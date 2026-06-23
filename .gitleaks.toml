@@ -1,0 +1,19 @@
+# gitleaks configuration for Mailcove.
+# Extends the default ruleset, then allowlists known-safe, non-secret test
+# fixtures so `gitleaks` reports clean.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret test fixtures: the RFC 8291 section 5 published Web Push vectors (used to assert exact spec conformance) and obviously-synthetic HMAC keys in unit tests."
+regexes = [
+  '''BTBZMqHH6r4Tts7J_aSIgg''',
+  '''test-secret-0123456789''',
+]
+paths = [
+  '''src/test/push\.test\.ts''',
+  '''src/test/push_routes\.test\.ts''',
+  '''app/test/push\.test\.ts''',
+  '''src/test/media\.test\.ts''',
+  '''src/test/media_route\.test\.ts''',
+]

@@ -1,0 +1,48 @@
+{
+  "name": "mailcove",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "npm run migrate:remote && wrangler deploy",
+    "deploy:worker": "wrangler deploy",
+    "dev": "wrangler dev",
+    "dev:web": "vite",
+    "build": "npm run typecheck && vite build",
+    "test": "vitest run",
+    "typecheck": "tsc -b --force",
+    "migrate": "wrangler d1 migrations apply mailcove --local",
+    "migrate:remote": "wrangler d1 migrations apply mailcove --remote",
+    "schema": "wrangler d1 execute mailcove --remote --file schema.sql"
+  },
+  "dependencies": {
+    "@react-email/editor": "^1.5.4",
+    "@tanstack/react-query": "^5.101.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "jose": "^6.2.3",
+    "lucide-react": "^1.17.0",
+    "postal-mime": "^2.4.4",
+    "radix-ui": "^1.4.3",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251001.0",
+    "@playwright/test": "^1.61.0",
+    "@tailwindcss/vite": "^4.3.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.16",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "jsdom": "^29.1.1",
+    "tailwindcss": "^4.3.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8",
+    "wrangler": "^4.61.1"
+  }
+}

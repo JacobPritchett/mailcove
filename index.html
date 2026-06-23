@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Marker the service worker uses to confirm a navigation response is the
+         real app shell (and not, e.g., a Cloudflare Access login page) before
+         caching it for offline use. See public/sw.js. -->
+    <meta name="app-shell" content="Mailcove" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#0f172a" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!-- use-credentials: the manifest (and the icons it references) live behind
+         Cloudflare Access, so the browser must send the Access cookie when
+         fetching them — without this the manifest fetch hits the 302 login page
+         and install silently fails. -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+    <!-- iOS add-to-home-screen -->
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Mailcove" />
+    <title>Mailcove</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/app/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,83 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mailcove",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Vite-built React SPA served via Workers Assets. directory MUST equal
+  // vite.config.ts build.outDir ("dist"). run_worker_first keeps /api/* on the
+  // Worker even if a build artifact ever collides with an /api path.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api", "/api/*"]
+  },
+
+  // Public, Access-protected UI lives here. wrangler creates the DNS + route.
+  // Replace with the hostname you want the inbox served from.
+  "routes": [{ "pattern": "inbox.example.com", "custom_domain": true }],
+  "workers_dev": false,
+  "triggers": { "crons": ["0 4 * * *"] },
+
+  // Outbound: send from the onboarded sending subdomain (no API keys needed).
+  "send_email": [{ "name": "EMAIL" }],
+
+  // Workers AI: conversation summaries and reply drafting (account-scoped).
+  // See SECURITY.md for the privacy implications of sending mail content to AI.
+  "ai": { "binding": "AI" },
+
+  // Metadata + search. Create with `wrangler d1 create mailcove`, then paste the
+  // returned id below. migrations_dir + `npm run deploy` (which runs
+  // `wrangler d1 migrations apply --remote`) keep the prod schema in lockstep
+  // with the code on every deploy.
+  "d1_databases": [
+    { "binding": "DB", "database_name": "mailcove", "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID", "migrations_dir": "migrations" }
+  ],
+
+  // Raw .eml, parsed bodies, attachments. Create with
+  // `wrangler r2 bucket create mailcove-mail`.
+  "r2_buckets": [
+    { "binding": "MAILSTORE", "bucket_name": "mailcove-mail" }
+  ],
+
+  "vars": {
+    // The apex domain mail is received for.
+    "INBOX_DOMAIN": "example.com",
+    // FROM_DOMAIN is the onboarded Email Sending subdomain, the ONLY domain the
+    // send_email binding authorizes as an outbound sender. The apex is NOT
+    // authorized to send (the binding throws "email sending not authorized for
+    // subdomain 'example.com'"); it only receives. Reply-To pins the apex
+    // identity so replies still land in the inbox. Do not set this to the apex.
+    "FROM_DOMAIN": "send.example.com",
+    "DEFAULT_FROM_LOCAL": "hello",
+    // Optional. A copy of every inbound message is forwarded here as a backup.
+    // Leave empty to disable forwarding.
+    "FORWARD_COPY_TO": "",
+    // Your Cloudflare Access team domain and the Access application audience tag
+    // that protects the inbox hostname. See docs/DEPLOY.md (Access section).
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    "ACCESS_AUD": "REPLACE_WITH_YOUR_ACCESS_APPLICATION_AUD",
+    // Account whose zones the "Domains" dashboard lists. The CF API token it
+    // uses is the CF_API_TOKEN secret (set via `wrangler secret put`); writes
+    // are narrowly scoped in src/cf_routing.ts.
+    "CF_ACCOUNT_ID": "REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID",
+    // This Worker's own name, the Email Routing catch-all target used by the
+    // "Receive in this inbox" onboarding action. Keep in sync with "name" above.
+    "INBOX_WORKER_NAME": "mailcove",
+    // Web Push (RFC 8291/8292). VAPID_PUBLIC is the non-secret application server
+    // key the client subscribes with; the matching VAPID_PRIVATE is a Worker
+    // secret (set via `wrangler secret put`). Generate a fresh pair (see
+    // docs/DEPLOY.md) and never reuse a key pair across deployments.
+    "VAPID_PUBLIC": "REPLACE_WITH_YOUR_VAPID_PUBLIC_KEY",
+    "VAPID_SUBJECT": "mailto:admin@example.com"
+  }
+
+  // Worker secrets (set via `wrangler secret put`, never committed here):
+  //   AUTH_TOKEN, CF_API_TOKEN, VAPID_PRIVATE (see notes above).
+  //   IMG_PROXY_SECRET — HMAC key signing the short-lived /api/media image tokens
+  //     (inline cid: and proxied remote images). Falls back to AUTH_TOKEN when
+  //     unset, so it is optional in dev; set a dedicated value in production.
+}

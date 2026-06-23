@@ -1,0 +1,17 @@
+# Local development secrets. Copy to .dev.vars and fill in.
+# .dev.vars is gitignored. Never commit real secret values.
+
+# Bearer token for the API during local dev (there is no Cloudflare Access in
+# front of `wrangler dev`). Call the API with: Authorization: Bearer <this value>.
+# Use a long random string. See SECURITY.md for the production tradeoff.
+AUTH_TOKEN=replace-with-a-long-random-string
+
+# Only if you use Web Push locally. Generate with: npx web-push generate-vapid-keys
+# VAPID_PRIVATE=
+
+# Only if you exercise the in-app domain onboarding flow locally. Scope narrowly.
+# CF_API_TOKEN=
+
+# Optional. HMAC key for the /api/media image-token signer (inline cid + remote
+# image proxy). Falls back to AUTH_TOKEN when unset, so it is optional in dev.
+# IMG_PROXY_SECRET=

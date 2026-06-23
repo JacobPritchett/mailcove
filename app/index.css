@@ -1,0 +1,177 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.5rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.129 0.042 264.695);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.129 0.042 264.695);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.129 0.042 264.695);
+  --primary: oklch(0.208 0.042 265.755);
+  --primary-foreground: oklch(0.984 0.003 247.858);
+  --secondary: oklch(0.968 0.007 247.896);
+  --secondary-foreground: oklch(0.208 0.042 265.755);
+  --muted: oklch(0.968 0.007 247.896);
+  --muted-foreground: oklch(0.554 0.046 257.417);
+  --accent: oklch(0.968 0.007 247.896);
+  --accent-foreground: oklch(0.208 0.042 265.755);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.984 0.003 247.858);
+  --border: oklch(0.929 0.013 255.508);
+  --input: oklch(0.929 0.013 255.508);
+  --ring: oklch(0.704 0.04 256.788);
+}
+
+.dark {
+  --background: oklch(0.129 0.042 264.695);
+  --foreground: oklch(0.984 0.003 247.858);
+  --card: oklch(0.208 0.042 265.755);
+  --card-foreground: oklch(0.984 0.003 247.858);
+  --popover: oklch(0.208 0.042 265.755);
+  --popover-foreground: oklch(0.984 0.003 247.858);
+  --primary: oklch(0.929 0.013 255.508);
+  --primary-foreground: oklch(0.208 0.042 265.755);
+  --secondary: oklch(0.279 0.041 260.031);
+  --secondary-foreground: oklch(0.984 0.003 247.858);
+  --muted: oklch(0.279 0.041 260.031);
+  --muted-foreground: oklch(0.704 0.04 256.788);
+  --accent: oklch(0.279 0.041 260.031);
+  --accent-foreground: oklch(0.984 0.003 247.858);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.984 0.003 247.858);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.551 0.027 264.364);
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+    outline-color: var(--ring);
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+  /* Hand-rolled (non-shadcn) buttons get a consistent keyboard focus ring.
+     Excludes any button that already ships a shadcn focus ring (the <Button>
+     primitive and Radix action/close buttons that use buttonVariants or their
+     own focus:ring-* / focus-visible:ring-* classes) so they don't double up.
+     Mouse focus is unaffected (:focus-visible only). */
+  button:not([data-slot]):not([class*="focus-visible:ring"]):not([class*="focus:ring"]):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+/* ----------------------------------------------------------------
+ * Rich compose editor (@react-email/editor)
+ *
+ * The editor paints the EMAIL's theme (white canvas, 600px container) onto
+ * its ProseMirror surface. Like Gmail, the compose SURFACE should look like
+ * the app — dark in dark mode — while the SENT email keeps the neutral light
+ * theme, so these overrides restyle only the editing view (the serializer
+ * never sees them). Block-level color uses !important to beat the editor's
+ * runtime-injected scoped styles; inline color MARKS live on child spans and
+ * stay untouched.
+ * ---------------------------------------------------------------- */
+.compose-editor .tiptap.ProseMirror {
+  background-color: transparent !important;
+  color: var(--foreground) !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+  outline: none;
+}
+.compose-editor .tiptap.ProseMirror > * {
+  max-width: 100% !important;
+  min-width: 0 !important;
+}
+/* :not([style*="color"]) keeps any explicitly-colored block authoritative —
+   only theme-injected defaults are neutralized. */
+.compose-editor .tiptap.ProseMirror :is(p, h1, h2, h3, h4, li):not([style*="color"]) {
+  color: inherit !important;
+}
+/* Quoted history reads as secondary, Gmail-style: muted, smaller, tucked
+   under the reply. The attribution line lives INSIDE the blockquote (see
+   replyContext.ts), so no selector has to guess which paragraph it is. */
+.compose-editor .tiptap.ProseMirror blockquote:not([style*="color"]) {
+  color: var(--muted-foreground) !important;
+  border-left: 2px solid var(--border);
+  margin: 0.25rem 0 0;
+  padding: 0 0 0 0.75rem;
+  font-size: 0.9em;
+}
+
+/* TipTap's empty-document placeholder. */
+.compose-editor .tiptap.ProseMirror p.is-editor-empty:first-child::before {
+  color: color-mix(in oklch, var(--muted-foreground) 70%, transparent);
+}
+
+/* The editor's floating menus (bubble menu, slash command, link form) theme
+   via --re-* variables with a prefers-color-scheme fallback. The app's dark
+   mode is CLASS-driven, so bind the variables to app tokens both ways.
+   html-qualified to outrank the lazy-loaded theme css (:root) in ties. */
+html:not(.dark),
+html.dark {
+  --re-bg: var(--popover);
+  --re-text: var(--popover-foreground);
+  --re-text-muted: var(--muted-foreground);
+  --re-border: var(--border);
+  --re-separator: var(--border);
+  --re-hover: var(--accent);
+  --re-active: var(--accent);
+  --re-pressed: var(--accent);
+  --re-bg-hover: var(--accent);
+  --re-bg-active: var(--accent);
+  --re-tooltip-bg: var(--popover);
+  --re-tooltip-text: var(--popover-foreground);
+}
+
+/* The email "container" node keeps the email theme's white canvas inside the
+   editing view — same Gmail rule as above: surface follows the app. */
+.compose-editor .tiptap.ProseMirror .node-container {
+  background-color: transparent !important;
+  /* The theme also pins the email's text color here; blocks use `inherit`,
+     so the container must forward the app color down. */
+  color: inherit !important;
+}
+
+/* The editor's floating UI (slash menu, bubble menus, link form) mounts on
+   <body> with no z-index of its own; Radix dialogs sit at z-50 and would
+   cover it — which reads as "typing / does nothing". Lift it above. */
+body > div:has([data-re-slash-command]),
+body > div:has([data-re-bubble-menu]),
+body > div:has([data-re-link-selector]) {
+  z-index: 60;
+}
