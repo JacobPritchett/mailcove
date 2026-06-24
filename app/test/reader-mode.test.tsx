@@ -60,6 +60,7 @@ function renderReader(thread: ThreadResponse = STUB) {
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  document.documentElement.classList.remove("dark");
 });
 
 describe("Reader Rich/Chat toggle", () => {
@@ -141,5 +142,45 @@ describe("Reader Rich/Chat toggle", () => {
     expect(screen.getByRole("heading", { name: /Mode test subject/i })).toBeInTheDocument();
     // Archive toolbar still visible (onAction prop provided)
     expect(screen.getByRole("button", { name: "Archive" })).toBeInTheDocument();
+  });
+
+  it("dark rich view forces simple HTML mail to inherit theme text color", async () => {
+    document.documentElement.classList.add("dark");
+    renderReader({
+      thread_id: "t-dark-html",
+      messages: [{
+        ...STUB.messages[0],
+        id: "m-dark-html",
+        thread_id: "t-dark-html",
+        body: { text: "dark text fallback", html: '<p style="color:#333">Readable in dark mode</p>', attachments: [] },
+      } as any],
+    });
+
+    await screen.findByTitle(/Message from/i);
+    const srcDoc = document.querySelector("iframe")?.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain('data-app-theme="dark"');
+    expect(srcDoc).toContain('data-email-background="false"');
+    expect(srcDoc).toContain("color:inherit!important");
+  });
+
+  it("rich view preserves explicit email backgrounds", async () => {
+    document.documentElement.classList.add("dark");
+    renderReader({
+      thread_id: "t-designed-html",
+      messages: [{
+        ...STUB.messages[0],
+        id: "m-designed-html",
+        thread_id: "t-designed-html",
+        body: { text: "designed fallback", html: '<table bgcolor="#ffffff"><tr><td style="color:#333">Designed email</td></tr></table>', attachments: [] },
+      } as any],
+    });
+
+    await screen.findByTitle(/Message from/i);
+    const srcDoc = document.querySelector("iframe")?.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain('data-email-background="true"');
+    expect(srcDoc).toContain("background:#fff");
+    expect(srcDoc).toContain("body:not([data-email-background='true'])");
+    expect(srcDoc).toContain("a{color:#93c5fd!important}");
+    expect(srcDoc).not.toContain(":where(a,");
   });
 });

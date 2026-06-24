@@ -466,7 +466,7 @@ export default function App() {
           Mobile: full width; hidden when the reader is showing. */}
       <section
         className={cn(
-          "flex min-w-0 flex-1 flex-col border-r md:w-80 md:flex-none md:shrink-0",
+          "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border-r md:w-80 md:flex-none md:shrink-0",
           mobileShowingReader && "hidden md:flex",
         )}
       >
@@ -620,7 +620,7 @@ export default function App() {
           Mobile: full-screen; hidden unless mobileView === "reader". */}
       <div
         className={cn(
-          "min-w-0 flex-1 flex-col",
+          "min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
           mobileShowingReader ? "flex" : "hidden md:flex",
         )}
       >

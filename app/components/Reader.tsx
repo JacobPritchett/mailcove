@@ -46,15 +46,27 @@ const CSP =
   `default-src 'none'; img-src data: ${MEDIA_ORIGIN}/api/media; style-src 'unsafe-inline'; font-src data:; base-uri 'none'`;
 
 // Injected into every email document: a viewport so fixed-width (e.g. 600px
-// table) newsletters don't overflow on mobile, a forced light color-scheme so
-// emails that set only a text color stay readable regardless of app theme, and
-// a small reset so images/tables never exceed the reading column.
+// table) newsletters don't overflow on mobile, theme-aware defaults for simple
+// rich messages, and a small reset so images/tables never exceed the reading
+// column. Email HTML that brings its own backgrounds still wins; plain HTML
+// messages inherit an app-theme surface instead of a forced white body.
 const BASE_STYLE =
-  "html{color-scheme:only light}body{margin:0;background:#fff;color:#1a1a1a;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;overflow-wrap:anywhere}img{max-width:100%;height:auto}table{max-width:100%}";
+  "html{color-scheme:light}html[data-app-theme='dark']{color-scheme:dark}body{box-sizing:border-box;margin:0;background:#fff;color:#1a1a1a;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;overflow-wrap:anywhere}a{color:#2563eb}html[data-app-theme='dark'] body:not([data-email-background='true']){background:#0f172a;color:#e5e7eb}html[data-app-theme='dark'] body:not([data-email-background='true']) a{color:#93c5fd!important}html[data-app-theme='dark'] body:not([data-email-background='true']) :where(p,div,span,font,td,th,li,strong,em,b,i,h1,h2,h3,h4,h5,h6,blockquote){color:inherit!important;background-color:transparent!important}img{max-width:100%;height:auto}table{max-width:100%}";
+
+function emailDeclaresBackground(html: string): boolean {
+  return /(?:style\s*=\s*["'][^"']*background(?:-[a-z]+)?\s*:|\bbgcolor\s*=|\bbackground\s*=)/i.test(html);
+}
+
+function currentAppTheme(): "dark" | "light" {
+  if (typeof document !== "undefined" && document.documentElement.classList.contains("dark")) return "dark";
+  return "light";
+}
 
 /** Wrap untrusted email HTML so the CSP meta is the first thing in <head>. */
 function wrapHtml(html: string): string {
-  return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="only light"><style>${BASE_STYLE}</style></head><body>${html}</body></html>`;
+  const theme = currentAppTheme();
+  const hasBackground = emailDeclaresBackground(html) ? "true" : "false";
+  return `<!doctype html><html data-app-theme="${theme}"><head><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><style>${BASE_STYLE}</style></head><body data-email-background="${hasBackground}">${html}</body></html>`;
 }
 
 export interface ReaderProps {
@@ -177,8 +189,8 @@ export default function Reader({
   const canReply = messages.some((m) => m.direction === "in") && !!replyInitial;
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col">
-      <ScrollArea className="flex-1">
+    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <ScrollArea className="min-h-0 flex-1">
         {/* mx-auto + max-w caps the reading measure so a message doesn't sprawl
             to 150+ chars/line on a wide monitor (standard mail-client behavior). */}
         <article className="mx-auto w-full max-w-3xl px-4 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] md:px-7 md:py-6">
@@ -394,7 +406,7 @@ function MessageEntry({
             <EmailFrame html={html} title={`Message from ${msg.msg_from}`} />
           </>
         ) : (
-          <pre className="font-sans text-sm whitespace-pre-wrap [overflow-wrap:anywhere]">
+          <pre className="m-0 rounded-md border bg-card p-4 font-sans text-sm whitespace-pre-wrap [overflow-wrap:anywhere]">
             {body.text
               ? linkifyText(body.text).map((tok, i) =>
                   tok.t === "link" ? (
@@ -434,6 +446,16 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
     const iframe = ref.current;
     if (!iframe) return;
     let ro: ResizeObserver | undefined;
+    const syncTheme = () => {
+      try {
+        const doc = iframe.contentDocument;
+        if (doc?.documentElement) {
+          doc.documentElement.dataset.appTheme = document.documentElement.classList.contains("dark") ? "dark" : "light";
+        }
+      } catch {
+        /* ignore */
+      }
+    };
     const measure = () => {
       try {
         const doc = iframe.contentDocument;
@@ -446,6 +468,7 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
       }
     };
     const onLoad = () => {
+      syncTheme();
       measure();
       try {
         const doc = iframe.contentDocument;
@@ -460,22 +483,28 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
     };
     iframe.addEventListener("load", onLoad);
     if (iframe.contentDocument?.readyState === "complete") onLoad();
+    const themeObserver = new MutationObserver(syncTheme);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    syncTheme();
     return () => {
       iframe.removeEventListener("load", onLoad);
       ro?.disconnect();
+      themeObserver.disconnect();
     };
   }, [html]);
 
   return (
-    <iframe
-      ref={ref}
-      title={title}
-      sandbox={IFRAME_SANDBOX}
-      srcDoc={wrapHtml(html)}
-      scrolling="no"
-      style={height ? { height: `${height}px` } : undefined}
-      className="block min-h-24 w-full overflow-hidden rounded-md border bg-white"
-    />
+    <div className="overflow-hidden rounded-md border bg-card p-4">
+      <iframe
+        ref={ref}
+        title={title}
+        sandbox={IFRAME_SANDBOX}
+        srcDoc={wrapHtml(html)}
+        scrolling="no"
+        style={height ? { height: `${height}px` } : undefined}
+        className="block min-h-24 w-full overflow-hidden border-0 bg-transparent"
+      />
+    </div>
   );
 }
 
