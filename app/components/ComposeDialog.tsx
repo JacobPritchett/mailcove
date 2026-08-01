@@ -1,7 +1,13 @@
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Send, X, AlertCircle, Loader2, Sparkles, Trash2 } from "lucide-react";
+import { Send, X, AlertCircle, Loader2, Sparkles, Trash2, Paperclip } from "lucide-react";
 import type { ComposeBodyHandle } from "@/components/EmailBodyEditor";
+import {
+  checkAttachmentLimits,
+  fileToBase64,
+  formatBytes,
+  type StagedAttachment,
+} from "@/lib/attachments";
 import {
   Dialog,
   DialogContent,
@@ -110,6 +116,42 @@ export default function ComposeDialog({
   const toInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<ComposeBodyHandle>(null);
 
+  // Files staged for this message. Held in memory as base64 and shipped in the
+  // send body; nothing is uploaded until the message is actually sent, so
+  // closing the dialog costs nothing.
+  const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  async function addFiles(files: FileList | null) {
+    setAttachError(null);
+    const picked = Array.from(files ?? []);
+    if (!picked.length) return;
+    const problem = checkAttachmentLimits(attachments, picked);
+    if (problem) {
+      setAttachError(problem);
+      return;
+    }
+    try {
+      const staged = await Promise.all(
+        picked.map(async (f) => ({
+          name: f.name,
+          type: f.type || "application/octet-stream",
+          size: f.size,
+          data: await fileToBase64(f),
+        })),
+      );
+      setAttachments((prev) => [...prev, ...staged]);
+    } catch (e) {
+      setAttachError(e instanceof Error ? e.message : "Could not read that file.");
+    }
+  }
+
+  function removeAttachment(index: number) {
+    setAttachError(null);
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
+  }
+
   // ---- Draft autosave ----
   const qc = useQueryClient();
   // The draft row this compose session writes to (created lazily on first save).
@@ -193,6 +235,13 @@ export default function ComposeDialog({
     setBodyJsonSeed(initial?.bodyJson ?? "");
     setBodyFocused(false);
     setCaretAtEnd(true);
+    // The dialog stays mounted between sessions, so staged files MUST be cleared
+    // here. Otherwise a file attached to one message is still staged when the
+    // next compose opens, and would be sent to a recipient the user never chose
+    // it for. Clearing only after a successful send would miss the far more
+    // common close-without-sending path.
+    setAttachments([]);
+    setAttachError(null);
     clearSuggestion();
     draftIdRef.current = initial?.draftId ?? null;
     skipDraftRef.current = false;
@@ -382,6 +431,15 @@ export default function ComposeDialog({
         ...(bodyHtml && hasVisibleBody ? { html: bodyHtml } : {}),
         inReplyTo: initial?.inReplyTo,
         threadId: initial?.threadId,
+        ...(attachments.length
+          ? {
+              attachments: attachments.map((a) => ({
+                filename: a.name,
+                type: a.type,
+                data: a.data,
+              })),
+            }
+          : {}),
       },
       {
         onSuccess: () => {
@@ -716,9 +774,72 @@ export default function ComposeDialog({
             </div>
           )}
 
+          {(attachments.length > 0 || attachError) && (
+            <div className="mx-5 mb-3 space-y-2">
+              {attachments.length > 0 && (
+                <ul className="flex flex-wrap gap-2">
+                  {attachments.map((a, i) => (
+                    <li
+                      key={`${a.name}-${i}`}
+                      className="flex max-w-full items-center gap-2 rounded-lg border border-border/60 bg-muted/40 px-2.5 py-1.5 text-xs"
+                    >
+                      <Paperclip className="size-3.5 shrink-0 text-muted-foreground" />
+                      <span className="truncate" title={a.name}>{a.name}</span>
+                      <span className="shrink-0 text-muted-foreground">{formatBytes(a.size)}</span>
+                      <button
+                        type="button"
+                        onClick={() => removeAttachment(i)}
+                        aria-label={`Remove ${a.name}`}
+                        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {attachments.length > 0 && (
+                // Draft autosave persists text and recipients, not files. Say so
+                // rather than letting someone reopen a draft and find them gone.
+                <p className="text-xs text-muted-foreground/70">
+                  Files are sent with this message but are not saved in drafts.
+                </p>
+              )}
+              {attachError && (
+                <p role="alert" className="flex items-start gap-2 text-xs text-destructive">
+                  <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+                  <span>{attachError}</span>
+                </p>
+              )}
+            </div>
+          )}
+
           {/* Footer */}
           <div className="mt-auto flex items-center justify-between gap-3 border-t border-border/60 px-5 py-3 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
             <span className="flex items-center gap-3">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  void addFiles(e.target.files);
+                  // Reset so picking the same file twice still fires onChange.
+                  e.target.value = "";
+                }}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={send.isPending}
+                aria-label="Attach files"
+                className="gap-1.5 text-xs text-muted-foreground max-md:h-11"
+              >
+                <Paperclip className="size-3.5" />
+                Attach
+              </Button>
               <span className="flex items-center gap-1 text-xs text-muted-foreground max-md:hidden">
                 <Kbd>⌘</Kbd>
                 <Kbd>↵</Kbd>

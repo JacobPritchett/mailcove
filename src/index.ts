@@ -1,5 +1,11 @@
 import PostalMime from "postal-mime";
-import { storeInboundAttachments, type InboundPart } from "./attachments";
+import {
+  storeInboundAttachments,
+  parseOutboundAttachments,
+  AttachmentError,
+  type InboundPart,
+  type OutboundAttachment,
+} from "./attachments";
 import { verifyAccess } from "./auth";
 import { deriveThreadId, sanitizeMessageId } from "./threading";
 import { getThread, findThreadIdByMessageIds } from "./store";
@@ -79,6 +85,59 @@ function mediaSecret(env: Env): string | null {
 const suggestBuckets = new Map<string, Bucket>();
 // …and for destination registration (each call emails a verification link).
 const destinationBuckets = new Map<string, Bucket>();
+
+// …and for outbound send. The bearer automation credential drives /api/send
+// unattended, so blunt the burst a leaked or looping caller can produce: 20 at
+// once, refilling 12/min, keyed per caller and sized well above human compose
+// rates. Like the other buckets this is PER-ISOLATE and therefore best-effort —
+// a caller spread across cold starts or PoPs gets a fresh allowance each time,
+// so treat it as damage limiting, not a guaranteed global send rate. A hard
+// ceiling needs durable state (a Durable Object or the rate-limiting binding).
+const sendBuckets = new Map<string, Bucket>();
+
+/** Test-only: clear the send limiter so each test starts with a full bucket. */
+export function resetSendBucketsForTest() {
+  sendBuckets.clear();
+}
+/** Conservative address count: string entries may hold a comma-separated list. */
+function countAddresses(list: Recipient[]): number {
+  return list.reduce(
+    (n, r) => n + (typeof r === "string" ? r.split(",").filter((s) => s.includes("@")).length : 1),
+    0,
+  );
+}
+
+/** Render recipients for storage/display ("Name <addr>"), never "[object Object]". */
+function recipientText(r: Recipient): string {
+  if (typeof r === "string") return r;
+  return r.name ? `${r.name} <${r.email}>` : r.email;
+}
+
+/** Upper bound on recipients per send, so one call cannot fan out to a list. */
+const MAX_RECIPIENTS = 50;
+
+/** A recipient as the send binding accepts it: a bare address or {name, email}. */
+type Recipient = string | { name?: string; email: string };
+
+function isRecipientObject(r: unknown): r is { name?: string; email: string } {
+  return typeof r === "object" && r !== null
+    && typeof (r as { email?: unknown }).email === "string"
+    && looksLikeRecipient((r as { email: string }).email);
+}
+
+/** A usable recipient must carry an address and no header-breaking control chars.
+ *  Deliberately looser than isEmailAddress: "Name <a@b.com>" is a valid recipient
+ *  and contains spaces, so a strict address regex would reject legitimate input.
+ *  This only rejects obvious junk ("12345", null, {}) that would otherwise be
+ *  stringified into a plausible-looking address and stored as one. */
+function looksLikeRecipient(value: string): boolean {
+  return value.includes("@") && !/[\r\n]/.test(value);
+}
+
+function isUsableRecipient(r: unknown): r is Recipient {
+  return typeof r === "string" ? looksLikeRecipient(r) : isRecipientObject(r);
+}
+
 
 // Inert types we trust to render inline. Everything else is forced to download
 // with a generic content-type so a stored text/html (or SVG, etc.) attachment
@@ -1200,9 +1259,23 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
 
   // POST /api/send
   if (path === "/api/send" && request.method === "POST") {
-    const b = (await request.json()) as Record<string, any>;
+    if (!takeToken(sendBuckets, who, Date.now(), 20, 0.2)) {
+      return json({ error: "rate limited" }, 429);
+    }
+    const b = (await request.json().catch(() => ({}))) as Record<string, any>;
     if (!b.to) return json({ error: "missing 'to'" }, 400);
-    const toList: string[] = Array.isArray(b.to) ? b.to : String(b.to).split(",").map((s) => s.trim());
+    // The send binding accepts a bare address OR a structured {name, email}, so
+    // only trim the string form and pass structured entries through intact.
+    const toList: Recipient[] = (Array.isArray(b.to) ? b.to : String(b.to).split(","))
+      .map((r: unknown) => (typeof r === "string" ? r.trim() : r))
+      .filter(isUsableRecipient);
+    if (!toList.length) return json({ error: "missing 'to'" }, 400);
+    // Count ADDRESSES, not elements: a single array element may itself hold a
+    // comma-separated list, which would otherwise slip a large fan-out past a
+    // cap that only counted array length.
+    if (countAddresses(toList) > MAX_RECIPIENTS) {
+      return json({ error: `too many recipients (max ${MAX_RECIPIENTS})` }, 400);
+    }
     // Resolve the sender identity. The send_email binding only authorizes
     // onboarded Email Sending domains as outbound senders, so the transport From
     // must live on the identity's sending_domain (the apex itself when the apex
@@ -1235,6 +1308,16 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
       headers["In-Reply-To"] = irt;
       headers["References"] = irt;
     }
+    // Decode and validate BEFORE sending: an oversized or corrupt attachment has
+    // to fail the whole request rather than deliver a message the sender believes
+    // carries a file it does not.
+    let attachments: OutboundAttachment[];
+    try {
+      attachments = parseOutboundAttachments(b.attachments);
+    } catch (e) {
+      if (e instanceof AttachmentError) return json({ error: e.message }, 400);
+      throw e;
+    }
     const msg: Record<string, unknown> = {
       // Per-send name override → identity's profile name → derived default.
       // Sanitized: a raw b.fromName must never carry CR/LF into a header.
@@ -1251,11 +1334,19 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     // (send.* setups); apex-onboarded identities reply naturally to From.
     if (replyTo) msg.replyTo = replyTo;
     if (b.html) msg.html = b.html;
+    if (attachments.length) {
+      msg.attachments = attachments.map((a) => ({
+        disposition: "attachment" as const,
+        filename: a.filename,
+        type: a.type,
+        content: a.content,
+      }));
+    }
     let sendResult: { messageId?: string } | undefined;
     try {
       // send() resolves to an object carrying the platform-assigned messageId.
       sendResult = await env.EMAIL.send(msg);
-      console.log(`SEND OK: ${fromAddr} -> ${toList.join(",")}`);
+      console.log(`SEND OK: ${fromAddr} -> ${toList.map(recipientText).join(",")}`);
     } catch (e) {
       console.error("EMAIL.send failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
       return json({ error: "send failed", detail: e instanceof Error ? e.message : String(e) }, 502);
@@ -1266,19 +1357,44 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     const sentMessageId = sendResult?.messageId ?? "";
     const id = uuid();
     const snippet = String(b.text || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    await env.MAILSTORE.put(`parsed/${id}.json`, JSON.stringify({ text: b.text || "", html: b.html || "", attachments: [] }));
+    // Store attachments the way inbound mail does (att/<id>/p<n> in R2 plus a
+    // record in the parsed body), so the Sent view, the download route and the
+    // reader all work on sent mail with no special-casing. The message is
+    // already delivered here, so a storage failure must not report "Send
+    // failed" and invite a duplicate send.
+    const attachmentRecords = attachments.map((a, i) => ({
+      partId: `p${i}`,
+      name: a.filename,
+      mimeType: a.type,
+      size: a.content.byteLength,
+      disposition: "attachment",
+      contentId: null,
+    }));
+    try {
+      await Promise.all(
+        attachments.map((a, i) =>
+          env.MAILSTORE.put(`att/${id}/p${i}`, a.content, { httpMetadata: { contentType: a.type } }),
+        ),
+      );
+      await env.MAILSTORE.put(
+        `parsed/${id}.json`,
+        JSON.stringify({ text: b.text || "", html: b.html || "", attachments: attachmentRecords }),
+      );
+    } catch (e) {
+      console.error("send: storing body/attachments failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+    }
     await env.DB.prepare(
       `INSERT INTO messages (id, thread_id, direction, folder, msg_from, msg_to, subject, snippet, date, unread, has_attachments, message_id, in_reply_to, state, starred, domain)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
-      .bind(id, b.threadId || id, "out", "sent", identityAddr, toList.join(", "), b.subject || "", snippet, Date.now(), 0, 0, sentMessageId, irt ?? "", "inbox", 0, sender.domain)
+      .bind(id, b.threadId || id, "out", "sent", identityAddr, toList.map(recipientText).join(", "), b.subject || "", snippet, Date.now(), 0, attachments.length ? 1 : 0, sentMessageId, irt ?? "", "inbox", 0, sender.domain)
       .run();
     // Index the sent message for full-text search (best-effort).
     await ftsUpsert(env, ftsRowFrom({
       id,
       subject: b.subject || "",
       from: identityAddr,
-      to: toList.join(", "),
+      to: toList.map(recipientText).join(", "),
       bodyText: bodyForIndex(b.text || "", b.html || ""),
     }));
     return json({ ok: true, id });
