@@ -378,7 +378,21 @@ function MessageEntry({
       {/* Attachments — links to the download endpoint, shown as chips. */}
       {body.attachments.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-2">
-          {body.attachments.map((a) => (
+          {body.attachments.map((a) =>
+            a.stored === false ? (
+              // The bytes were never written, so a link here would just 404.
+              // Show the name (it is real information) and say plainly that the
+              // file is unavailable rather than offering a dead download.
+              <span
+                key={a.name}
+                title="This file was not stored with the message"
+                className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-3 py-1.5 text-sm text-muted-foreground"
+              >
+                <Paperclip className="h-3.5 w-3.5" />
+                {a.name}
+                <span className="text-xs">(not stored)</span>
+              </span>
+            ) : (
             <a
               key={a.name}
               href={attachmentUrl(msg.id, a.name)}
@@ -389,7 +403,8 @@ function MessageEntry({
               <Paperclip className="h-3.5 w-3.5" />
               {a.name}
             </a>
-          ))}
+            ),
+          )}
         </div>
       )}
 

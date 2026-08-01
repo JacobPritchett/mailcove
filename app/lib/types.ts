@@ -79,6 +79,9 @@ export interface Attachment {
   name: string;
   mimeType: string;
   size: number;
+  /** False when the bytes were never written (over the per-message cap, or
+   *  the write failed). The name is still worth showing; the link is not. */
+  stored?: boolean;
 }
 
 export interface MessageBody {

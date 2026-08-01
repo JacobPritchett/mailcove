@@ -58,6 +58,11 @@ export function sanitizeFromName(value: unknown): string {
     // Breaking the "=?" opener makes a smuggled encoded-word render literally
     // instead of being decoded by the recipient's mail client.
     .replace(/=\?/g, "=")
+    // Angle brackets in a display name can read as a second angle-addr once the
+    // header is assembled ("Real Person <real@corp> <actual@sender>"), and many
+    // clients surface the FIRST one. Drop them so a display name can never imply
+    // an address other than the one we actually send from.
+    .replace(/[<>]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 100);

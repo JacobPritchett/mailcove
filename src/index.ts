@@ -1,4 +1,5 @@
 import PostalMime from "postal-mime";
+import { storeInboundAttachments, type InboundPart } from "./attachments";
 import { verifyAccess } from "./auth";
 import { deriveThreadId, sanitizeMessageId } from "./threading";
 import { getThread, findThreadIdByMessageIds } from "./store";
@@ -273,24 +274,42 @@ async function handleEmail(message: ForwardableEmailMessage, env: Env, ctx: Exec
   // postal-mime exposes References as a single space-separated string.
   const references = parsed.references;
 
-  const attachments: AttachmentRecord[] = [];
-  let idx = 0;
-  for (const att of parsed.attachments || []) {
-    const body = att.content as ArrayBuffer;
-    const rec = attachmentRecord(
-      { filename: att.filename, mimeType: att.mimeType, size: (body as ArrayBuffer).byteLength || 0, contentId: att.contentId, disposition: att.disposition },
-      idx++,
-    );
-    await env.MAILSTORE.put(`att/${id}/${rec.partId}`, body, {
-      httpMetadata: { contentType: rec.mimeType || "application/octet-stream" },
-    });
-    attachments.push(rec);
+  // Bounded and best-effort: the message row is inserted BELOW, so anything that
+  // throws here would leave the mail in R2 but invisible in the inbox. A message
+  // with thousands of MIME parts previously meant that many sequential object
+  // writes on the delivery path.
+  const stored = await storeInboundAttachments(
+    (key, body, opts) => env.MAILSTORE.put(key, body as ArrayBuffer, opts),
+    id,
+    (parsed.attachments || []) as InboundPart[],
+    (att, i) =>
+      attachmentRecord(
+        {
+          filename: att.filename,
+          mimeType: att.mimeType,
+          size: (att.content as ArrayBuffer)?.byteLength || 0,
+          contentId: att.contentId,
+          disposition: att.disposition,
+        },
+        i,
+      ),
+  );
+  const attachments: AttachmentRecord[] = stored.records;
+  if (stored.skipped) {
+    console.error(`inbound ${id}: ${stored.skipped} attachment(s) not stored (cap or write failure)`);
   }
 
-  await env.MAILSTORE.put(
-    `parsed/${id}.json`,
-    JSON.stringify({ text, html, attachments, headers: { messageId, inReplyTo } }),
-  );
+  // Same reasoning as the attachments above: the row is inserted below, so a
+  // failure here must not abort ingest. The message still lists with subject,
+  // sender and date; only the body is unavailable until it is re-fetched.
+  try {
+    await env.MAILSTORE.put(
+      `parsed/${id}.json`,
+      JSON.stringify({ text, html, attachments, headers: { messageId, inReplyTo } }),
+    );
+  } catch (e) {
+    console.error(`inbound ${id}: storing parsed body failed:`, e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+  }
 
   // Prefer linking this reply to an already-stored thread: gather every parent
   // candidate from References + In-Reply-To (sanitized to canonical <id@host>),
@@ -305,7 +324,12 @@ async function handleEmail(message: ForwardableEmailMessage, env: Env, ctx: Exec
   const candidates = [...refTokens, inReplyTo]
     .map((v) => sanitizeMessageId(v))
     .filter((v): v is string => v !== null);
-  const linked = await findThreadIdByMessageIds(env.DB, candidates);
+  // Threading is a nicety; delivery is not. A transient read failure should cost
+  // this message its thread link, not its place in the inbox.
+  const linked = await findThreadIdByMessageIds(env.DB, candidates).catch((e: unknown) => {
+    console.error(`inbound ${id}: thread lookup failed:`, e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+    return null;
+  });
   const threadId =
     linked ?? deriveThreadId({ references, inReplyTo, messageId }, id);
   // Derive the domain from the ENVELOPE recipient (RCPT TO) first — it's the

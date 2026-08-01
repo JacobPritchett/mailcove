@@ -26,17 +26,31 @@ const EMPTY_BODY: ThreadBody = { text: "", html: "", attachments: [] };
  * thread root rather than a mid-chain message. Returns null when there are no
  * candidates (no query is issued) or nothing matches.
  */
+/**
+ * Most candidate ids to put in the IN clause.
+ *
+ * D1 rejects a query with more than 100 bound parameters (verified against a
+ * live database: 100 succeeds, 101 fails with "too many SQL variables"). A
+ * References header grows by one Message-ID per reply, so an ordinary
+ * mailing-list thread crosses that on its own, with no attacker involved. Past
+ * the limit every later message in the thread would fail this lookup and start
+ * its own thread, so cap the list instead. The newest ancestors are kept: they
+ * are the ones most likely to be stored here.
+ */
+const MAX_THREAD_CANDIDATES = 50;
+
 export async function findThreadIdByMessageIds(
   db: D1Database,
   candidateIds: string[],
 ): Promise<string | null> {
   if (candidateIds.length === 0) return null;
-  const placeholders = candidateIds.map(() => "?").join(",");
+  const ids = candidateIds.slice(-MAX_THREAD_CANDIDATES);
+  const placeholders = ids.map(() => "?").join(",");
   const row = await db
     .prepare(
       `SELECT thread_id FROM messages WHERE message_id IN (${placeholders}) ORDER BY date ASC LIMIT 1`,
     )
-    .bind(...candidateIds)
+    .bind(...ids)
     .first<{ thread_id: string }>();
   return row?.thread_id ?? null;
 }
