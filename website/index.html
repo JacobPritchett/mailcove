@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mailcove: custom-domain email on Cloudflare</title>
+    <meta
+      name="description"
+      content="Mailcove is a self-hosted send-and-receive inbox that runs entirely in your Cloudflare account: Workers, D1, R2, Email Routing, Email Sending, Access, and Workers AI."
+    />
+    <meta property="og:title" content="Mailcove: custom-domain email on Cloudflare" />
+    <meta
+      property="og:description"
+      content="Your domain. Your inbox. Your Cloudflare account. Mail handled by Cloudflare primitives."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#05070a" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #05070a;
+        --bg-2: #080b11;
+        --panel: rgba(255, 255, 255, 0.045);
+        --panel-2: rgba(255, 255, 255, 0.075);
+        --text: #f6f9fc;
+        --muted: #9aa7b4;
+        --line: rgba(211, 231, 255, 0.16);
+        --line-strong: rgba(211, 231, 255, 0.28);
+        --blue: #67b8ff;
+        --cyan: #5ce6df;
+        --green: #41e69f;
+        --orange: #ffb56b;
+        --red: #ff6b7f;
+        --shadow: 0 0 0 1px rgba(211, 231, 255, 0.12), 0 28px 90px rgba(0, 0, 0, 0.52);
+        color-scheme: dark;
+        font-family: "Geist", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      /* Keep a solid colour under the gradient layers. The `background` shorthand
+         resets background-color to transparent, which left light-on-transparent text
+         resolving against a white canvas. Set it on body, not html, so body's
+         background still propagates to the canvas and the gradients keep their sizing. */
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background-color: var(--bg);
+        background-image:
+          radial-gradient(circle at 16% -6%, rgba(103, 184, 255, 0.22), transparent 28rem),
+          radial-gradient(circle at 88% 7%, rgba(92, 230, 223, 0.13), transparent 32rem),
+          linear-gradient(180deg, #05070a 0%, #07101a 38%, #030405 100%);
+        color: var(--text);
+      }
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image: linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+        background-size: 60px 60px;
+        mask-image: linear-gradient(to bottom, black, transparent 80%);
+      }
+      a { color: inherit; text-decoration: none; }
+      img { max-width: 100%; display: block; }
+      code, pre { font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .page { overflow: hidden; position: relative; }
+      .section, .nav-inner, .footer-inner { width: min(1440px, calc(100% - 48px)); margin: 0 auto; }
+      .nav {
+        position: sticky; top: 0; z-index: 50;
+        border-bottom: 1px solid var(--line);
+        background: rgba(5, 7, 10, 0.78);
+        backdrop-filter: blur(18px);
+      }
+      .nav-inner { height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 750; letter-spacing: -0.04em; }
+      .brand-mark {
+        width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center;
+        background: linear-gradient(135deg, var(--blue), var(--green)); color: #03111c;
+        font-weight: 850; box-shadow: 0 0 40px rgba(103, 184, 255, 0.4);
+      }
+      .nav-links { display: flex; align-items: center; gap: 22px; color: var(--muted); font-size: 14px; }
+      .nav-links a:hover { color: var(--text); }
+      .button {
+        display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+        min-height: 42px; padding: 0 16px; border-radius: 999px;
+        border: 1px solid var(--line); background: rgba(255,255,255,0.04); color: var(--text);
+        font-size: 14px; font-weight: 650; transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+      }
+      .button:hover { transform: translateY(-1px); border-color: var(--line-strong); background: rgba(255,255,255,0.08); }
+      .button.primary { border: 0; background: #f8fbff; color: #05070a; }
+      .button.primary:hover { background: #fff; }
+      .hero { padding: 96px 0 72px; }
+      .hero-grid { display: grid; grid-template-columns: minmax(390px, 0.72fr) minmax(760px, 1.28fr); gap: 48px; align-items: center; }
+      .eyebrow { display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,0.04); color: #cbd7e4; font-size: 13px; }
+      .eyebrow::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--green); box-shadow: 0 0 18px rgba(65,230,159,0.85); }
+      h1 { margin: 22px 0; font-size: clamp(46px, 6.2vw, 78px); line-height: 0.95; letter-spacing: -0.074em; }
+      .lead { max-width: 690px; color: #bcc9d7; font-size: clamp(18px, 2vw, 21px); line-height: 1.55; }
+      .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 30px; }
+      .trust { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 28px; color: #c7d2df; font-family: "Geist Mono", monospace; font-size: 12px; }
+      .trust span { border: 1px solid var(--line); background: rgba(255,255,255,0.035); border-radius: 999px; padding: 7px 9px; }
+      .browser {
+        border: 1px solid var(--line-strong); border-radius: 22px; overflow: hidden; background: #080b10;
+        box-shadow: var(--shadow); position: relative; margin: 0; container-type: inline-size;
+      }
+      .browser img { width: 100%; height: calc(100cqw * 9 / 16); max-height: 520px; object-fit: cover; object-position: top left; background: #0b1017; }
+      .browser::after { content: ""; position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 1px rgba(255,255,255,0.1); border-radius: inherit; }
+      .browser-top { height: 42px; display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.045); }
+      .dot { width: 10px; height: 10px; border-radius: 999px; background: rgba(255,255,255,0.24); }
+      .dot:nth-child(1) { background: #ff6b7f; } .dot:nth-child(2) { background: #ffbf5b; } .dot:nth-child(3) { background: #41e69f; }
+      .address { margin-left: 8px; flex: 1; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; color: #93a0ae; font: 12px "Geist Mono", monospace; background: rgba(0,0,0,0.22); }
+      .caption { padding: 11px 14px 13px; border-top: 1px solid var(--line); color: #aab6c3; font-size: 13px; }
+      .pillars { padding: 32px 0 36px; }
+      .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+      .card { border: 1px solid var(--line); border-radius: 22px; background: var(--panel); padding: 22px; box-shadow: inset 0 1px rgba(255,255,255,0.05); }
+      .card h3 { margin: 12px 0 8px; font-size: 18px; letter-spacing: -0.03em; }
+      .card p { margin: 0; color: var(--muted); line-height: 1.55; }
+      .icon { width: 34px; height: 34px; border-radius: 12px; display: grid; place-items: center; background: linear-gradient(135deg, rgba(103,184,255,0.22), rgba(92,230,223,0.12)); border: 1px solid var(--line); }
+      .section { padding: 84px 0; }
+      .section-head { max-width: 920px; margin-bottom: 34px; }
+      .kicker { color: var(--green); font: 650 12px "Geist Mono", monospace; letter-spacing: 0.12em; text-transform: uppercase; }
+      h2 { margin: 10px 0 12px; font-size: clamp(34px, 4.8vw, 58px); line-height: 1; letter-spacing: -0.06em; }
+      .section-head p, .feature-copy p, .fit p, .security p { color: var(--muted); line-height: 1.65; font-size: 16px; }
+      .feature { display: grid; grid-template-columns: minmax(760px, 1.45fr) minmax(360px, 0.55fr); gap: 40px; align-items: center; padding: 34px 0; }
+      .feature:nth-child(even) { grid-template-columns: minmax(360px, 0.55fr) minmax(760px, 1.45fr); }
+      .feature:nth-child(even) .feature-copy { order: -1; }
+      .feature-copy { padding: 8px; max-width: 520px; }
+      .feature-copy h3 { margin: 0 0 12px; font-size: clamp(26px, 3vw, 38px); line-height: 1.08; letter-spacing: -0.05em; }
+      .mini-list { margin: 18px 0 0; padding: 0; list-style: none; display: grid; gap: 10px; color: #cbd6e2; }
+      .mini-list li { display: flex; gap: 10px; align-items: flex-start; }
+      .mini-list li::before { content: ""; margin-top: 8px; width: 6px; height: 6px; border-radius: 99px; background: var(--cyan); flex: 0 0 auto; }
+      .architecture { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+      .flow { border: 1px solid var(--line); border-radius: 22px; background: linear-gradient(180deg, rgba(255,255,255,0.065), rgba(255,255,255,0.025)); padding: 22px; }
+      .flow h3 { margin: 0 0 14px; }
+      .flow ol { margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.8; }
+      .spec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      .spec { border: 1px solid var(--line); border-radius: 20px; background: var(--panel); padding: 20px; }
+      .spec h3 { margin: 0 0 8px; }
+      .spec p { margin: 0; color: var(--muted); line-height: 1.6; }
+      .deploy { display: grid; grid-template-columns: 0.82fr 1.18fr; gap: 24px; align-items: start; }
+      .deploy-code { margin-top: 24px; }
+      .steps { display: grid; gap: 12px; }
+      .step { border: 1px solid var(--line); border-radius: 18px; padding: 16px; background: var(--panel); }
+      .step strong { display: block; margin-bottom: 5px; }
+      .step span { color: var(--muted); line-height: 1.5; }
+      pre { margin: 0; overflow: auto; padding: 22px; border: 1px solid var(--line); border-radius: 22px; background: #030507; color: #d9f1ff; line-height: 1.7; box-shadow: var(--shadow); }
+      .fit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      .fit.good { border-color: rgba(65,230,159,0.35); } .fit.not { border-color: rgba(255,107,127,0.35); }
+      .fit h3 { margin: 0 0 14px; }
+      .fit ul { margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.8; }
+      .security-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+      .faq { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+      details { border: 1px solid var(--line); border-radius: 18px; background: var(--panel); padding: 18px 20px; }
+      summary { cursor: pointer; font-weight: 650; }
+      details p { color: var(--muted); line-height: 1.6; margin: 12px 0 0; }
+      footer { border-top: 1px solid var(--line); padding: 34px 0; color: var(--muted); }
+      .footer-inner { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+      .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
+      .footer-links a:hover { color: var(--text); }
+      @media (max-width: 1180px) {
+        .hero-grid, .feature, .feature:nth-child(even), .deploy { grid-template-columns: 1fr; }
+        .feature:nth-child(even) .feature-copy { order: 0; }
+        .cards, .architecture, .security-grid { grid-template-columns: 1fr; }
+        .hero { padding-top: 64px; }
+      }
+      @media (max-width: 720px) {
+        .nav-links a:not(.button) { display: none; }
+        .section, .nav-inner, .footer-inner { width: min(100% - 28px, 1440px); }
+        .spec-grid, .fit-grid, .faq { grid-template-columns: 1fr; }
+        .browser-top { height: 36px; } .address { display: none; }
+        h1 { font-size: clamp(44px, 16vw, 68px); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <nav class="nav" aria-label="Primary navigation">
+        <div class="nav-inner">
+          <a class="brand" href="#top" aria-label="Mailcove home"><span class="brand-mark" aria-hidden="true">M</span><span>Mailcove</span></a>
+          <div class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#architecture">Architecture</a>
+            <a href="#deploy">Deploy</a>
+            <a class="button primary" href="https://github.com/JacobPritchett/mailcove">GitHub <span aria-hidden="true">→</span></a>
+          </div>
+        </div>
+      </nav>
+
+      <main>
+      <header id="top" class="hero section">
+        <div class="hero-grid">
+          <div>
+            <span class="eyebrow">Self-hosted email on Cloudflare</span>
+            <h1>Your domain. Your inbox. Your Cloudflare account.</h1>
+            <p class="lead">
+              Mailcove is a send-and-receive custom-domain inbox that runs on Cloudflare Workers. Mail lands in your R2 and D1, sends from your domain, and stays behind Cloudflare Access.
+            </p>
+            <div class="hero-actions">
+              <a class="button primary" href="https://github.com/JacobPritchett/mailcove">Deploy from GitHub →</a>
+              <a class="button" href="#architecture">Read the architecture</a>
+            </div>
+            <div class="trust" aria-label="Cloudflare primitives used by Mailcove">
+              <span>Workers</span><span>D1</span><span>R2</span><span>Email Routing</span><span>Email Sending</span><span>Access</span><span>Workers AI</span><span>MIT</span>
+            </div>
+          </div>
+          <figure class="browser">
+            <div class="browser-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="address">https://inbox.example.com</span></div>
+            <img src="/assets/screenshots/mailcove-inbox.png" width="1440" height="920" alt="Mailcove app showing a three-pane inbox with folders, threaded messages, and an open conversation" />
+            <figcaption class="caption">Custom-domain inbox, threaded conversations, full-text search, and an Access-protected UI.</figcaption>
+          </figure>
+        </div>
+      </header>
+
+      <section class="pillars section" aria-labelledby="pillars-title">
+        <div class="section-head">
+          <span class="kicker">Why Mailcove</span>
+          <h2 id="pillars-title">Custom-domain email on Cloudflare primitives.</h2>
+        </div>
+        <div class="cards">
+          <article class="card"><div class="icon">⚡</div><h3>Serverless by default</h3><p>Inbound mail wakes a Worker, gets parsed, stored, indexed, and stops. Cloudflare handles the edge work.</p></article>
+          <article class="card"><div class="icon">◎</div><h3>You own the data</h3><p>Raw mail and attachments live in your R2. Metadata, threads, and search live in your D1. It is your Cloudflare account.</p></article>
+          <article class="card"><div class="icon">◇</div><h3>Private by default</h3><p>The inbox UI sits behind Cloudflare Access, and the Worker verifies the Access JWT on API requests.</p></article>
+        </div>
+      </section>
+
+      <section id="features" class="section" aria-labelledby="features-title">
+        <div class="section-head">
+          <span class="kicker">Product walkthrough</span>
+          <h2 id="features-title">A real inbox for domains you control.</h2>
+          <p>Read, search, reply, switch between rich email and chat-style threads, and manage routing from one private UI. Mailcove keeps the familiar parts of email while moving the storage and control plane into your Cloudflare account.</p>
+        </div>
+
+        <article class="feature">
+          <figure class="browser"><div class="browser-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="address">inbox.example.com/search</span></div><img src="/assets/screenshots/mailcove-search.png" width="1440" height="920" alt="Mailcove search results filtered to a pizza thread" /></figure>
+          <div class="feature-copy"><span class="kicker">Search</span><h3>Find anything. Catch up in three bullets.</h3><p>Full-text search runs across every message in your own D1. Open a thread and Workers AI summarizes the conversation inline: what was decided, what is pending, and what needs a reply.</p><ul class="mini-list"><li>FTS5 search over subject, participants, and body text.</li><li>AI summaries and drafts use Cloudflare Workers AI.</li><li>Your search index lives in D1.</li></ul></div>
+        </article>
+
+        <article class="feature">
+          <figure class="browser"><div class="browser-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="address">inbox.example.com/thread</span></div><img src="/assets/screenshots/mailcove-ai-summary.png" width="1440" height="920" alt="Mailcove thread with an AI summary panel listing three bullet points above the conversation" /></figure>
+          <div class="feature-copy"><span class="kicker">AI</span><h3>Catch up on a long thread before you reply.</h3><p>Summarize a conversation into a few bullets, or have a reply drafted for you. Both run on Workers AI in your own Cloudflare account, and a draft always lands in the composer as editable text rather than being sent for you.</p><ul class="mini-list"><li>Thread summaries and draft replies via Workers AI.</li><li>Drafts open in the composer so you edit before sending.</li><li>Both share one model constant in the source.</li></ul></div>
+        </article>
+
+        <article class="feature">
+          <figure class="browser"><div class="browser-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="address">inbox.example.com/thread</span></div><img src="/assets/screenshots/mailcove-chat.png" width="1440" height="920" alt="Mailcove chat view showing a cleaned-up conversation thread" /></figure>
+          <div class="feature-copy"><span class="kicker">Rich + chat</span><h3>Read the original email, then switch to the clean thread.</h3><p>Rich view keeps formatted email in a sandboxed frame. Chat view turns the same thread into plain conversation bubbles, stripping the email cruft when you just want to catch up and reply.</p><ul class="mini-list"><li>Toggle between Rich and Chat per thread.</li><li>Thread-aware replies.</li><li>Multiple send identities.</li></ul></div>
+        </article>
+
+        <article class="feature">
+          <figure class="browser"><div class="browser-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="address">inbox.example.com/domains</span></div><img src="/assets/screenshots/mailcove-domains.png" width="1440" height="920" alt="Mailcove domain management dialog showing Email Routing and sending setup" /></figure>
+          <div class="feature-copy"><span class="kicker">Domains</span><h3>Email Routing from the same UI.</h3><p>Manage receiving, sending, catch-all behavior, forwarding destinations, and per-address rules for the domains in your Cloudflare account. Changes apply to live Email Routing, so the UI treats them as real infrastructure operations.</p><ul class="mini-list"><li>Catch-all to inbox, forward, or drop.</li><li>Per-address routing rules.</li><li>Sending domains and sender display names.</li></ul></div>
+        </article>
+
+        <article class="feature">
+          <figure class="browser"><div class="browser-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="address">⌘K</span></div><img src="/assets/screenshots/mailcove-command-palette.png" width="1440" height="920" alt="Mailcove command palette with compose, search, rules, domains, and navigation actions" /></figure>
+          <div class="feature-copy"><span class="kicker">Keyboard</span><h3>Built for people who live in the keyboard.</h3><p>A command palette and shortcut set cover the flow you use all day: compose, search, jump to rules, switch views, archive, star, and reply from the keyboard.</p><ul class="mini-list"><li>⌘K command palette.</li><li>Fast view switching.</li><li>Shortcuts for common mail actions.</li></ul></div>
+        </article>
+      </section>
+
+      <section id="architecture" class="section" aria-labelledby="architecture-title">
+        <div class="section-head">
+          <span class="kicker">Architecture</span>
+          <h2 id="architecture-title">Three flows, one Worker.</h2>
+          <p>Mail arrives, a Worker wakes up, does the job, and stops. You pay for invocations instead of uptime.</p>
+        </div>
+        <div class="architecture">
+          <article class="flow"><h3>Inbound</h3><ol><li><code>*@example.com</code> hits Email Routing.</li><li>The Worker <code>email()</code> handler parses with postal-mime.</li><li>Raw EML, bodies, and attachments go to R2. Threads and search rows go to D1.</li></ol></article>
+          <article class="flow"><h3>Outbound</h3><ol><li>The app calls <code>POST /api/send</code>.</li><li>The <code>send_email</code> binding sends from your sending domain.</li><li><code>Reply-To</code> points back to your real custom-domain address.</li></ol></article>
+          <article class="flow"><h3>UI</h3><ol><li>React app ships through Workers Assets.</li><li>Cloudflare Access protects the inbox host.</li><li>API requests are verified before mail data leaves storage.</li></ol></article>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="running-title">
+        <div class="section-head"><span class="kicker">What you run</span><h2 id="running-title">Managed primitives for mail.</h2></div>
+        <div class="spec-grid">
+          <article class="spec"><h3>D1 for metadata and search</h3><p>Threads, folders, unread state, identities, rules, and FTS5 search live in SQLite in your account.</p></article>
+          <article class="spec"><h3>R2 for raw mail and attachments</h3><p>Keep the original message source, parsed bodies, and binary attachments in object storage you control.</p></article>
+          <article class="spec"><h3>Email Routing and Email Sending</h3><p>Cloudflare handles the mail edge. Mailcove handles parsing, app logic, storage, search, and UI.</p></article>
+          <article class="spec"><h3>Access and Workers AI</h3><p>Access protects the inbox. Workers AI powers optional summaries and drafts from the thread text you choose to send it.</p></article>
+        </div>
+      </section>
+
+      <section id="deploy" class="section" aria-labelledby="deploy-title">
+        <div class="deploy">
+          <div class="section-head"><span class="kicker">Deploy</span><h2 id="deploy-title">Deploy it to your own account in an afternoon.</h2><p>Bring a Cloudflare account, a domain, and Wrangler. The setup is infrastructure work, but it is the kind you can finish in an afternoon.</p></div>
+          <div class="steps"><div class="step"><strong>1. Provision</strong><span>Create the D1 database and R2 bucket, then apply migrations.</span></div><div class="step"><strong>2. Route</strong><span>Enable Email Routing catch-all and Email Sending for your domain.</span></div><div class="step"><strong>3. Protect</strong><span>Put the inbox hostname behind Cloudflare Access.</span></div><div class="step"><strong>4. Deploy</strong><span>Build the app and ship the Worker.</span></div></div>
+        </div>
+        <pre class="deploy-code" aria-label="Deployment command sketch"><code>git clone https://github.com/JacobPritchett/mailcove
+cd mailcove
+npm install
+# create D1 + R2, apply migrations
+# enable Email Routing + Email Sending
+# protect the inbox host with Cloudflare Access
+npm run build && wrangler deploy</code></pre>
+      </section>
+
+      <section class="section" aria-labelledby="fit-title">
+        <div class="section-head"><span class="kicker">Fit</span><h2 id="fit-title">Honest about who it is for.</h2></div>
+        <div class="fit-grid">
+          <article class="card fit good"><h3>Good fit</h3><ul><li>You own one or more domains on Cloudflare.</li><li>You are comfortable running Wrangler and reading deploy logs.</li><li>You want catch-all addresses and custom-domain mail while avoiding one paid mailbox per address.</li><li>You want the raw mail and attachments in your own storage.</li></ul></article>
+          <article class="card fit not"><h3>Skip it if</h3><ul><li>You want a zero-config consumer Gmail replacement.</li><li>You need hosted support, migration tooling, team admin, or mobile push on day one.</li><li>You prefer someone else to operate the Cloudflare resources.</li><li>You need a compliance-certified mailbox vendor.</li></ul></article>
+        </div>
+      </section>
+
+      <section class="section security" aria-labelledby="security-title">
+        <div class="section-head"><span class="kicker">Security</span><h2 id="security-title">Private by construction.</h2></div>
+        <div class="security-grid">
+          <article class="card"><h3>Access on every request</h3><p>The Worker verifies Access JWT issuer and audience before serving private API data.</p></article>
+          <article class="card"><h3>Sandboxed rendering</h3><p>Email bodies render in sandboxed iframes, with plain messages adapting to light or dark mode and designed HTML still allowed to bring its own styling.</p></article>
+          <article class="card"><h3>Your storage only</h3><p>Raw EML, parsed bodies, and attachments stay in your R2. Metadata and search stay in your D1.</p></article>
+          <article class="card"><h3>Know what AI sees</h3><p>Thread text is sent to Workers AI only for summaries and drafts that you request.</p></article>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="faq-title">
+        <div class="section-head"><span class="kicker">FAQ</span><h2 id="faq-title">Practical questions.</h2></div>
+        <div class="faq">
+          <details><summary>Is this a hosted email service?</summary><p>No. You deploy it to your own Cloudflare account, using your storage, your domain, and your Access policy.</p></details>
+          <details><summary>Does it replace Gmail?</summary><p>For the right person, maybe. It is aimed at developers, small organizations, and tinkerers who care more about custom-domain control than consumer-mailbox polish.</p></details>
+          <details><summary>Where does mail live?</summary><p>Raw messages and attachments live in R2. Message metadata, thread state, rules, and search indexes live in D1.</p></details>
+          <details><summary>Should the public site be the same hostname as the inbox?</summary><p>No. Keep this public website separate from the Access-protected inbox host, for example <code>mail.example.com</code> for the site and <code>inbox.example.com</code> for the app.</p></details>
+        </div>
+      </section>
+      </main>
+
+      <footer>
+        <div class="footer-inner"><div class="brand"><span class="brand-mark" aria-hidden="true">M</span><span>Mailcove</span></div><div class="footer-links"><a href="https://github.com/JacobPritchett/mailcove">GitHub</a><a href="https://github.com/JacobPritchett/mailcove/blob/main/docs/DEPLOY.md">Deploy guide</a><a href="https://github.com/JacobPritchett/mailcove/blob/main/SECURITY.md">Security</a><a href="https://github.com/JacobPritchett/mailcove/blob/main/LICENSE">MIT License</a></div></div>
+      </footer>
+    </div>
+  </body>
+</html>
