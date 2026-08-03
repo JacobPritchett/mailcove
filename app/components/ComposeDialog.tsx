@@ -60,12 +60,23 @@ export interface ComposeInitial {
   threadId?: string;
   /** Identity domain to reply as (the domain the original mail was sent to). */
   fromDomain?: string;
-  /** The quoted history, when this prefill IS a reply built by
-   *  buildReplyInitial. Absent on a resumed draft or a handoff from the inline
-   *  composer, whose `text` is a whole body the user may already have written -
-   *  seeding into that would duplicate the signature and, because seeding goes
-   *  through setPlainText, replace the rich document with flattened text. */
+  /** The quoted history, whenever this prefill is a reply — including one
+   *  handed over from the inline composer. `text` is NOT a substitute: on a
+   *  handoff it is the whole live body (the user's words, their signature and
+   *  the quote), and on a resumed draft it is everything they ever wrote.
+   *  Anything that wants "just the history" has to read this. */
   replyQuote?: string;
+  /** The signature is already in `text`. Separate from `replyQuote` because
+   *  they answer different questions — "what is the quoted history?" and "may a
+   *  signature still be seeded into this body?" — and conflating them meant the
+   *  only way to say no to the second was to lie about the first, which is what
+   *  starved the AI-draft path of the quote.
+   *
+   *  Not load-bearing today: the "untouched" check below independently refuses
+   *  to seed over a body that differs from the seed, and a handed-off body
+   *  always does. Kept because it states the intent directly rather than
+   *  leaving it to a coincidence of that comparison. */
+  signatureApplied?: boolean;
   /** Resume state (opening a saved draft). */
   draftId?: string;
   /** Stringified TipTap document — wins over `text` for the body seed. */
@@ -342,7 +353,7 @@ export default function ComposeDialog({
     if (!open) return;
     // A prefill that is not a reply carries a body the USER owns (resumed
     // draft, inline handoff). Never seed into that.
-    if (initial && initial.replyQuote === undefined) return;
+    if (initial && (initial.replyQuote === undefined || initial.signatureApplied)) return;
     const quote = initial?.replyQuote ?? "";
     const sig = signatureFor(fromDomain);
     const desired = bodySeedWithSignature(quote, sig);
@@ -604,15 +615,17 @@ export default function ComposeDialog({
     );
   }
 
-  // Ask Workers AI to draft a reply, then place it above the quoted original
-  // (kept from `initial.text` so re-drafting never stacks the quote).
+  // Ask Workers AI to draft a reply, then place it above the quoted original —
+  // read from `replyQuote`, never from `text`. Re-drafting must not stack the
+  // quote, and after a handoff `text` is the whole live body, so using it put
+  // the user's own words and their signature back under the AI draft.
   function handleAiDraft() {
     const threadId = initial?.threadId;
     if (!threadId) return;
     aiDraft.mutate(threadId, {
       onSuccess: (res) => {
-        const quote = initial?.text ?? "";
-        const full = quote ? `${res.draft}\n\n${quote}` : res.draft;
+        const quote = initial?.replyQuote ?? "";
+        const full = quote ? `${res.draft}${quote}` : res.draft;
         // Replace everywhere: the mounted editor (setPlainText), the mirror,
         // and the mount seed (covers the editor chunk mounting later). The
         // rich-doc seed AND the autosave snapshot are now stale — drop both so

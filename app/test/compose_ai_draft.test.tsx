@@ -28,12 +28,26 @@ function renderDialog(initial?: ComposeInitial) {
   );
 }
 
+const QUOTE = "\n\n----- On Mon, Alice wrote -----\n> the original message";
+
 const REPLY_INITIAL: ComposeInitial = {
   to: "alice@example.com",
   subject: "Re: Lunch",
-  text: "\n\n----- On Mon, Alice wrote -----\n> the original message",
+  text: QUOTE,
+  replyQuote: QUOTE,
   inReplyTo: "<m1@example.com>",
   threadId: "t1",
+};
+
+/**
+ * What the inline composer hands over when it is expanded: `text` is the LIVE
+ * body - the user's words, their signature and the quote - while `replyQuote`
+ * is still just the quote.
+ */
+const HANDED_OFF: ComposeInitial = {
+  ...REPLY_INITIAL,
+  text: `My own words.\n\nSam Rivera${QUOTE}`,
+  signatureApplied: true,
 };
 
 beforeEach(() => vi.clearAllMocks());
@@ -64,6 +78,21 @@ describe("ComposeDialog — Draft with AI", () => {
     expect(body.value).toContain("the original message");
     // Draft comes first.
     expect(body.value.indexOf("Sounds great")).toBeLessThan(body.value.indexOf("the original"));
+  });
+
+  it("does not stack the user's own words under the AI draft after a handoff", async () => {
+    // `initial.text` is the whole live body once a reply has been expanded from
+    // the inline composer, so treating it as "the quote" put the user's typed
+    // reply and their signature back underneath the AI draft.
+    vi.mocked(draftReply).mockResolvedValue({ ok: true, draft: "AI DRAFT." });
+    renderDialog(HANDED_OFF);
+
+    fireEvent.click(screen.getByRole("button", { name: /draft with ai/i }));
+    const body = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    await waitFor(() => expect(body.value).toContain("AI DRAFT."));
+
+    expect(body.value).not.toContain("My own words.");
+    expect(body.value).toContain("the original message");
   });
 
   it("re-drafting does not stack the quote (uses the original quote, not the current body)", async () => {

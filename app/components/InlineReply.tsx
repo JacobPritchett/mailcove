@@ -326,14 +326,13 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
                 onOpenFull({
                   ...initial,
                   text: text || initial.text,
-                  // Drop the reply marker ONLY once we have actually seeded:
-                  // the body we hand over then already carries the signature,
-                  // and leaving it set would let the dialog seed a second one
-                  // into the user's text (flattening the rich document doing
-                  // it). Expanding before identities resolve is a real window,
-                  // though, and handing off unmarked there produced a reply
-                  // that never got signed at all.
-                  replyQuote: hasSeededRef.current ? undefined : initial.replyQuote,
+                  // The quote always travels; whether a signature may still be
+                  // seeded is a separate fact. Dropping the quote to say "do
+                  // not seed" left the dialog with no idea what the history
+                  // was, so its AI draft rebuilt the body from the whole live
+                  // text - stacking the user's own words under the draft.
+                  replyQuote: initial.replyQuote,
+                  signatureApplied: hasSeededRef.current,
                   bodyJson: docJsonRef.current || undefined,
                   draftId: draftIdRef.current ?? undefined,
                 });
