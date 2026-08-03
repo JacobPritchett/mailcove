@@ -1,0 +1,176 @@
+// Recipient suggestions derived from mail you have already exchanged.
+//
+// No new storage: the `messages` table already holds every address you have
+// corresponded with. People you have WRITTEN to are the strongest signal, so
+// outbound recipients rank above inbound senders, and recency breaks ties.
+
+export interface Contact {
+  /** Address, lowercased. */
+  email: string;
+  /** Display name if one was ever seen, else "". */
+  name: string;
+}
+
+export interface ContactsEnv {
+  DB: D1Database;
+}
+
+/** Max suggestions returned. A dropdown longer than this is noise. */
+export const MAX_CONTACTS = 8;
+/** Rows scanned per direction. This makes suggestions "recently contacted",
+ *  not "most contacted": on a busy mailbox 400 messages may be only days. */
+const SCAN_LIMIT = 400;
+/** Cap on a single stored address-list value before parsing. */
+const MAX_ADDRESS_LIST_CHARS = 4000;
+/** Deliberately STRICTER than the compose field's validator, which accepts
+ *  "a@x.com>" because its domain class only excludes whitespace and "@". A
+ *  suggestion we offer should always be sendable, so require a real dotted
+ *  domain and exclude the punctuation that only shows up in malformed headers. */
+const ADDRESS_RE =
+  /^[^\s@<>,;"()]+@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+
+/**
+ * Split a stored address list ("A <a@x>, b@y") into individual entries.
+ * Stored values come from headers, so they are comma-joined and may carry
+ * display names, quotes and angle brackets.
+ */
+export function parseAddressList(raw: unknown): Contact[] {
+  // Bound the input. Header values are attacker-controlled (msg_from is built
+  // from parsed.from.name), and a 40 KB run of "<" is a real inbound message.
+  const value = String(raw ?? "").slice(0, MAX_ADDRESS_LIST_CHARS);
+  if (!value) return [];
+  const out: Contact[] = [];
+  // Split on commas outside a quoted display name or an angle-addr. `quoted`
+  // gates the depth counter: a "<" inside a quoted name is text, not a bracket,
+  // and letting it move depth swallowed every address after it.
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  let current = "";
+  for (const ch of value) {
+    if (escaped) {
+      escaped = false;
+      current += ch;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      current += ch;
+      continue;
+    }
+    if (ch === '"') quoted = !quoted;
+    else if (!quoted && ch === "<") depth++;
+    else if (!quoted && ch === ">") depth = Math.max(0, depth - 1);
+    // Semicolons separate addresses too, and terminate RFC 5322 group syntax.
+    if ((ch === "," || ch === ";") && !quoted && depth === 0) {
+      out.push(...parseOne(current));
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  out.push(...parseOne(current));
+  return out;
+}
+
+function parseOne(entry: string): Contact[] {
+  let s = entry.trim();
+  if (!s) return [];
+  // Drop an RFC 5322 comment ("a@x.com (Alice)") and a group label ("Team: ...").
+  s = s.replace(/\([^)]*\)/g, " ").trim();
+  const colon = s.indexOf(":");
+  if (colon !== -1 && !s.slice(0, colon).includes("@")) s = s.slice(colon + 1).trim();
+
+  // Index scan rather than /^(.*)<([^>]+)>$/: that regex backtracks quadratically
+  // when it FAILS on a string with many "<", which one inbound message can
+  // trigger. Measured 4x per doubling; 40k "<" cost ~570 ms per call.
+  let email: string;
+  let name = "";
+  const lt = s.lastIndexOf("<");
+  const gt = lt >= 0 ? s.indexOf(">", lt + 1) : -1;
+  if (lt >= 0 && gt > lt) {
+    email = s.slice(lt + 1, gt).trim();
+    name = s.slice(0, lt).trim();
+  } else {
+    email = s;
+  }
+  email = email.toLowerCase();
+  // Use the same shape the compose field validates with. A looser check let
+  // "a@x.com>" through, and it survived the client validator too, so the user
+  // could send to a broken address from a suggestion that looked fine.
+  if (!ADDRESS_RE.test(email)) return [];
+  name = name.replace(/^"(.*)"$/, "$1").replace(/\\(.)/g, "$1").trim();
+  return [{ email, name }];
+}
+
+/** True when `c` matches what the user has typed so far. */
+export function contactMatches(c: Contact, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return c.email.includes(q) || c.name.toLowerCase().includes(q);
+}
+
+/**
+ * Suggest recipients for `query`, most useful first.
+ *
+ * Ranking: addresses you have sent to outrank ones that have only written to
+ * you (you chose the former; anyone can be the latter, including spam), and
+ * more recent contact wins within each group.
+ */
+export async function suggestContacts(
+  env: ContactsEnv,
+  query: string,
+  limit = MAX_CONTACTS,
+): Promise<Contact[]> {
+  const [sent, received] = await Promise.all([
+    env.DB.prepare(
+      // folder is set once at insert ('sent' for outbound, 'inbox' for inbound)
+      // and never mutated - archiving and trashing move `state`, not `folder`.
+      // Naming it lets this use idx_messages_folder_date(folder, date DESC);
+      // filtering on `direction` alone forces a full scan plus a temp B-tree
+      // sort. `direction` stays for correctness if those ever diverge.
+      `SELECT msg_to AS addrs FROM messages
+        WHERE folder='sent' AND direction='out' AND msg_to IS NOT NULL AND msg_to <> ''
+        ORDER BY date DESC LIMIT ?`,
+    )
+      .bind(SCAN_LIMIT)
+      .all<{ addrs: string }>(),
+    env.DB.prepare(
+      `SELECT msg_from AS addrs FROM messages
+        WHERE folder='inbox' AND direction='in' AND msg_from IS NOT NULL AND msg_from <> ''
+        ORDER BY date DESC LIMIT ?`,
+    )
+      .bind(SCAN_LIMIT)
+      .all<{ addrs: string }>(),
+  ]);
+
+  // Build the identity map FIRST, then filter. Filtering during collection
+  // matched on name, and a sent row for an address you typed bare carries no
+  // display name - so a name query skipped it in the sent group and picked it
+  // up in the received group, ranking a stranger above someone you email daily.
+  const seen = new Map<string, Contact & { sent: boolean }>();
+  const add = (rows: { addrs: string }[] | undefined, sent: boolean) => {
+    for (const row of rows ?? []) {
+      for (const c of parseAddressList(row.addrs)) {
+        const existing = seen.get(c.email);
+        if (!existing) seen.set(c.email, { ...c, sent });
+        else {
+          // Rows arrive newest-first, so first sighting wins on order; a later
+          // row may still carry the display name an earlier one lacked, and
+          // being in the sent group at all outranks received-only.
+          if (!existing.name && c.name) existing.name = c.name;
+          if (sent) existing.sent = true;
+        }
+      }
+    }
+  };
+  add(sent.results, true);
+  add(received.results, false);
+
+  const all = Array.from(seen.values());
+  const matches = all.filter((c) => contactMatches(c, query));
+  // Stable partition: sent-group first, each group still newest-first.
+  return [...matches.filter((c) => c.sent), ...matches.filter((c) => !c.sent)]
+    .slice(0, limit)
+    .map(({ email, name }) => ({ email, name }));
+}

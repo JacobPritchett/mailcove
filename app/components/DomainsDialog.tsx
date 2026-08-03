@@ -32,6 +32,10 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+
+/** Mirrors MAX_SIGNATURE_CHARS in src/domains.ts - the server truncates there. */
+const MAX_SIGNATURE_CHARS = 2000;
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -211,6 +215,7 @@ function ConnectCards({ detail, inboxWorker }: { detail: DomainDetail; inboxWork
         )}
         {snd.kind === "off" && <p className="text-sm text-muted-foreground">Sending not enabled.</p>}
         {snd.kind !== "off" && <SenderNameSetting detail={detail} />}
+        {snd.kind !== "off" && <SignatureSetting detail={detail} />}
         {snd.kind !== "apex" && (
           <ConfirmButton
             disabled={connectSending.isPending}
@@ -473,6 +478,76 @@ function ForwardCopySetting({ detail }: { detail: DomainDetail }) {
 }
 
 /**
+ * Signature seeded into NEW messages composed from this identity. Plain text on
+ * purpose: it is dropped into the compose body, and markup there would ride out
+ * on every message sent from the domain. Replies do not get one - a reply's
+ * body is a caret line plus a trimmable quote block.
+ */
+function SignatureSetting({ detail }: { detail: DomainDetail }) {
+  const settings = useDomainSettings(detail.zoneId);
+  const save = useSetDomainSettings();
+  const [draft, setDraft] = useState<string | null>(null);
+  if (!settings.data) return null;
+  const saved = settings.data.signature ?? "";
+  const value = draft ?? saved;
+  const dirty = draft !== null && draft.trimEnd() !== saved;
+
+  function saveSignature() {
+    const trimmed = (draft ?? "").trimEnd();
+    save.mutate(
+      // "" clears it (stored as null).
+      { zoneId: detail.zoneId, patch: { signature: trimmed || null } },
+      {
+        onSuccess: () => {
+          toast.success("Signature saved");
+          setDraft(null);
+        },
+        onError: (e) => toast.error(e instanceof Error ? e.message : "Couldn't save signature"),
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-1 pt-1">
+      <label htmlFor={`signature-${detail.zoneId}`} className="text-xs text-muted-foreground">
+        Signature on new messages:
+      </label>
+      <Textarea
+        id={`signature-${detail.zoneId}`}
+        value={value}
+        onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setDraft(e.target.value)}
+        rows={3}
+        // The server caps at MAX_SIGNATURE_CHARS. Without this the field accepts
+        // more, saves, toasts success, and the value silently comes back cut.
+        maxLength={MAX_SIGNATURE_CHARS}
+        placeholder={"Your name\nCompany"}
+        className="min-h-20 text-xs"
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-8 text-xs max-md:h-11"
+          disabled={save.isPending || !dirty}
+          onClick={saveSignature}
+          aria-label="Save signature"
+        >
+          Save
+        </Button>
+        <p className="text-xs text-muted-foreground">
+          {`Added to new messages from this identity. Replies are left alone.${
+            value.length > MAX_SIGNATURE_CHARS - 200
+              ? ` ${MAX_SIGNATURE_CHARS - value.length} characters left.`
+              : ""
+          }`}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Sending profile: the From display name recipients see on mail sent as this
  * domain. Empty = the derived default ("Example" for example.com). Saved to the
  * domain registry; compose prefills it and allows a per-message override.
@@ -519,16 +594,16 @@ function SenderNameSetting({ detail }: { detail: DomainDetail }) {
             }
           }}
           placeholder={displayNameDefault}
-          aria-label="Sender display name"
           className="h-8 w-44 max-w-full text-xs"
         />
         <Button
           type="button"
           size="sm"
           variant="outline"
-          className="h-8 text-xs"
+          className="h-8 text-xs max-md:h-11"
           disabled={save.isPending || !dirty}
           onClick={saveName}
+          aria-label="Save sender name"
         >
           Save
         </Button>

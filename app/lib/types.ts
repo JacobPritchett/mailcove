@@ -154,6 +154,8 @@ export interface SendIdentity {
   /** Onboarded Email Sending domain carrying the transport From header. */
   sendingDomain: string;
   displayName: string;
+  /** Plain-text signature seeded into new messages from this identity. */
+  signature: string;
 }
 export interface IdentitiesResponse {
   identities: SendIdentity[];
@@ -260,11 +262,14 @@ export interface DomainSettings {
   displayName: string | null;
   /** The derived name used when displayName is null (e.g. "Example"). */
   displayNameDefault: string;
+  /** Plain-text signature seeded into new messages; null = none. */
+  signature: string | null;
 }
 /** PATCH /api/domains/:zoneId/settings — partial; only present fields change. */
 export interface DomainSettingsPatch {
   forwardCopyTo?: string | null;
   displayName?: string | null;
+  signature?: string | null;
 }
 /** POST /api/domains/:zoneId/sending response. */
 export interface ConnectSendingResponse {
@@ -294,3 +299,9 @@ export interface Filter {
 }
 export interface FiltersResponse { filters: Filter[]; }
 export interface NewFilter { field: FilterField; op: FilterOp; value: string; action: FilterAction; }
+
+/** A recipient suggestion derived from mail already exchanged. */
+export interface Contact {
+  email: string;
+  name: string;
+}

@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS domains (
   sending_domain  TEXT,               -- onboarded Email Sending domain (transport From), NULL = no sending
   receive_mode    TEXT,               -- 'inbox' | 'forward' | 'external' | 'off' (informational cache)
   forward_copy_to TEXT,               -- per-domain forward-copy override; NULL = global FORWARD_COPY_TO
-  display_name    TEXT,               -- From display name default for this identity
+  display_name    TEXT,
+  signature       TEXT,               -- From display name default for this identity
   created         INTEGER NOT NULL
 );
 

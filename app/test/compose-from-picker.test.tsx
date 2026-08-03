@@ -19,8 +19,8 @@ import { send, getIdentities } from "../lib/api";
 
 const TWO_IDENTITIES = {
   identities: [
-    { domain: "example.net", sendingDomain: "send.example.net", displayName: "Mailcove" },
-    { domain: "example.com", sendingDomain: "example.com", displayName: "Example" },
+    { domain: "example.net", sendingDomain: "send.example.net", displayName: "Mailcove", signature: "" },
+    { domain: "example.com", sendingDomain: "example.com", displayName: "Example", signature: "" },
   ],
   defaultLocal: "hello",
   defaultDomain: "example.net",

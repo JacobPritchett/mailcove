@@ -369,8 +369,13 @@ export function useSetDomainSettings() {
       setDomainSettings(zoneId, patch),
     onSuccess: (_d, { zoneId, patch }) => {
       void qc.invalidateQueries({ queryKey: ["domain-settings", zoneId] });
-      // A sender-name change shows up in the compose From prefill.
-      if ("displayName" in patch) void qc.invalidateQueries({ queryKey: ["identities"] });
+      // Both of these feed compose through GET /api/identities: the sender name
+      // via the From prefill, the signature via the seeded body. Without this
+      // the user saves a signature and the very next compose still seeds the
+      // old one until a reload.
+      if ("displayName" in patch || "signature" in patch) {
+        void qc.invalidateQueries({ queryKey: ["identities"] });
+      }
     },
   });
 }

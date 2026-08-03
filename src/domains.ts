@@ -23,6 +23,7 @@ export interface DomainRow {
   receive_mode: string | null;
   forward_copy_to: string | null;
   display_name: string | null;
+  signature: string | null;
 }
 
 /** One selectable From identity for the compose picker. */
@@ -33,6 +34,8 @@ export interface SendIdentity {
   sendingDomain: string;
   /** Default From display name for this identity. */
   displayName: string;
+  /** Plain-text signature appended to new messages, "" when unset. */
+  signature: string;
 }
 
 /** Same local-part sanitization as the legacy fromLocal path (src/index.ts). */
@@ -84,7 +87,7 @@ export async function listIdentities(env: DomainsEnv): Promise<SendIdentity[]> {
   let rows: DomainRow[] = [];
   try {
     const r = await env.DB.prepare(
-      `SELECT domain, zone_id, sending_domain, receive_mode, forward_copy_to, display_name
+      `SELECT domain, zone_id, sending_domain, receive_mode, forward_copy_to, display_name, signature
          FROM domains ORDER BY domain ASC`,
     ).all<DomainRow>();
     rows = r.results ?? [];
@@ -97,6 +100,7 @@ export async function listIdentities(env: DomainsEnv): Promise<SendIdentity[]> {
       domain: r.domain,
       sendingDomain: r.sending_domain as string,
       displayName: sanitizeFromName(r.display_name) || defaultDisplayName(r.domain),
+      signature: sanitizeSignature(r.signature),
     }));
   // A registry row for the default domain takes precedence over the env pair.
   const envDomain = env.INBOX_DOMAIN.toLowerCase();
@@ -105,6 +109,7 @@ export async function listIdentities(env: DomainsEnv): Promise<SendIdentity[]> {
     out.push({
       domain: env.INBOX_DOMAIN,
       sendingDomain: env.FROM_DOMAIN,
+      signature: sanitizeSignature(profile?.signature),
       // Custom sender name when one is saved; else derived ("Mailcove" for the
       // current config) so a re-configured INBOX_DOMAIN doesn't inherit another
       // product's name.
@@ -119,13 +124,14 @@ export async function listIdentities(env: DomainsEnv): Promise<SendIdentity[]> {
 // DDL mirror of migrations/0007-domains.sql. The connect flows bootstrap the
 // table on first use (CREATE TABLE IF NOT EXISTS is a no-op once it exists), so
 // user-driven onboarding works even before the migration file is applied.
-const DOMAINS_DDL = `CREATE TABLE IF NOT EXISTS domains (
+export const DOMAINS_DDL = `CREATE TABLE IF NOT EXISTS domains (
   domain          TEXT PRIMARY KEY,
   zone_id         TEXT,
   sending_domain  TEXT,
   receive_mode    TEXT,
   forward_copy_to TEXT,
   display_name    TEXT,
+  signature       TEXT,
   created         INTEGER NOT NULL
 )`;
 
@@ -162,7 +168,7 @@ export async function upsertDomain(env: { DB: D1Database }, u: DomainUpsert, now
 export async function getDomainRow(env: { DB: D1Database }, domain: string): Promise<DomainRow | null> {
   try {
     const r = await env.DB.prepare(
-      `SELECT domain, zone_id, sending_domain, receive_mode, forward_copy_to, display_name
+      `SELECT domain, zone_id, sending_domain, receive_mode, forward_copy_to, display_name, signature
          FROM domains WHERE domain = ?`,
     )
       .bind(domain.toLowerCase())
@@ -199,6 +205,40 @@ export async function setDomainForwardCopy(
  * default. Like setDomainForwardCopy, this sets the column EXPLICITLY,
  * including back to NULL. Callers sanitize before storing.
  */
+/**
+ * Trim a signature to something safe to seed into a compose body.
+ *
+ * Kept PLAIN TEXT on purpose: the value is the user's own, but seeding markup
+ * into the rich editor would let a stray tag alter every message sent from the
+ * identity. Newlines survive because a signature is inherently multi-line.
+ */
+export function sanitizeSignature(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]+/g, "")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trimEnd()
+    .slice(0, MAX_SIGNATURE_CHARS);
+}
+
+/** Long enough for a real sign-off, short enough not to dominate a message. */
+export const MAX_SIGNATURE_CHARS = 2000;
+
+export async function setDomainSignature(
+  env: { DB: D1Database },
+  domain: string,
+  value: string | null,
+  now: number,
+): Promise<void> {
+  await ensureDomainsTable(env);
+  await env.DB.prepare(
+    `INSERT INTO domains (domain, signature, created) VALUES (?,?,?)
+     ON CONFLICT(domain) DO UPDATE SET signature = excluded.signature`,
+  )
+    .bind(domain.toLowerCase(), value, now)
+    .run();
+}
+
 export async function setDomainDisplayName(
   env: { DB: D1Database },
   domain: string,
@@ -297,6 +337,7 @@ export async function resolveSender(
   return buildSender(local, {
     domain: env.INBOX_DOMAIN,
     sendingDomain: env.FROM_DOMAIN,
+    signature: sanitizeSignature(profile?.signature),
     // "Mailcove" under the current config — the historical legacy-path default.
     displayName:
       sanitizeFromName(profile?.display_name) || defaultDisplayName(env.INBOX_DOMAIN),

@@ -17,8 +17,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSend, useDraftReply, useIdentities } from "@/lib/queries";
-import { ApiError, putDraft, deleteDraft } from "@/lib/api";
+import { ApiError, putDraft, deleteDraft, getContacts } from "@/lib/api";
 import { commitRecipients } from "@/lib/recipients";
+import type { Contact } from "@/lib/types";
 import { docHasVisibleContent } from "@/lib/editorDoc";
 import { useComposeSuggestion } from "@/lib/useComposeSuggestion";
 import { cn } from "@/lib/utils";
@@ -119,6 +120,50 @@ export default function ComposeDialog({
   // Files staged for this message. Held in memory as base64 and shipped in the
   // send body; nothing is uploaded until the message is actually sent, so
   // closing the dialog costs nothing.
+  // Recipient suggestions from mail already exchanged. Fetched on demand while
+  // typing; failures are silent because this is a convenience, not a dependency.
+  const [contactHits, setContactHits] = useState<Contact[]>([]);
+  const [contactIndex, setContactIndex] = useState(0);
+  const contactSeq = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      setContactHits([]);
+      return;
+    }
+    const q = toInput.trim();
+    if (q.length < 2) {
+      setContactHits([]);
+      return;
+    }
+    const seq = ++contactSeq.current;
+    const t = setTimeout(() => {
+      getContacts(q)
+        .then((r) => {
+          // Ignore a response that a newer keystroke has already superseded.
+          if (seq !== contactSeq.current) return;
+          setContactHits(r.contacts.filter((c) => !recipients.includes(c.email)));
+          setContactIndex(0);
+        })
+        .catch(() => {
+          // Guard the failure path too: an older request that errors after a
+          // newer one succeeded would otherwise clear fresh suggestions.
+          if (seq === contactSeq.current) setContactHits([]);
+        });
+    }, 150);
+    return () => clearTimeout(t);
+  }, [toInput, open, recipients]);
+
+  /** Turn a suggested contact into a recipient chip. */
+  function acceptContact(c: Contact) {
+    const r = commitRecipients(recipients, c.email, { keepTrailing: false });
+    setRecipients(r.recipients);
+    setToInput("");
+    setToError(null);
+    setContactHits([]);
+    toInputRef.current?.focus();
+  }
+
   const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -172,6 +217,12 @@ export default function ComposeDialog({
   const aiDraft = useDraftReply();
   // Only repliable conversations (carry a threadId) can be AI-drafted.
   const canAiDraft = !!initial?.threadId;
+
+  /** Saved signature for a domain, "" when none or identities have not loaded. */
+  function signatureFor(domain: string | undefined): string {
+    if (!domain) return "";
+    return identities?.identities.find((i) => i.domain === domain)?.signature ?? "";
+  }
 
   // Sendable From identities (registry-backed). While the fetch is loading or
   // failed, fall back to the reply context's intended domain (the server still
@@ -231,6 +282,8 @@ export default function ComposeDialog({
     setToError(null);
     setSubject(initial?.subject ?? "");
     setText(initial?.text ?? "");
+    textRef.current = initial?.text ?? "";
+    seededSigRef.current = "";
     setBodySeed(initial?.text ?? "");
     setBodyJsonSeed(initial?.bodyJson ?? "");
     setBodyFocused(false);
@@ -252,9 +305,63 @@ export default function ComposeDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  // Signature seeding lives in its own effect, declared AFTER the [open] reset
+  // above, and that ordering is load-bearing twice over:
+  //   - the identity list is fetched WHEN the dialog opens, so it is always
+  //     undefined during the [open] effect and the signature never appeared;
+  //   - on reopen this must run after `text` is cleared, or the "do not
+  //     overwrite what the user typed" guard reads the PREVIOUS signature and
+  //     bails, so the signature came back only once per page load.
+  // New messages only: a reply's seed is a caret line plus a trimmable quote
+  // block, and splicing into that structure risks the quote handling.
+  // Mirrors `text`. An effect sees the render-time value of state, so the
+  // [open] reset above is NOT visible to the seeding effect in the same commit
+  // - guarding on `text` read the PREVIOUS session's signature and bailed.
+  const textRef = useRef("");
+  /** Exactly what seeding last wrote: distinguishes our own seed from anything
+   *  the user typed, AND lets a stale seed be replaced by a corrected one. */
+  const seededSigRef = useRef("");
+  useEffect(() => {
+    // Deliberately does NOT clear seededSigRef on close: the close-flush reads
+    // it to tell "only a signature" from real content, and clearing here made
+    // every abandoned compose save a junk draft again. The [open] effect above
+    // resets it on the way back in.
+    if (!open) return;
+    if (initial) return; // replies keep their caret line + quote block
+    const sig = signatureFor(fromDomain);
+    const desired = sig ? `\n\n${sig}` : "";
+    if (!desired || desired === seededSigRef.current) return;
+    // Compare VALUES rather than using a one-shot flag. The identities query is
+    // gated on `open`, so the first run after reopening reads the STALE cache
+    // and the refetch lands a moment later; a flag would seed the old signature
+    // and then refuse to correct it. Replace only our own seed, never typed text.
+    const body = textRef.current;
+    const untouched = body.trim() === "" || body.trim() === seededSigRef.current.trim();
+    if (!untouched) return;
+    seededSigRef.current = desired;
+    setText(desired);
+    textRef.current = desired;
+    setBodySeed(desired); // editor not mounted yet: initialText is read on mount
+    if (editorRef.current) editorRef.current.setPlainText(desired);
+    else {
+      // Lazy chunk: on reopen it can mount a tick later still carrying the
+      // previous session's text, which the seed prop alone will not replace.
+      const t = setTimeout(() => editorRef.current?.setPlainText(desired), 0);
+      return () => clearTimeout(t);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, identities, fromDomain]);
+
   /** Anything worth persisting as a draft? */
   function draftHasContent() {
-    return !!(text.trim() || subject.trim() || recipients.length || toInput.trim());
+    // A seeded signature is not content the user wrote. Counting it meant every
+    // opened-and-abandoned compose saved a draft containing nothing but the
+    // signature, and toasted "Draft saved" for it.
+    // Compare trimmed: when the editor is already mounted the seed goes through
+    // its serializer and comes back with different surrounding whitespace, so
+    // exact equality misses it and the junk draft is saved anyway.
+    const written = text.trim() === seededSigRef.current.trim() ? "" : text;
+    return !!(written.trim() || subject.trim() || recipients.length || toInput.trim());
   }
 
   /** Best-effort draft upsert (autosave path — failures stay silent). */
@@ -362,6 +469,25 @@ export default function ComposeDialog({
   function onToKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     // Let the form-level ⌘/Ctrl+Enter handler send instead of adding a chip.
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") return;
+    // Suggestion navigation takes precedence while the list is open, so Enter
+    // accepts the highlighted contact instead of committing the raw fragment.
+    if (contactHits.length) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setContactIndex((i) => (i + 1) % contactHits.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setContactIndex((i) => (i - 1 + contactHits.length) % contactHits.length);
+        return;
+      }
+      if (e.key === "Enter" || (e.key === "Tab" && !e.shiftKey)) {
+        e.preventDefault();
+        acceptContact(contactHits[contactIndex]);
+        return;
+      }
+    }
     if (e.key === "Enter" || e.key === ";" || e.key === ",") {
       e.preventDefault();
       flushToInput(toInput, false);
@@ -499,6 +625,15 @@ export default function ComposeDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
+        // Radix registers its Escape handler on `document` with capture, so a
+        // React onKeyDown (bubble, on #root) can never preventDefault in time.
+        // Escape used to close the whole compose window instead of the dropdown.
+        onEscapeKeyDown={(e) => {
+          if (contactHits.length) {
+            e.preventDefault();
+            setContactHits([]);
+          }
+        }}
         className="flex max-h-[100dvh] flex-col gap-0 overflow-hidden rounded-2xl border-border/70 p-0 shadow-2xl max-md:h-[100dvh] max-md:max-w-full max-md:rounded-none max-md:border-0 sm:max-w-xl"
       >
         {/* Header */}
@@ -548,7 +683,8 @@ export default function ComposeDialog({
               To
             </label>
             <div
-              className="flex flex-1 cursor-text flex-wrap items-center gap-1.5"
+              // relative: anchors the recipient-suggestion dropdown below.
+              className="relative flex flex-1 cursor-text flex-wrap items-center gap-1.5"
               onClick={() => toInputRef.current?.focus()}
             >
               {recipients.map((addr) => (
@@ -582,10 +718,56 @@ export default function ComposeDialog({
                 autoComplete="off"
                 placeholder={recipients.length ? "" : "someone@example.com"}
                 aria-label="Add recipient"
+                // Combobox wiring: without aria-activedescendant, arrowing the
+                // list moves a visual highlight only and a screen reader
+                // announces nothing, so a blind user would press Enter on an
+                // address they were never told.
+                role="combobox"
+                aria-expanded={contactHits.length > 0}
+                aria-controls="contact-suggestions"
+                aria-autocomplete="list"
+                aria-activedescendant={
+                  contactHits.length ? `contact-option-${contactIndex}` : undefined
+                }
                 aria-invalid={!!toError}
                 aria-describedby={toError ? "compose-to-error" : undefined}
                 className={cn(FIELD, "min-w-[8rem] flex-1 py-1")}
               />
+              {contactHits.length > 0 && (
+                <ul
+                  id="contact-suggestions"
+                  role="listbox"
+                  aria-label="Recipient suggestions"
+                  className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-lg border border-border/60 bg-popover py-1 shadow-md"
+                >
+                  {contactHits.map((c, i) => (
+                    // role=option sits on the li so the listbox owns its
+                    // options directly. Focus stays in the input; selection is
+                    // conveyed by aria-activedescendant.
+                    <li
+                      key={c.email}
+                      id={`contact-option-${i}`}
+                      role="option"
+                      aria-selected={i === contactIndex}
+                      // Commit on mouseDown: blur would otherwise flush the
+                      // typed fragment into a chip before the click lands.
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        acceptContact(c);
+                      }}
+                      onMouseEnter={() => setContactIndex(i)}
+                      className={cn(
+                        "flex min-h-11 cursor-pointer items-center gap-2 px-3 py-2 text-sm",
+                        i === contactIndex ? "bg-accent" : "bg-transparent",
+                      )}
+                    >
+                      {c.name && <span className="truncate font-medium">{c.name}</span>}
+                      <span className="truncate text-muted-foreground">{c.email}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
               {/* Recipient validation lives right under the field it's about,
                   not in the shared error block by the footer. */}
               {toError && (
@@ -711,6 +893,7 @@ export default function ComposeDialog({
                 placeholder="Write your message… ( / for blocks, markdown works)"
                 onTextChange={(t) => {
                   setText(t);
+                  textRef.current = t;
                   // Keep the doc snapshot fresh — the close-flush persists it
                   // after the editor has unmounted.
                   try {

@@ -3,6 +3,7 @@
 // cookie is sent. Non-OK responses throw a typed ApiError carrying the status.
 
 import type {
+  Contact,
   ThreadsResponse,
   ViewCounts,
   View,
@@ -114,6 +115,11 @@ export function send(payload: SendPayload): Promise<{ ok: true; id: string }> {
 /** GET /api/identities — the From identities compose can send as. */
 export function getIdentities(): Promise<IdentitiesResponse> {
   return request<IdentitiesResponse>(`/api/identities`);
+}
+
+/** GET /api/contacts — recipient suggestions derived from past mail. */
+export function getContacts(q: string): Promise<{ contacts: Contact[] }> {
+  return request<{ contacts: Contact[] }>(`/api/contacts?q=${encodeURIComponent(q)}`);
 }
 
 /** POST /api/threads/:id/summarize — Workers AI conversation summary. */

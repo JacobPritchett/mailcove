@@ -213,6 +213,7 @@ describe("/api/domains/:zoneId/settings (forward copy)", () => {
       forwardCopyDefault: "alex@example.com",
       displayName: "Acme Inc",
       displayNameDefault: "A",
+      signature: null,
     });
   });
 

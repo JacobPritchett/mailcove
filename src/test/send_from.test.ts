@@ -215,7 +215,7 @@ describe("GET /api/identities", () => {
     );
     const body = (await res.json()) as any;
     expect(body.identities).toEqual([
-      { domain: "example.net", sendingDomain: "send.example.net", displayName: "Example" },
+      { domain: "example.net", sendingDomain: "send.example.net", displayName: "Example", signature: "" },
     ]);
   });
 });

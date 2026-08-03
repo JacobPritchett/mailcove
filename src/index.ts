@@ -7,6 +7,7 @@ import {
   type OutboundAttachment,
 } from "./attachments";
 import { verifyAccess } from "./auth";
+import { suggestContacts } from "./contacts";
 import { deriveThreadId, sanitizeMessageId } from "./threading";
 import { getThread, findThreadIdByMessageIds } from "./store";
 import { isMailAction, mutateThread, mutateThreads, purgeOldTrash } from "./store_mutations";
@@ -46,6 +47,8 @@ import {
   sanitizeFromName,
   defaultDisplayName,
   forwardCopyFor,
+  setDomainSignature,
+  sanitizeSignature,
 } from "./domains";
 import { classifyMessage } from "./categorize";
 import { validateDraft, putDraft, listDrafts, getDraft, deleteDraft, countDrafts } from "./drafts";
@@ -85,6 +88,8 @@ function mediaSecret(env: Env): string | null {
 const suggestBuckets = new Map<string, Bucket>();
 // …and for destination registration (each call emails a verification link).
 const destinationBuckets = new Map<string, Bucket>();
+// …and for recipient suggestions (one query pair per keystroke).
+const contactBuckets = new Map<string, Bucket>();
 
 // …and for outbound send. The bearer automation credential drives /api/send
 // unattended, so blunt the burst a leaked or looping caller can produce: 20 at
@@ -981,6 +986,7 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
         forwardCopyDefault: env.FORWARD_COPY_TO || null,
         displayName: row?.display_name ?? null,
         displayNameDefault: defaultDisplayName(zone.name),
+        signature: row?.signature ?? null,
       });
     } catch (e) {
       if (e instanceof CfNotConfigured) return json({ error: "domains admin not configured" }, 503);
@@ -992,16 +998,21 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     const b = (await request.json().catch(() => ({}))) as {
       forwardCopyTo?: unknown;
       displayName?: unknown;
+      signature?: unknown;
     };
     const hasCopy = Object.prototype.hasOwnProperty.call(b, "forwardCopyTo");
     const hasName = Object.prototype.hasOwnProperty.call(b, "displayName");
-    if (!hasCopy && !hasName) return json({ error: "no settings provided" }, 400);
+    const hasSig = Object.prototype.hasOwnProperty.call(b, "signature");
+    if (!hasCopy && !hasName && !hasSig) return json({ error: "no settings provided" }, 400);
     const v = b.forwardCopyTo;
     if (hasCopy && v !== null && typeof v !== "string") {
       return json({ error: "forwardCopyTo must be string or null" }, 400);
     }
     if (hasName && b.displayName !== null && typeof b.displayName !== "string") {
       return json({ error: "displayName must be string or null" }, 400);
+    }
+    if (hasSig && b.signature !== null && typeof b.signature !== "string") {
+      return json({ error: "signature must be string or null" }, 400);
     }
     try {
       const zone = await findZone(env, m[1]);
@@ -1020,6 +1031,11 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
         // profile back to the derived default.
         const name = typeof b.displayName === "string" ? sanitizeFromName(b.displayName) : "";
         await setDomainDisplayName(env, zone.name, name || null, Date.now());
+      }
+      if (hasSig) {
+        // Stored pre-sanitized and plain text; "" clears it.
+        const sig = typeof b.signature === "string" ? sanitizeSignature(b.signature) : "";
+        await setDomainSignature(env, zone.name, sig || null, Date.now());
       }
       return json({ ok: true });
     } catch (e) {
@@ -1244,6 +1260,26 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     const obj = await env.MAILSTORE.get(key);
     if (!obj) return new Response("not found", { status: 404 });
     return serveAttachment(obj.body, obj.httpMetadata?.contentType, name);
+  }
+
+  // GET /api/contacts?q= — recipient suggestions from mail already exchanged.
+  // Read-only and derived; no contact store to keep in sync.
+  if (path === "/api/contacts" && request.method === "GET") {
+    // Same defense-in-depth as /api/compose/suggest: the debounce is client
+    // side and enforces nothing on its own.
+    if (!takeToken(contactBuckets, who, Date.now())) return json({ contacts: [] });
+    const q = (url.searchParams.get("q") || "").slice(0, 100);
+    // Enforce the 2-char minimum server side too: without it a bare
+    // GET /api/contacts is a one-call dump of the whole address book.
+    if (q.trim().length < 2) return json({ contacts: [] });
+    try {
+      return json({ contacts: await suggestContacts(env, q) });
+    } catch (e) {
+      // Suggestions are a convenience: degrade to none rather than failing the
+      // compose flow if the lookup errors.
+      console.error("contacts lookup failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+      return json({ contacts: [] });
+    }
   }
 
   // GET /api/identities — the From identities compose can send as (registry-
