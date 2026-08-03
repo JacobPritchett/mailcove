@@ -59,6 +59,7 @@ import {
   deleteDraftAttachments,
   parseManifest,
   manifestOf,
+  purgeOrphanedDraftAttachments,
 } from "./draftAttachments";
 import { sendPushToAll, isAllowedPushEndpoint, validSubscriptionKeys, clampUtf8, MAX_SUBSCRIPTIONS } from "./push";
 import { normalizeCid, rewriteEmailImages } from "./imageRewrite";
@@ -1494,7 +1495,16 @@ export default {
   fetch: handleFetch,
   email: handleEmail,
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
-    const r = await purgeOldTrash(env, Date.now());
+    const now = Date.now();
+    const r = await purgeOldTrash(env, now);
     console.log(`purge: removed ${r.purged} trashed message(s)`);
+    // Independent of the purge above: a failure there must not skip this, and
+    // vice versa. Both are best-effort housekeeping.
+    try {
+      const a = await purgeOrphanedDraftAttachments(env, now);
+      if (a.purged) console.log(`purge: removed ${a.purged} orphaned draft attachment blob(s)`);
+    } catch (e) {
+      console.log(`purge: draft-attachment sweep failed: ${e instanceof Error ? e.message : e}`);
+    }
   },
 };

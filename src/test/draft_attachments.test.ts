@@ -11,6 +11,7 @@ import {
   putDraftAttachments,
   getDraftAttachments,
   deleteDraftAttachments,
+  purgeOrphanedDraftAttachments,
 } from "../draftAttachments";
 import { MAX_ATTACHMENTS } from "../attachments";
 import { DRAFTS_DDL } from "../drafts";
@@ -310,5 +311,98 @@ describe("surviving the pre-migration window", () => {
     expect(out).toHaveLength(1);
     expect(out[0].attachmentCount).toBe(0);
     expect(attempts).toBe(2);
+  });
+});
+
+describe("the orphan sweep", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = 1_700_000_000_000;
+
+  /** R2 double with an uploaded timestamp per object. */
+  function makeListableR2(objects: Array<{ key: string; ageMs: number }>) {
+    const keys = new Set(objects.map((o) => o.key));
+    return {
+      keys,
+      bucket: {
+        list: async () => ({
+          objects: objects
+            .filter((o) => keys.has(o.key))
+            .map((o) => ({ key: o.key, uploaded: new Date(NOW - o.ageMs) })),
+        }),
+        delete: async (k: string) => void keys.delete(k),
+      } as unknown as R2Bucket,
+    };
+  }
+
+  function makeDb(liveIds: string[], onBinds?: (b: unknown[]) => void) {
+    return {
+      prepare: () => ({
+        bind: (...b: unknown[]) => {
+          onBinds?.(b);
+          return {
+            all: async () => ({ results: liveIds.filter((id) => b.includes(id)).map((id) => ({ id })) }),
+          };
+        },
+      }),
+    } as unknown as D1Database;
+  }
+
+  it("deletes a blob whose draft is gone", async () => {
+    const r2 = makeListableR2([{ key: "draftatt/gone.json", ageMs: 2 * DAY }]);
+
+    const out = await purgeOrphanedDraftAttachments({ DB: makeDb([]), MAILSTORE: r2.bucket }, NOW);
+
+    expect(out.purged).toBe(1);
+    expect(r2.keys.size).toBe(0);
+  });
+
+  it("keeps a blob whose draft still exists", async () => {
+    const r2 = makeListableR2([{ key: "draftatt/live.json", ageMs: 2 * DAY }]);
+
+    const out = await purgeOrphanedDraftAttachments(
+      { DB: makeDb(["live"]), MAILSTORE: r2.bucket },
+      NOW,
+    );
+
+    expect(out.purged).toBe(0);
+    expect(r2.keys.has("draftatt/live.json")).toBe(true);
+  });
+
+  it("will not touch a blob written recently", async () => {
+    // Writes are row-then-bytes, but a sweep racing a save must never be the
+    // reason a user loses a file. An orphan surviving one more day costs a few
+    // KB; deleting a live attachment cannot be undone.
+    const r2 = makeListableR2([{ key: "draftatt/fresh.json", ageMs: 60_000 }]);
+
+    const out = await purgeOrphanedDraftAttachments({ DB: makeDb([]), MAILSTORE: r2.bucket }, NOW);
+
+    expect(out.purged).toBe(0);
+    expect(r2.keys.size).toBe(1);
+  });
+
+  it("never binds more than 100 parameters to one statement", async () => {
+    // D1's limit is exactly 100 — verified live, where 101 fails with
+    // "too many SQL variables". 150 candidates must become two statements.
+    const objects = Array.from({ length: 150 }, (_, i) => ({
+      key: `draftatt/d${i}.json`,
+      ageMs: 2 * DAY,
+    }));
+    const r2 = makeListableR2(objects);
+    const binds: number[] = [];
+
+    await purgeOrphanedDraftAttachments(
+      { DB: makeDb([], (b) => binds.push(b.length)), MAILSTORE: r2.bucket },
+      NOW,
+    );
+
+    expect(binds.length).toBe(2);
+    expect(Math.max(...binds)).toBeLessThanOrEqual(100);
+  });
+
+  it("does nothing when there is nothing old enough to consider", async () => {
+    const r2 = makeListableR2([]);
+    expect(
+      (await purgeOrphanedDraftAttachments({ DB: makeDb([]), MAILSTORE: r2.bucket }, NOW)).purged,
+    ).toBe(0);
   });
 });

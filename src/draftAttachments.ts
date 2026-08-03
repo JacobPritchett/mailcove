@@ -142,3 +142,57 @@ export async function deleteDraftAttachments(
 ): Promise<void> {
   await env.MAILSTORE.delete(draftAttachmentKey(draftId));
 }
+
+/** Ignore anything written recently: a blob younger than this may belong to a
+ *  draft whose row is still being written. */
+const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
+/**
+ * D1 binds at most 100 parameters per statement — verified against the live
+ * database, where 100 succeeds and 101 fails with "too many SQL variables".
+ */
+const ID_CHUNK = 100;
+
+/**
+ * Delete attachment blobs whose draft no longer exists.
+ *
+ * Writes are ordered row-then-bytes, so a blob without a row is either a draft
+ * deleted while R2 was unavailable (that cleanup is best-effort, deliberately)
+ * or a row removed outside the API. Neither is reachable by the user, so the
+ * bytes would otherwise sit in R2 forever.
+ *
+ * Deliberately conservative: only blobs older than the grace period are even
+ * considered, so a draft mid-save is never swept, and a lookup failure keeps
+ * the blob. Leaving an orphan one more day costs a few KB; deleting a live
+ * attachment loses the user's file.
+ */
+export async function purgeOrphanedDraftAttachments(
+  env: { DB: D1Database; MAILSTORE: R2Bucket },
+  now: number,
+): Promise<{ purged: number }> {
+  const listed = await env.MAILSTORE.list({ prefix: "draftatt/", limit: 1000 });
+  const candidates = listed.objects
+    .filter((o) => now - o.uploaded.getTime() > ORPHAN_GRACE_MS)
+    .map((o) => ({ key: o.key, id: o.key.slice("draftatt/".length).replace(/\.json$/, "") }))
+    .filter((c) => c.id.length > 0);
+  if (candidates.length === 0) return { purged: 0 };
+
+  const live = new Set<string>();
+  for (let i = 0; i < candidates.length; i += ID_CHUNK) {
+    const chunk = candidates.slice(i, i + ID_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const { results } = await env.DB.prepare(
+      `SELECT id FROM drafts WHERE id IN (${placeholders})`,
+    )
+      .bind(...chunk.map((c) => c.id))
+      .all<{ id: string }>();
+    for (const r of results ?? []) live.add(r.id);
+  }
+
+  let purged = 0;
+  for (const c of candidates) {
+    if (live.has(c.id)) continue;
+    await env.MAILSTORE.delete(c.key);
+    purged++;
+  }
+  return { purged };
+}
