@@ -313,3 +313,60 @@ describe("Draft with AI keeps the signature", () => {
     expect(body.value.indexOf("AI DRAFT")).toBeLessThan(body.value.indexOf(SIG));
   }, 10000);
 });
+
+describe("replying again after discarding one", () => {
+  it("still autosaves the SECOND reply in the same thread", async () => {
+    // skipDraftRef is set on discard and never reset, and the composer is keyed
+    // by THREAD - so it stays mounted across a discard. Every later reply in
+    // that thread silently stopped autosaving, and because the unmount flush
+    // checks the same flag, switching threads dropped the text entirely.
+    const { inline, body } = await openReply();
+    await waitFor(() => expect(body.value).toContain(SIG));
+
+    fireEvent.change(body, { target: { value: `first attempt${body.value}` } });
+    await waitFor(() => expect(putDraft).toHaveBeenCalled(), { timeout: 5000 });
+    vi.mocked(putDraft).mockClear();
+
+    fireEvent.click(within(inline).getByRole("button", { name: "Discard reply" }));
+
+    // Start over in the SAME thread.
+    fireEvent.click(await screen.findByRole("button", { name: "Reply" }));
+    const inline2 = await screen.findByTestId("inline-reply");
+    const body2 = (await within(inline2).findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(body2, { target: { value: "second attempt, worth keeping" } });
+
+    await waitFor(() => expect(putDraft).toHaveBeenCalled(), { timeout: 5000 });
+
+    // ...and what gets saved is the NEW reply. `text` survived the discard too,
+    // so without resetting it the composer would write the discarded body back
+    // out under a fresh draft id.
+    const saved = vi.mocked(putDraft).mock.calls.at(-1)![1] as { bodyText: string };
+    expect(saved.bodyText).toContain("second attempt");
+    expect(saved.bodyText).not.toContain("first attempt");
+  }, 15000);
+
+  it("does not autosave the discarded body when there is no signature to reseed over it", async () => {
+    // With a signature, seeding overwrites the stale `text` on reopen and hides
+    // this. With none, the seeding effect early-returns, so the discarded body
+    // is still sitting in `text` - dirty, and 1500ms from being written back
+    // out under a fresh draft id without the user typing anything.
+    vi.mocked(getIdentities).mockResolvedValue({
+      ...IDENTITIES,
+      identities: [{ ...IDENTITIES.identities[0], signature: "" }],
+    });
+
+    const { inline, body } = await openReply();
+    await waitFor(() => expect(body.value).toContain("just checking in"));
+    fireEvent.change(body, { target: { value: `first attempt${body.value}` } });
+    await waitFor(() => expect(putDraft).toHaveBeenCalled(), { timeout: 5000 });
+    vi.mocked(putDraft).mockClear();
+
+    fireEvent.click(within(inline).getByRole("button", { name: "Discard reply" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reply" }));
+    await screen.findByTestId("inline-reply");
+
+    // Touch nothing at all, and outlast the autosave debounce.
+    await new Promise((r) => setTimeout(r, 1800));
+    expect(putDraft).not.toHaveBeenCalled();
+  }, 15000);
+});

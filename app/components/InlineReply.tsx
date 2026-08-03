@@ -68,6 +68,35 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
    *  reads every untouched reply as edited and autosaves a junk draft. */
   const replyDirty = text.trim() !== "" && !sameBody(text, seededRef.current);
 
+  // Reopening the inline composer starts a NEW reply, so every per-reply ref
+  // has to go back to its initial state. This composer is keyed by THREAD, so
+  // discarding or handing off to the dialog does not unmount it and the
+  // previous reply's state survives. Two consequences, both silent:
+  //   - skipDraftRef stayed set, so the next reply in that thread never
+  //     autosaved, and because the unmount flush checks the same flag,
+  //     switching threads threw the text away instead of saving it;
+  //   - `text` still held the discarded body, ready to be written back out
+  //     under a fresh draft id.
+  // Declared BEFORE the signature seeding effect so the reset cannot wipe a
+  // seed applied in the same commit - effects run in declaration order.
+  const wasOpenRef = useRef(false);
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      skipDraftRef.current = false;
+      // The previous row is either deleted or now owned by the dialog; a new
+      // reply gets a new id rather than writing over either.
+      draftIdRef.current = null;
+      userEditedRef.current = false;
+      hasSeededRef.current = false;
+      seededRef.current = initial.text ?? "";
+      latestRef.current.quote = initial.text ?? "";
+      docJsonRef.current = "";
+      setText("");
+      setBodySeed(initial.text ?? "");
+    }
+    wasOpenRef.current = open;
+  }, [open, initial.text]);
+
   // Autosave queue: saves chain (each starts after the previous settled) and
   // deletion joins the chain — no PUT can land after the DELETE.
   const savingRef = useRef<Promise<void>>(Promise.resolve());
