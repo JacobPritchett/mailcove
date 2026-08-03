@@ -59,9 +59,11 @@ describe("ComposeDialog — Draft with AI", () => {
     const body = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
     await waitFor(() => expect(body.value).toContain("Sounds great — see you at noon."));
     // The quoted original is kept below the draft.
-    expect(body.value).toContain("> the original message");
+    // The mirror holds the editor's TEXT: "> " lines became a <blockquote>,
+    // so the markers are gone. The quoted CONTENT is what survives.
+    expect(body.value).toContain("the original message");
     // Draft comes first.
-    expect(body.value.indexOf("Sounds great")).toBeLessThan(body.value.indexOf("> the original"));
+    expect(body.value.indexOf("Sounds great")).toBeLessThan(body.value.indexOf("the original"));
   });
 
   it("re-drafting does not stack the quote (uses the original quote, not the current body)", async () => {
@@ -79,6 +81,6 @@ describe("ComposeDialog — Draft with AI", () => {
     await waitFor(() => expect(body.value).toContain("Second draft."));
     expect(body.value).not.toContain("First draft.");
     // Exactly one copy of the quote.
-    expect(body.value.split("> the original message").length - 1).toBe(1);
+    expect(body.value.split("the original message").length - 1).toBe(1);
   });
 });

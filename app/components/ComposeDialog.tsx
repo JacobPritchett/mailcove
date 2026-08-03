@@ -21,6 +21,7 @@ import { ApiError, putDraft, deleteDraft, getContacts } from "@/lib/api";
 import { commitRecipients } from "@/lib/recipients";
 import type { Contact } from "@/lib/types";
 import { docHasVisibleContent } from "@/lib/editorDoc";
+import { bodySeedWithSignature, sameBody } from "@/lib/replyContext";
 import { useComposeSuggestion } from "@/lib/useComposeSuggestion";
 import { cn } from "@/lib/utils";
 
@@ -58,6 +59,12 @@ export interface ComposeInitial {
   threadId?: string;
   /** Identity domain to reply as (the domain the original mail was sent to). */
   fromDomain?: string;
+  /** The quoted history, when this prefill IS a reply built by
+   *  buildReplyInitial. Absent on a resumed draft or a handoff from the inline
+   *  composer, whose `text` is a whole body the user may already have written -
+   *  seeding into that would duplicate the signature and, because seeding goes
+   *  through setPlainText, replace the rich document with flattened text. */
+  replyQuote?: string;
   /** Resume state (opening a saved draft). */
   draftId?: string;
   /** Stringified TipTap document — wins over `text` for the body seed. */
@@ -312,8 +319,11 @@ export default function ComposeDialog({
   //   - on reopen this must run after `text` is cleared, or the "do not
   //     overwrite what the user typed" guard reads the PREVIOUS signature and
   //     bails, so the signature came back only once per page load.
-  // New messages only: a reply's seed is a caret line plus a trimmable quote
-  // block, and splicing into that structure risks the quote handling.
+  // In practice this dialog only ever seeds NEW messages: every reply path
+  // (the r key, the menu, the reader toolbar) opens the inline composer, and
+  // the inline handoff arrives already signed. The reply branch below is kept
+  // because `replyQuote` is part of the prefill contract, not because anything
+  // currently reaches it - do not read it as live behaviour.
   // Mirrors `text`. An effect sees the render-time value of state, so the
   // [open] reset above is NOT visible to the seeding effect in the same commit
   // - guarding on `text` read the PREVIOUS session's signature and bailed.
@@ -327,16 +337,27 @@ export default function ComposeDialog({
     // every abandoned compose save a junk draft again. The [open] effect above
     // resets it on the way back in.
     if (!open) return;
-    if (initial) return; // replies keep their caret line + quote block
+    // A prefill that is not a reply carries a body the USER owns (resumed
+    // draft, inline handoff). Never seed into that.
+    if (initial && initial.replyQuote === undefined) return;
+    const quote = initial?.replyQuote ?? "";
     const sig = signatureFor(fromDomain);
-    const desired = sig ? `\n\n${sig}` : "";
+    const desired = bodySeedWithSignature(quote, sig);
     if (!desired || desired === seededSigRef.current) return;
     // Compare VALUES rather than using a one-shot flag. The identities query is
     // gated on `open`, so the first run after reopening reads the STALE cache
     // and the refetch lands a moment later; a flag would seed the old signature
     // and then refuse to correct it. Replace only our own seed, never typed text.
+    // Compared through sameBody, not string equality: the editor returns a
+    // seeded reply WITHOUT its "> " markers, so a raw comparison reads every
+    // seeded body as "the user typed this".
     const body = textRef.current;
-    const untouched = body.trim() === "" || body.trim() === seededSigRef.current.trim();
+    const untouched =
+      body.trim() === "" ||
+      sameBody(body, seededSigRef.current) ||
+      // A reply opens holding the bare quote block; that is our seed too, not
+      // something the user wrote, so it may be replaced by the signed version.
+      sameBody(body, quote);
     if (!untouched) return;
     seededSigRef.current = desired;
     setText(desired);
@@ -350,7 +371,7 @@ export default function ComposeDialog({
       return () => clearTimeout(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, identities, fromDomain]);
+  }, [open, identities, fromDomain, initial?.replyQuote]);
 
   /** Anything worth persisting as a draft? */
   function draftHasContent() {
@@ -360,7 +381,7 @@ export default function ComposeDialog({
     // Compare trimmed: when the editor is already mounted the seed goes through
     // its serializer and comes back with different surrounding whitespace, so
     // exact equality misses it and the junk draft is saved anyway.
-    const written = text.trim() === seededSigRef.current.trim() ? "" : text;
+    const written = sameBody(text, seededSigRef.current) ? "" : text;
     return !!(written.trim() || subject.trim() || recipients.length || toInput.trim());
   }
 

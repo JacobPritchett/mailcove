@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { useDraftReply, useIdentities, useSend } from "@/lib/queries";
 import { putDraft, deleteDraft } from "@/lib/api";
 import { docHasVisibleContent } from "@/lib/editorDoc";
+import { bodySeedWithSignature, sameBody } from "@/lib/replyContext";
 import type { ComposeBodyHandle } from "@/components/EmailBodyEditor";
 import type { ComposeInitial } from "@/components/ComposeDialog";
 
@@ -48,8 +49,24 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
   const latestRef = useRef({ text: "", quote: initial.text ?? "" });
   latestRef.current.text = text;
 
-  /** Typed anything beyond the seeded quote? */
-  const replyDirty = text.trim() !== "" && text !== (initial.text ?? "");
+  /** Exactly what seeding last wrote — the bare quote until the signature for
+   *  the resolved sending domain arrives, then quote + signature. Everything
+   *  that asks "did the user actually write something?" compares against this,
+   *  so a seeded sign-off never counts as a typed reply. */
+  const seededRef = useRef(initial.text ?? "");
+  /** Has a seed actually been written yet? Distinguishes "empty because we have
+   *  not filled it" from "empty because the user cleared it". */
+  const hasSeededRef = useRef(false);
+  /** Set while WE write to the editor, so the resulting change event is not
+   *  mistaken for the user typing. */
+  const applyingSeedRef = useRef(false);
+  /** The user has touched the body; seeding must never write over it again. */
+  const userEditedRef = useRef(false);
+
+  /** Typed anything beyond what we seeded? Compared through sameBody: the
+   *  editor hands a seeded reply back WITHOUT its "> " markers, so raw equality
+   *  reads every untouched reply as edited and autosaves a junk draft. */
+  const replyDirty = text.trim() !== "" && !sameBody(text, seededRef.current);
 
   // Autosave queue: saves chain (each starts after the previous settled) and
   // deletion joins the chain — no PUT can land after the DELETE.
@@ -111,7 +128,7 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
   useEffect(() => {
     return () => {
       const { text: t, quote } = latestRef.current;
-      if (!skipDraftRef.current && t.trim() && t !== quote) {
+      if (!skipDraftRef.current && t.trim() && !sameBody(t, quote)) {
         void saveReplyDraft(t, docJsonRef.current);
       }
     };
@@ -136,6 +153,34 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
     identities?.defaultDomain ??
     "example.com";
   const fromLocal = identities?.defaultLocal || "hello";
+
+  // Seed the signature only once identities resolve WHICH domain is sending.
+  // The reply domain and the sending domain are not always the same — the
+  // resolution above falls back to the server default when the original domain
+  // cannot send — and seeding the wrong identity's sign-off is worse than
+  // seeding none. Same reasoning, and the same value-comparison, as the
+  // dialog's seeding effect.
+  useEffect(() => {
+    if (!open) return;
+    const sig = identities?.identities.find((i) => i.domain === fromDomain)?.signature ?? "";
+    const desired = bodySeedWithSignature(initial.text ?? "", sig);
+    if (desired === seededRef.current) return;
+    // Replace only our own seed, never text the user typed. Compared by VALUE
+    // rather than a one-shot flag: the identities query is gated on `open`, so
+    // the first run can read a stale cache and be corrected a moment later.
+    if (userEditedRef.current) return;
+    const body = latestRef.current.text;
+    if (body.trim() !== "" && !sameBody(body, seededRef.current)) return;
+    hasSeededRef.current = true;
+    seededRef.current = desired;
+    // The unmount flush reads this to tell a seeded body from a written one.
+    latestRef.current.quote = desired;
+    applyingSeedRef.current = true;
+    setText(desired);
+    setBodySeed(desired); // editor may not be mounted yet: initialText on mount
+    editorRef.current?.setPlainText(desired);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, identities, fromDomain, initial.text]);
 
   if (!open) {
     return (
@@ -196,8 +241,14 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
     if (!threadId) return;
     aiDraft.mutate(threadId, {
       onSuccess: (res) => {
+        // Rebuild from the SIGNED seed, not initial.text: the latter is the
+        // bare prefill, so drafting with AI used to silently drop the
+        // signature and nothing ever put it back (the seeding effect's deps
+        // have not changed, and its guard now reads the body as user-written).
         const quote = initial.text ?? "";
-        const full = quote ? `${res.draft}\n\n${quote}` : res.draft;
+        const sig = identities?.identities.find((i) => i.domain === fromDomain)?.signature ?? "";
+        const rest = bodySeedWithSignature(quote, sig);
+        const full = rest ? `${res.draft}${rest}` : res.draft;
         // Mirror + mount seed + snapshot reset, same as the dialog: covers the
         // editor chunk mounting after the draft lands, and stops a stale doc
         // snapshot from outliving the replaced body.
@@ -246,6 +297,14 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
                 onOpenFull({
                   ...initial,
                   text: text || initial.text,
+                  // Drop the reply marker ONLY once we have actually seeded:
+                  // the body we hand over then already carries the signature,
+                  // and leaving it set would let the dialog seed a second one
+                  // into the user's text (flattening the rich document doing
+                  // it). Expanding before identities resolve is a real window,
+                  // though, and handing off unmarked there produced a reply
+                  // that never got signed at all.
+                  replyQuote: hasSeededRef.current ? undefined : initial.replyQuote,
                   bodyJson: docJsonRef.current || undefined,
                   draftId: draftIdRef.current ?? undefined,
                 });
@@ -281,6 +340,12 @@ export default function InlineReply({ initial, open, onOpenChange, onOpenFull }:
           initialText={bodySeed}
           placeholder="Write your reply… ( / for blocks, markdown works)"
           onTextChange={(t) => {
+            // Any change we did not cause ourselves is the user editing. The
+            // mirror alone cannot tell "empty because nothing is seeded yet"
+            // from "empty because the user cleared it", and treating the second
+            // as the first resurrects a quote they deliberately deleted.
+            if (applyingSeedRef.current) applyingSeedRef.current = false;
+            else userEditedRef.current = true;
             setText(t);
             // Keep the doc snapshot fresh for autosave + the unmount flush.
             try {

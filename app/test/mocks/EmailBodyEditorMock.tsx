@@ -6,6 +6,18 @@
 import { forwardRef, useImperativeHandle, useRef } from "react";
 import type { ComposeBodyHandle, EmailBodyEditorProps } from "../../components/EmailBodyEditor";
 
+/**
+ * What the real editor does to a plain-text seed, as far as the mirror can see.
+ *
+ * plainTextToHtml turns "> " lines into a <blockquote>, so getText() hands them
+ * back WITHOUT the markers. A mock that echoes setPlainText verbatim makes
+ * every "is the body still exactly what we seeded?" check trivially true, which
+ * hid a junk-draft regression and a draft-clobbering bug from the suite.
+ */
+function roundTrip(text: string): string {
+  return text.replace(/^[ \t]*>[ \t]?/gm, "");
+}
+
 const EmailBodyEditorMock = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
   function EmailBodyEditorMock(
     { initialText, initialJson, placeholder, onTextChange, onFocusChange, onCaretAtEndChange, autoFocus },
@@ -15,7 +27,7 @@ const EmailBodyEditorMock = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
 
     // Round-trippable doc format for tests: {"mockText": "..."} — what
     // getDocJson emits is what initialJson restores.
-    let seed = initialText ?? "";
+    let seed = roundTrip(initialText ?? "");
     if (initialJson) {
       try {
         const doc = JSON.parse(initialJson) as { mockText?: string };
@@ -34,8 +46,9 @@ const EmailBodyEditorMock = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
         return JSON.stringify({ mockText: taRef.current?.value ?? "" });
       },
       setPlainText(text: string) {
-        if (taRef.current) taRef.current.value = text;
-        onTextChange?.(text);
+        const v = roundTrip(text);
+        if (taRef.current) taRef.current.value = v;
+        onTextChange?.(v);
       },
       appendPlainText(text: string) {
         if (taRef.current) taRef.current.value += text;

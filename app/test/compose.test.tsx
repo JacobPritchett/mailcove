@@ -184,7 +184,9 @@ describe("ComposeDialog", () => {
     expect(within(inline).getByText("alice@example.com")).toBeInTheDocument();
 
     const body = (await within(inline).findByLabelText("Message")) as HTMLTextAreaElement;
-    expect(body.value).toContain("> just checking in");
+    // The mirror holds the editor's TEXT: "> " lines became a <blockquote>,
+    // so the markers are gone. The quoted CONTENT is what survives.
+    expect(body.value).toContain("just checking in");
     fireEvent.change(body, { target: { value: "thanks!" } });
     fireEvent.click(within(inline).getByRole("button", { name: /^send$/i }));
 
