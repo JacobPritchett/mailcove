@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "../App";
 import type { ThreadsResponse, ThreadListRow, ThreadResponse, Me } from "../lib/types";
@@ -106,10 +106,45 @@ describe("<App/> mail layout", () => {
         screen.getByRole("heading", { name: "Hello from Alice" }),
       ).toBeInTheDocument(),
     );
-    expect(
-      screen.getByText("Alice <alice@example.com>"),
-    ).toBeInTheDocument();
+    // The header shows the sender's NAME plus their address as separate text;
+    // the raw "Name <addr>" form is detail behind the disclosure. Scoped to the
+    // reading pane because the list row renders the same name.
+    const reader = within(screen.getByRole("main"));
+    expect(reader.getByText("Alice")).toBeInTheDocument();
+    expect(reader.getByText("alice@example.com")).toBeInTheDocument();
+    expect(reader.queryByText("Alice <alice@example.com>")).not.toBeInTheDocument();
+
+    // ...and the full addresses are still one click away, so nothing that was
+    // readable before became unreachable.
+    fireEvent.click(reader.getByRole("button", { expanded: false, name: /^to / }));
+    expect(await reader.findByText("Alice <alice@example.com>")).toBeInTheDocument();
+
     expect(getThread).toHaveBeenCalledWith("t1");
+  });
+
+  it("keeps the real sender address on screen when the display name fakes one", async () => {
+    // The server re-serializes the display name verbatim as `${name} <${addr}>`,
+    // so a name that already contains an address would otherwise render
+    // byte-identically to real mail from that address.
+    vi.mocked(getThread).mockResolvedValue({
+      ...THREAD,
+      messages: [
+        {
+          ...THREAD.messages[0],
+          msg_from: "Legit Corp <billing@legit.com> <evil@attacker.example>",
+          from_addr: "evil@attacker.example",
+        },
+      ],
+    });
+
+    renderApp();
+    fireEvent.click(await screen.findByText("Hello from Alice"));
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Hello from Alice" })).toBeInTheDocument(),
+    );
+
+    const reader = within(screen.getByRole("main"));
+    expect(reader.getByText("evil@attacker.example")).toBeInTheDocument();
   });
 });
 

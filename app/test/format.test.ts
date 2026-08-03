@@ -1,5 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { formatDate, senderLabel, addressOf } from "@/lib/format";
+import {
+  formatDate,
+  senderLabel,
+  addressOf,
+  splitAddressList,
+  recipientSummary,
+  initialsOf,
+  avatarHue,
+  avatarColor,
+  formatFullDate,
+} from "@/lib/format";
 
 describe("formatDate", () => {
   // Fixed reference: 2026-06-03T15:30:00 local time.
@@ -53,9 +63,14 @@ describe("senderLabel", () => {
     expect(senderLabel("Jane <j@x.com")).toBe("Jane <j@x.com");
   });
 
-  // Quoted display name: the quotes are part of m[1] and are kept verbatim.
-  it("keeps quotes around a quoted display name", () => {
-    expect(senderLabel("\"Doe, Jane\" <j@x.com>")).toBe("\"Doe, Jane\"");
+  // Quoted display name: the quotes are RFC 5322 syntax that lets a name carry
+  // a comma, not part of the name. The reader shows the name, not the grammar.
+  it("strips the quotes around a quoted display name", () => {
+    expect(senderLabel("\"Doe, Jane\" <j@x.com>")).toBe("Doe, Jane");
+  });
+
+  it("unescapes a quoted name containing an escaped quote", () => {
+    expect(senderLabel('"Bob \\" Smith" <b@x.com>')).toBe('Bob " Smith');
   });
 });
 
@@ -85,5 +100,166 @@ describe("addressOf", () => {
   // Quoted display name: the address inside the angles is still extracted.
   it("extracts the address from a quoted display name", () => {
     expect(addressOf("\"Doe, Jane\" <j@x.com>")).toBe("j@x.com");
+  });
+});
+
+describe("splitAddressList", () => {
+  it("splits a plain comma-separated header", () => {
+    expect(splitAddressList("a@x.com, b@y.com")).toEqual(["a@x.com", "b@y.com"]);
+  });
+
+  it("does not split inside a quoted display name", () => {
+    // The whole reason a naive split(",") is wrong: this is ONE recipient.
+    expect(splitAddressList('"Doe, John" <j@x.com>, b@y.com')).toEqual([
+      '"Doe, John" <j@x.com>',
+      "b@y.com",
+    ]);
+  });
+
+  it("does not split inside angle brackets, and handles semicolons", () => {
+    expect(splitAddressList("A <a@x.com>; B <b@y.com>")).toEqual(["A <a@x.com>", "B <b@y.com>"]);
+  });
+
+  it("survives an escaped quote without swallowing the rest of the list", () => {
+    expect(splitAddressList('"Bob \\" Smith" <b@x.com>, c@y.com')).toHaveLength(2);
+  });
+
+  it("stays linear on a pathological run of angle brackets", () => {
+    // This runs over attacker-supplied header text on every render, so a
+    // backtracking implementation would be a rendering-path DoS.
+    const t0 = Date.now();
+    splitAddressList("<".repeat(40000) + ", real@y.com");
+    expect(Date.now() - t0).toBeLessThan(150);
+  });
+
+  it("drops empty entries", () => {
+    expect(splitAddressList(" , , ")).toEqual([]);
+    expect(splitAddressList("")).toEqual([]);
+  });
+});
+
+describe("recipientSummary", () => {
+  it("names a single recipient", () => {
+    expect(recipientSummary("Sam Rivera <sam@x.com>")).toBe("Sam Rivera");
+  });
+
+  it("collapses several into a count so the header stays one line", () => {
+    expect(recipientSummary("Sam <sam@x.com>, b@y.com, c@z.com")).toBe("Sam and 2 others");
+  });
+
+  it("uses the singular for exactly one extra", () => {
+    expect(recipientSummary("Sam <sam@x.com>, b@y.com")).toBe("Sam and 1 other");
+  });
+
+  it("counts Cc recipients too", () => {
+    expect(recipientSummary("a@x.com", "b@y.com")).toBe("a@x.com and 1 other");
+  });
+
+  it("returns empty when there is nobody", () => {
+    expect(recipientSummary("", null)).toBe("");
+  });
+});
+
+describe("initialsOf", () => {
+  it("takes two letters from a name", () => {
+    expect(initialsOf("The Fastmail Team")).toBe("TF");
+  });
+
+  it("takes one letter from a single word or bare address", () => {
+    expect(initialsOf("alice@example.com")).toBe("A");
+  });
+
+  it("skips a decorative prefix for the initial a reader recognises", () => {
+    expect(initialsOf("\u{1F600} Smith")).toBe("S");
+  });
+
+  it("does not split a surrogate pair into half a character", () => {
+    // Indexing with [0] here returns a lone high surrogate, which renders as a
+    // replacement glyph rather than the sender's own character.
+    expect(initialsOf("\u{1F600}")).toBe("\u{1F600}");
+  });
+
+  it("falls back rather than rendering nothing", () => {
+    expect(initialsOf("")).toBe("?");
+  });
+});
+
+describe("avatarHue", () => {
+  it("is stable for the same sender and in range", () => {
+    const h = avatarHue("alice@example.com");
+    expect(h).toBe(avatarHue("alice@example.com"));
+    expect(h).toBeGreaterThanOrEqual(0);
+    expect(h).toBeLessThan(360);
+  });
+});
+
+describe("formatFullDate", () => {
+  const at = (y: number, m: number, d: number, hh = 12, mm = 0) =>
+    new Date(y, m, d, hh, mm).getTime();
+
+  it("shows just the time for today", () => {
+    const now = at(2026, 6, 21, 15, 0);
+    expect(formatFullDate(at(2026, 6, 21, 9, 41), now)).toMatch(/9:41/);
+  });
+
+  it("says yesterday", () => {
+    expect(formatFullDate(at(2026, 6, 20), at(2026, 6, 21))).toMatch(/\(yesterday\)$/);
+  });
+
+  it("gives the date plus how long ago, like Fastmail", () => {
+    expect(formatFullDate(at(2026, 6, 8), at(2026, 6, 21))).toMatch(/\(13 days ago\)$/);
+  });
+
+  it("counts CALENDAR days, not elapsed 24h periods", () => {
+    // 23:59 last night is "yesterday" at 00:01, not "1 day ago" -> and it must
+    // not flip to "2 days ago" a minute later. Dividing the epoch delta does.
+    expect(formatFullDate(at(2026, 6, 20, 23, 59), at(2026, 6, 21, 0, 1))).toMatch(/yesterday/);
+  });
+
+  it("drops the relative part once it stops being useful", () => {
+    expect(formatFullDate(at(2026, 4, 1), at(2026, 6, 21))).not.toMatch(/ago/);
+  });
+
+  it("includes the year only for another year", () => {
+    expect(formatFullDate(at(2024, 6, 21), at(2026, 6, 21))).toMatch(/2024/);
+    expect(formatFullDate(at(2026, 1, 3), at(2026, 6, 21))).not.toMatch(/2026/);
+  });
+});
+
+describe("avatarColor", () => {
+  // sRGB relative luminance, per WCAG 2.x.
+  function luminance(r: number, g: number, b: number): number {
+    const f = (c: number) => {
+      const s = c / 255;
+      return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  }
+  function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+    const c = (1 - Math.abs(2 * l - 1)) * s;
+    const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    const m = l - c / 2;
+    const [r, g, b] =
+      h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+      : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+  }
+
+  it("keeps WHITE initials above 4.5:1 on every hue it can produce", () => {
+    // The hue rotates with the sender, so a single bad hue is a real sender
+    // nobody can read. At 42% lightness the yellows were 2.94:1.
+    const m = /^hsl\((\d+) (\d+)% (\d+)%\)$/.exec(avatarColor("anything"));
+    expect(m).not.toBeNull();
+    const [sat, light] = [Number(m![2]) / 100, Number(m![3]) / 100];
+
+    let worst = Infinity;
+    for (let h = 0; h < 360; h++) {
+      worst = Math.min(worst, 1.05 / (luminance(...hslToRgb(h, sat, light)) + 0.05));
+    }
+    expect(worst).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("is stable for the same sender", () => {
+    expect(avatarColor("alice@example.com")).toBe(avatarColor("alice@example.com"));
   });
 });

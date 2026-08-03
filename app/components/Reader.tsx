@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { Archive, Mail, MailOpen, Paperclip, RotateCcw, Sparkles, Star, Trash2 } from "lucide-react";
+import { Archive, ChevronDown, Mail, MailOpen, Paperclip, RotateCcw, Sparkles, Star, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -20,6 +20,14 @@ import { useThread, useSummarizeThread } from "@/lib/queries";
 import { mutateThread, attachmentUrl, showMessageImages, allowImagesFrom } from "@/lib/api";
 import { useReaderMode } from "@/lib/useReaderMode";
 import { cn } from "@/lib/utils";
+import {
+  addressOf,
+  avatarColor,
+  formatFullDate,
+  initialsOf,
+  recipientSummary,
+  senderLabel,
+} from "@/lib/format";
 import ChatView from "@/components/ChatView";
 import { linkifyText } from "@/lib/chatNormalize";
 import InlineReply from "@/components/InlineReply";
@@ -299,8 +307,8 @@ export default function Reader({
             {mode === "chat" ? (
               <ChatView data={data} />
             ) : (
-              messages.map((m, i) => (
-                <MessageEntry key={m.id} msg={m} compact={isThread} last={i === messages.length - 1} />
+              messages.map((m) => (
+                <MessageEntry key={m.id} msg={m} />
               ))
             )}
           </div>
@@ -325,20 +333,13 @@ export default function Reader({
 }
 
 /** One message within the conversation: header + sandboxed body. */
-function MessageEntry({
-  msg,
-  compact,
-  last,
-}: {
-  msg: ThreadMessage;
-  compact: boolean;
-  last: boolean;
-}) {
+function MessageEntry({ msg }: { msg: ThreadMessage }) {
   const body = msg.body;
   const cc = msg.msg_cc?.trim();
   const qc = useQueryClient();
   const [shownHtml, setShownHtml] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showDetail, setShowDetail] = useState(false);
 
   const html = shownHtml ?? body.html;
   const blocked = shownHtml ? 0 : (msg.remoteShown ? 0 : msg.remoteImageCount ?? 0);
@@ -357,27 +358,88 @@ function MessageEntry({
     void qc.invalidateQueries({ queryKey: ["thread"] });
   }
 
+  const fromLabel = senderLabel(msg.msg_from) || msg.msg_from;
+  // The AUTHENTICATED mailbox where we have one; msg_from is the sender's own
+  // unescaped text and a display name can contain anything, including a second
+  // address. See showAddr below.
+  const fromAddr = msg.from_addr ?? addressOf(msg.msg_from);
+  // A display name is attacker-controlled, so showing it ALONE lets
+  // `From: "Legit Corp <billing@legit.com>" <evil@attacker.example>` render
+  // byte-identically to the real Legit Corp. Keeping the true address beside
+  // the name is the one defence a mail client owes against that. Suppressed
+  // only when the "name" already is the address.
+  const showAddr = fromAddr && fromAddr !== fromLabel;
+  const toSummary = recipientSummary(msg.msg_to, cc);
+
   return (
-    <section className={compact && !last ? "border-b pb-6" : undefined}>
+    <section className="overflow-hidden rounded-lg border bg-card">
       {/* Header — all metadata rendered as escaped React text nodes. */}
-      <div className="space-y-0.5 text-sm text-muted-foreground">
-        <div className="flex items-baseline justify-between gap-3">
-          <span className="font-semibold text-foreground [overflow-wrap:anywhere]">
-            {msg.msg_from}
-          </span>
-          <span className="shrink-0 text-xs">
-            {new Date(msg.date).toLocaleString()}
-          </span>
+      <div className="flex items-start gap-3 px-4 pt-3 pb-2.5">
+        <span
+          aria-hidden="true"
+          className="mt-0.5 grid size-9 shrink-0 place-items-center rounded-full text-xs font-semibold text-white"
+          style={{ backgroundColor: avatarColor(fromAddr || fromLabel) }}
+        >
+          {initialsOf(fromLabel)}
+        </span>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-baseline gap-2" title={msg.msg_from}>
+            <span className="truncate text-sm font-semibold text-foreground">{fromLabel}</span>
+            {showAddr && (
+              <span className="truncate text-xs text-muted-foreground">{fromAddr}</span>
+            )}
+          </div>
+          <button
+            type="button"
+            aria-expanded={showDetail}
+            onClick={() => setShowDetail((v) => !v)}
+            // Padding grows the touch target to 44px on mobile; the matching
+            // negative margin gives the space back to the layout, so the header
+            // stays as compact as it looks. Without it this is a 16px-tall tap
+            // target on a phone.
+            className="-mx-1 flex max-w-full items-center gap-1 rounded px-1 text-xs text-muted-foreground hover:text-foreground max-md:-my-3.5 max-md:py-3.5"
+          >
+            <span className="truncate">{toSummary ? `to ${toSummary}` : "to (nobody)"}</span>
+            <ChevronDown
+              className={cn("size-3 shrink-0 transition-transform", showDetail && "rotate-180")}
+            />
+          </button>
+
+          {/* The full addresses, on request. Collapsed by default because they
+              are the answer to "who exactly?", not the everyday reading need. */}
+          {showDetail && (
+            <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+              <dt className="font-medium">From</dt>
+              <dd className="[overflow-wrap:anywhere]">{msg.msg_from}</dd>
+              <dt className="font-medium">To</dt>
+              <dd className="[overflow-wrap:anywhere]">{msg.msg_to}</dd>
+              {cc && (
+                <>
+                  <dt className="font-medium">Cc</dt>
+                  <dd className="[overflow-wrap:anywhere]">{cc}</dd>
+                </>
+              )}
+              {/* The header shows a relative date; the exact time lived only in
+                  a title tooltip, which a touch device cannot reach at all. */}
+              <dt className="font-medium">Date</dt>
+              <dd>{new Date(msg.date).toLocaleString()}</dd>
+            </dl>
+          )}
         </div>
-        <div className="[overflow-wrap:anywhere]">
-          To: {msg.msg_to}
-          {cc ? ` · Cc: ${cc}` : ""}
-        </div>
+
+        <time
+          dateTime={new Date(msg.date).toISOString()}
+          title={new Date(msg.date).toLocaleString()}
+          className="shrink-0 pt-0.5 text-xs text-muted-foreground"
+        >
+          {formatFullDate(msg.date, Date.now())}
+        </time>
       </div>
 
       {/* Attachments — links to the download endpoint, shown as chips. */}
       {body.attachments.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 px-4 pb-3">
           {body.attachments.map((a) =>
             a.stored === false ? (
               // The bytes were never written, so a link here would just 404.
@@ -408,8 +470,12 @@ function MessageEntry({
         </div>
       )}
 
-      {/* Body — identical sandboxed iframe + CSP for every message. */}
-      <div className="mt-4">
+      {/* Body — identical sandboxed iframe + CSP for every message. It sits
+          full-bleed against the card edge: senders style their own margins,
+          and a second inset frame around that reads as a widget, not a
+          letter. */}
+      <div className="border-t">
+
         {html ? (
           <>
             <MessageImageBanner
@@ -453,6 +519,29 @@ function MessageEntry({
  * the frame's own document via a ResizeObserver — possible because the sandbox
  * includes `allow-same-origin` (and never `allow-scripts`; see IFRAME_SANDBOX).
  */
+/**
+ * Decide whether an email needs breathing room inside its card.
+ *
+ * A newsletter ships its own full-width coloured canvas and must stay flush to
+ * the card edge, or a gutter appears around a design that was meant to bleed.
+ * An ordinary reply arrives as a bare `<div dir="ltr">` with no margins at all
+ * and would otherwise sit jammed against the border. Decided by measuring the
+ * rendered document rather than pattern-matching the HTML, because "does this
+ * paint to the edge" is a layout question and only layout can answer it.
+ */
+function applyBodyPadding(doc: Document) {
+  const body = doc.body;
+  const view = doc.defaultView;
+  if (!body || !view) return;
+  const bleeds = Array.from(body.children).some((el) => {
+    const bg = view.getComputedStyle(el).backgroundColor;
+    // rgba(...,0) and "transparent" both mean nothing is painted.
+    if (!bg || bg === "transparent" || /,\s*0\s*\)$/.test(bg)) return false;
+    return el.getBoundingClientRect().width >= body.clientWidth - 2;
+  });
+  body.style.padding = bleeds ? "0" : "16px";
+}
+
 function EmailFrame({ html, title }: { html: string; title: string }) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
@@ -484,6 +573,11 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
     };
     const onLoad = () => {
       syncTheme();
+      try {
+        if (iframe.contentDocument) applyBodyPadding(iframe.contentDocument);
+      } catch {
+        /* ignore - padding is cosmetic, never worth failing the render for */
+      }
       measure();
       try {
         const doc = iframe.contentDocument;
