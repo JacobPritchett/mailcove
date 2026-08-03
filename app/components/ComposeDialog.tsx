@@ -22,6 +22,7 @@ import { commitRecipients } from "@/lib/recipients";
 import type { Contact } from "@/lib/types";
 import { docHasVisibleContent } from "@/lib/editorDoc";
 import { bodySeedWithSignature, sameBody } from "@/lib/replyContext";
+import AnchoredListbox from "@/components/AnchoredListbox";
 import { useComposeSuggestion } from "@/lib/useComposeSuggestion";
 import { cn } from "@/lib/utils";
 
@@ -122,6 +123,8 @@ export default function ComposeDialog({
   // the very end of the draft — track that so we don't offer/accept mid-edit.
   const [caretAtEnd, setCaretAtEnd] = useState(true);
   const toInputRef = useRef<HTMLInputElement>(null);
+  /** Measurement anchor for the portalled suggestion list. */
+  const toFieldRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<ComposeBodyHandle>(null);
 
   // Files staged for this message. Held in memory as base64 and shipped in the
@@ -704,8 +707,11 @@ export default function ComposeDialog({
               To
             </label>
             <div
-              // relative: anchors the recipient-suggestion dropdown below.
-              className="relative flex flex-1 cursor-text flex-wrap items-center gap-1.5"
+              ref={toFieldRef}
+              // The suggestion list is portalled out of this subtree (two
+              // clipping ancestors would cut it off), so this is its
+              // measurement anchor rather than a positioning context.
+              className="flex flex-1 cursor-text flex-wrap items-center gap-1.5"
               onClick={() => toInputRef.current?.focus()}
             >
               {recipients.map((addr) => (
@@ -755,11 +761,12 @@ export default function ComposeDialog({
                 className={cn(FIELD, "min-w-[8rem] flex-1 py-1")}
               />
               {contactHits.length > 0 && (
-                <ul
+                <AnchoredListbox
+                  anchorRef={toFieldRef}
                   id="contact-suggestions"
                   role="listbox"
                   aria-label="Recipient suggestions"
-                  className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-lg border border-border/60 bg-popover py-1 shadow-md"
+                  className="z-50 overflow-y-auto rounded-lg border border-border/60 bg-popover py-1 shadow-md"
                 >
                   {contactHits.map((c, i) => (
                     // role=option sits on the li so the listbox owns its
@@ -786,7 +793,7 @@ export default function ComposeDialog({
                       <span className="truncate text-muted-foreground">{c.email}</span>
                     </li>
                   ))}
-                </ul>
+                </AnchoredListbox>
               )}
 
               {/* Recipient validation lives right under the field it's about,

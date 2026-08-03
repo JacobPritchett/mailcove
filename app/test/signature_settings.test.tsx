@@ -2,7 +2,7 @@
 // compose actually reads from, and that a seeded signature is not mistaken for
 // content the user wrote. Both were real bugs.
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "../App";
 import type { ThreadsResponse, Me } from "../lib/types";
@@ -122,5 +122,37 @@ describe("useSetDomainSettings invalidation", () => {
     await waitFor(() => {
       expect(spy).toHaveBeenCalledWith({ queryKey: ["identities"] });
     });
+  });
+});
+
+describe("recipient suggestions escape their clipping ancestors", () => {
+  it("portals the listbox to the body and restores pointer events", async () => {
+    // The list is absolutely positioned inside a form that is overflow-y-auto
+    // inside an overflow-hidden dialog, so it was cut off when it did not fit:
+    // 21px lost at 390x320, 81px at 390x260.
+    //
+    // The host must be document.body. `position: fixed` resolves against the
+    // nearest ancestor with a transform, NOT the viewport, and the dialog is
+    // centred with `translate: -50% -50%` - hosting inside it put every
+    // coordinate in the dialog's frame (353px of error at 1280x800). That is
+    // invisible below `sm`, where the dialog is full-bleed and the error is
+    // exactly zero, which is why a mobile-only check passed it.
+    //
+    // Radix then sets pointer-events:none on the body while a modal is open,
+    // so the list has to ask for it back or every option click is swallowed.
+    const { getContacts } = await import("../lib/api");
+    vi.mocked(getContacts).mockResolvedValue({
+      contacts: [{ email: "alice@example.com", name: "Alice" }],
+    });
+
+    renderApp();
+    fireEvent.click(screen.getAllByRole("button", { name: /compose/i })[0]);
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("To"), { target: { value: "ali" } });
+
+    const list = await screen.findByRole("listbox", { name: "Recipient suggestions" });
+    expect(list.parentElement).toBe(document.body);
+    expect(list.closest('[data-slot="dialog-content"]')).toBeNull();
+    expect(list.style.pointerEvents).toBe("auto");
   });
 });

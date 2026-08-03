@@ -9,6 +9,7 @@
     "dev:web": "vite",
     "build": "npm run typecheck && vite build",
     "test": "vitest run",
+    "e2e": "npm run build && playwright test",
     "typecheck": "tsc -b --force",
     "migrate": "wrangler d1 migrations apply mailcove --local",
     "migrate:remote": "wrangler d1 migrations apply mailcove --remote",
