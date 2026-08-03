@@ -17,7 +17,14 @@ import {
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSend, useDraftReply, useIdentities } from "@/lib/queries";
-import { ApiError, putDraft, deleteDraft, getContacts } from "@/lib/api";
+import {
+  ApiError,
+  putDraft,
+  deleteDraft,
+  getContacts,
+  putDraftAttachments,
+  getDraftAttachments,
+} from "@/lib/api";
 import { commitRecipients } from "@/lib/recipients";
 import type { Contact } from "@/lib/types";
 import { docHasVisibleContent } from "@/lib/editorDoc";
@@ -222,6 +229,9 @@ export default function ComposeDialog({
   const qc = useQueryClient();
   // The draft row this compose session writes to (created lazily on first save).
   const draftIdRef = useRef<string | null>(null);
+  /** Signature of the attachment set last written to R2, so an unchanged set is
+   *  never re-uploaded on an ordinary body autosave. */
+  const syncedAttachmentsRef = useRef("");
   // True once the message was sent or the draft explicitly discarded — the
   // close-flush must not resurrect the deleted row.
   const skipDraftRef = useRef(false);
@@ -318,6 +328,24 @@ export default function ComposeDialog({
     setAttachError(null);
     clearSuggestion();
     draftIdRef.current = initial?.draftId ?? null;
+    syncedAttachmentsRef.current = "";
+    // Resume: pull the bytes back so the files are really there to send, not
+    // just listed. Best-effort - a draft that cannot fetch them should still
+    // open, with the attachment row simply empty.
+    const resumeId = initial?.draftId;
+    if (resumeId) {
+      void getDraftAttachments(resumeId)
+        .then(({ attachments: got }) => {
+          if (draftIdRef.current !== resumeId) return; // dialog moved on
+          setAttachments(got);
+          // Mark them as already stored, or the first autosave re-uploads
+          // everything the user just downloaded.
+          syncedAttachmentsRef.current = got.map((a) => `${a.name}:${a.size}`).join("|");
+        })
+        .catch(() => {
+          /* keep the draft usable without them */
+        });
+    }
     skipDraftRef.current = false;
     docJsonRef.current = initial?.bodyJson ?? "";
     send.reset();
@@ -396,7 +424,15 @@ export default function ComposeDialog({
     // its serializer and comes back with different surrounding whitespace, so
     // exact equality misses it and the junk draft is saved anyway.
     const written = sameBody(text, seededSigRef.current) ? "" : text;
-    return !!(written.trim() || subject.trim() || recipients.length || toInput.trim());
+    // A staged file is content too: without this, attaching one and closing
+    // saved no draft, so the file had nowhere to be stored and was lost.
+    return !!(
+      written.trim() ||
+      subject.trim() ||
+      recipients.length ||
+      toInput.trim() ||
+      attachments.length
+    );
   }
 
   /** Best-effort draft upsert (autosave path — failures stay silent). */
@@ -423,10 +459,26 @@ export default function ComposeDialog({
       threadId: initial?.threadId,
       inReplyTo: initial?.inReplyTo,
     };
+    // Signature of the staged set. The bytes ride only when this changes, so
+    // the 1.5s autosave stays a small JSON PUT no matter what is attached.
+    const attSig = attachments.map((a) => `${a.name}:${a.size}`).join("|");
+    const attChanged = attSig !== syncedAttachmentsRef.current;
+    const attSnapshot = attachments.map((a) => ({ name: a.name, type: a.type, data: a.data }));
+
     const save = savingRef.current.then(() =>
-      putDraft(id, payload).then(() => {
-        void qc.invalidateQueries({ queryKey: ["drafts"] });
-      }),
+      putDraft(id, payload)
+        .then(async () => {
+          // After the row exists: a draft row with no attachments is merely
+          // incomplete, whereas R2 bytes with no row are an orphan nobody will
+          // ever collect.
+          if (attChanged) {
+            await putDraftAttachments(id, attSnapshot);
+            syncedAttachmentsRef.current = attSig;
+          }
+        })
+        .then(() => {
+          void qc.invalidateQueries({ queryKey: ["drafts"] });
+        }),
     );
     savingRef.current = save.catch(() => {});
     try {

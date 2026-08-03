@@ -1,3 +1,4 @@
+import type { StagedAttachment } from "@/lib/attachments";
 // Typed fetch client for the Worker /api/* contract (see src/index.ts).
 // Every request rides with credentials:"same-origin" so the Cloudflare Access
 // cookie is sent. Non-OK responses throw a typed ApiError carrying the status.
@@ -311,6 +312,30 @@ export function setDomainSettings(zoneId: string, patch: DomainSettingsPatch): P
 /** GET /api/drafts — newest-first draft summaries. */
 export function listDrafts(): Promise<DraftsResponse> {
   return request<DraftsResponse>(`/api/drafts`);
+}
+
+/**
+ * PUT /api/drafts/:id/attachments — replaces the whole staged set.
+ *
+ * Separate from putDraft because the body autosaves every 1.5s while the user
+ * types while the file set changes only when they add or remove one; sending
+ * the bytes on the autosave path would re-upload everything per keystroke.
+ */
+export function putDraftAttachments(
+  id: string,
+  attachments: readonly { name: string; type: string; data: string }[],
+): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/drafts/${encodeURIComponent(id)}/attachments`, {
+    method: "PUT",
+    body: JSON.stringify({ attachments }),
+  });
+}
+
+/** GET /api/drafts/:id/attachments — the staged set WITH bytes, for resume. */
+export function getDraftAttachments(id: string): Promise<{ attachments: StagedAttachment[] }> {
+  return request<{ attachments: StagedAttachment[] }>(
+    `/api/drafts/${encodeURIComponent(id)}/attachments`,
+  );
 }
 
 /** GET /api/drafts/:id — full draft for resume. */

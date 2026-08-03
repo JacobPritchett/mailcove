@@ -20,6 +20,8 @@ vi.mock("../lib/api", () => ({
   getContacts: vi.fn(() => Promise.resolve({ contacts: [] })),
   send: vi.fn(() => Promise.resolve({ ok: true, id: "s1" })),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
+  getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
+  putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),
   deleteDraft: vi.fn(() => Promise.resolve({ ok: true })),
   listDrafts: vi.fn(() => Promise.resolve({ drafts: [] })),
   getDraft: vi.fn(),

@@ -17,6 +17,8 @@ vi.mock("../lib/api", () => ({
   ),
   send: vi.fn(() => Promise.resolve({ ok: true, id: "sent-1" })),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
+  getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
+  putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),
   deleteDraft: vi.fn(() => Promise.resolve({ ok: true })),
   listDrafts: vi.fn(),
   getDraft: vi.fn(),
@@ -40,6 +42,7 @@ const FULL: DraftFull = {
   fromLocal: "sales",
   fromDomain: "example.com",
   fromName: "Shiny Sales",
+  attachments: [],
   updated: Date.UTC(2026, 5, 9),
 };
 
@@ -61,8 +64,8 @@ beforeEach(() => {
   vi.mocked(getMe).mockResolvedValue({ email: "me@example.com" } as Me);
   vi.mocked(listDrafts).mockResolvedValue({
     drafts: [
-      { id: DRAFT_ID, threadId: null, to: "bob@example.com", subject: "WIP subject", snippet: "rich body", updated: Date.UTC(2026, 5, 9) },
-      { id: "99999999-8888-7777-6666-555555555555", threadId: "t9", to: "", subject: "", snippet: "", updated: Date.UTC(2026, 5, 8) },
+      { id: DRAFT_ID, threadId: null, to: "bob@example.com", subject: "WIP subject", snippet: "rich body", attachmentCount: 0, updated: Date.UTC(2026, 5, 9) },
+      { id: "99999999-8888-7777-6666-555555555555", threadId: "t9", to: "", subject: "", snippet: "", attachmentCount: 0, updated: Date.UTC(2026, 5, 8) },
     ],
   });
   vi.mocked(getDraft).mockResolvedValue(FULL);

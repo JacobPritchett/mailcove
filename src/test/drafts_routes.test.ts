@@ -123,6 +123,7 @@ describe("GET /api/drafts (+/:id) and DELETE", () => {
         to: "a@b.com",
         subject: "Hi",
         snippet: "line one line two",
+        attachmentCount: 0,
         updated: 123,
       },
     ]);

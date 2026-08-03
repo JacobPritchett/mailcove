@@ -3,6 +3,8 @@
 // domains registry — the DDL mirrors migrations/0008-drafts.sql so autosave
 // works before the migration file is ever applied.
 
+import { parseManifest } from "./draftAttachments";
+
 export interface DraftRow {
   id: string;
   thread_id: string | null;
@@ -14,10 +16,12 @@ export interface DraftRow {
   from_local: string | null;
   from_domain: string | null;
   from_name: string | null;
+  /** JSON manifest of {name,type,size}; bytes live in R2. */
+  attachments: string | null;
   updated: number;
 }
 
-const DRAFTS_DDL = `CREATE TABLE IF NOT EXISTS drafts (
+export const DRAFTS_DDL = `CREATE TABLE IF NOT EXISTS drafts (
   id          TEXT PRIMARY KEY,
   thread_id   TEXT,
   in_reply_to TEXT,
@@ -28,6 +32,7 @@ const DRAFTS_DDL = `CREATE TABLE IF NOT EXISTS drafts (
   from_local  TEXT,
   from_domain TEXT,
   from_name   TEXT,
+  attachments TEXT,
   updated     INTEGER NOT NULL
 )`;
 
@@ -143,20 +148,40 @@ export async function listDrafts(env: { DB: D1Database }): Promise<
     to: string;
     subject: string;
     snippet: string;
+    /** How many files are staged on this draft — enough for a paperclip. */
+    attachmentCount: number;
     updated: number;
   }>
 > {
+  // The `attachments` column arrives in migration 0013, but Workers Builds
+  // deploys code WITHOUT applying migrations - so for the window between the
+  // deploy and the migration this query would throw, and the catch below would
+  // report an EMPTY drafts list rather than an error. Silently losing the
+  // user's drafts view is far worse than one extra query, so fall back to the
+  // pre-0013 shape instead of letting that happen.
+  let r: D1Result<DraftRow> | null = null;
   try {
-    const r = await env.DB.prepare(
-      `SELECT id, thread_id, msg_to, subject, body_text, updated
+    r = await env.DB.prepare(
+      `SELECT id, thread_id, msg_to, subject, body_text, attachments, updated
          FROM drafts ORDER BY updated DESC LIMIT 200`,
     ).all<DraftRow>();
+  } catch {
+    r = null;
+  }
+  try {
+    if (!r) {
+      r = await env.DB.prepare(
+        `SELECT id, thread_id, msg_to, subject, body_text, updated
+           FROM drafts ORDER BY updated DESC LIMIT 200`,
+      ).all<DraftRow>();
+    }
     return (r.results ?? []).map((d) => ({
       id: d.id,
       threadId: d.thread_id,
       to: d.msg_to ?? "",
       subject: d.subject ?? "",
       snippet: (d.body_text ?? "").replace(/\s+/g, " ").trim().slice(0, 140),
+      attachmentCount: parseManifest(d.attachments).length,
       updated: d.updated,
     }));
   } catch {

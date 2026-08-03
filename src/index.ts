@@ -52,6 +52,14 @@ import {
 } from "./domains";
 import { classifyMessage } from "./categorize";
 import { validateDraft, putDraft, listDrafts, getDraft, deleteDraft, countDrafts } from "./drafts";
+import {
+  parseDraftAttachments,
+  putDraftAttachments,
+  getDraftAttachments,
+  deleteDraftAttachments,
+  parseManifest,
+  manifestOf,
+} from "./draftAttachments";
 import { sendPushToAll, isAllowedPushEndpoint, validSubscriptionKeys, clampUtf8, MAX_SUBSCRIPTIONS } from "./push";
 import { normalizeCid, rewriteEmailImages } from "./imageRewrite";
 import { verifyMediaToken, proxyRemoteImage, RASTER_TYPES, MEDIA_TTL_SECONDS, mintMediaToken, MEDIA_KID } from "./media";
@@ -1176,12 +1184,55 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
       fromLocal: d.from_local ?? "",
       fromDomain: d.from_domain ?? "",
       fromName: d.from_name ?? "",
+      attachments: parseManifest(d.attachments),
       updated: d.updated,
     });
   }
   if (m && request.method === "DELETE") {
+    // Best-effort on the bytes, unconditional on the row. Discarding a draft
+    // must never be blocked by R2 being unavailable - a draft the user cannot
+    // get rid of is a worse failure than bytes nobody collects, and deleting an
+    // absent key is a no-op so a later retry still converges.
+    try {
+      await deleteDraftAttachments(env, m[1]);
+    } catch {
+      // orphaned blob; the row goes regardless
+    }
     await deleteDraft(env, m[1]);
     return json({ ok: true });
+  }
+
+  // PUT /api/drafts/:id/attachments — replaces the whole staged set.
+  // GET  — the same set with bytes, for restoring compose on resume.
+  //
+  // Separate from the draft row on purpose: the body autosaves every 1.5s while
+  // the user types, and re-uploading 10MB of base64 on every keystroke would be
+  // absurd. This is called only when a file is added or removed.
+  m = path.match(/^\/api\/drafts\/([A-Za-z0-9-]{8,64})\/attachments$/);
+  if (m && request.method === "PUT") {
+    const b = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+    let items;
+    try {
+      items = parseDraftAttachments(b.attachments);
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : "invalid attachments" }, 400);
+    }
+    await putDraftAttachments(env, m[1], items);
+    // The manifest is what the drafts list reads; keep it in step with R2.
+    // Tolerated failure: before migration 0013 this column does not exist, and
+    // the bytes are already safely in R2 - a missing paperclip in the list is
+    // not a reason to fail the upload.
+    try {
+      await env.DB.prepare(`UPDATE drafts SET attachments = ? WHERE id = ?`)
+        .bind(items.length ? JSON.stringify(manifestOf(items)) : null, m[1])
+        .run();
+    } catch {
+      // pre-0013 database; the manifest appears once the migration runs
+    }
+    return json({ ok: true, attachments: manifestOf(items) });
+  }
+  if (m && request.method === "GET") {
+    return json({ attachments: await getDraftAttachments(env, m[1]) });
   }
 
   // ---- Per-sender image allowlist ----

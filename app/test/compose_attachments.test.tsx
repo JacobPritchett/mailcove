@@ -19,6 +19,8 @@ vi.mock("../lib/api", () => ({
   ),
   send: vi.fn(),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
+  getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
+  putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),
   deleteDraft: vi.fn(() => Promise.resolve({ ok: true })),
   listDrafts: vi.fn(() => Promise.resolve({ drafts: [] })),
   getDraft: vi.fn(),

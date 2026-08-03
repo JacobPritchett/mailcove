@@ -114,6 +114,7 @@ export interface DraftSummary {
   to: string;
   subject: string;
   snippet: string;
+  attachmentCount: number;
   updated: number;
 }
 export interface DraftsResponse {
@@ -132,7 +133,15 @@ export interface DraftFull {
   fromLocal: string;
   fromDomain: string;
   fromName: string;
+  /** Metadata only — the bytes come from GET /api/drafts/:id/attachments. */
+  attachments: DraftAttachmentMeta[];
   updated: number;
+}
+
+export interface DraftAttachmentMeta {
+  name: string;
+  type: string;
+  size: number;
 }
 /** PUT /api/drafts/:id body (id rides in the URL). */
 export interface DraftPut {

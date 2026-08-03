@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS drafts (
   from_local  TEXT,
   from_domain TEXT,
   from_name   TEXT,
+  -- JSON manifest of {name,type,size}; the bytes live in R2 (draftatt/<id>.json).
+  attachments TEXT,
   updated     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated DESC);
