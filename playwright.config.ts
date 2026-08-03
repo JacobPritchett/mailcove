@@ -11,7 +11,7 @@ export default defineConfig({
   testMatch: /e2e-.*\.spec\.ts$/,
   use: { ...devices["Desktop Chrome"], headless: true, baseURL: "http://127.0.0.1:4173" },
   webServer: {
-    command: "npx vite preview --port 4173 --strictPort",
+    command: "npx vite preview --host 127.0.0.1 --port 4173 --strictPort",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: true,
     timeout: 60_000,
