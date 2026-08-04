@@ -23,13 +23,13 @@ import { cn } from "@/lib/utils";
 import {
   addressOf,
   avatarColor,
-  formatFullDate,
   initialsOf,
   recipientSummary,
   senderLabel,
 } from "@/lib/format";
 import ChatView from "@/components/ChatView";
 import { linkifyText } from "@/lib/chatNormalize";
+import RelativeTime from "@/components/RelativeTime";
 import InlineReply from "@/components/InlineReply";
 import { replyInitialForThread } from "@/lib/replyContext";
 import type { ComposeInitial } from "@/components/ComposeDialog";
@@ -428,13 +428,10 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
           )}
         </div>
 
-        <time
-          dateTime={new Date(msg.date).toISOString()}
-          title={new Date(msg.date).toLocaleString()}
+        <RelativeTime
+          date={msg.date}
           className="shrink-0 pt-0.5 text-xs text-muted-foreground"
-        >
-          {formatFullDate(msg.date, Date.now())}
-        </time>
+        />
       </div>
 
       {/* Attachments — links to the download endpoint, shown as chips. */}
@@ -533,13 +530,19 @@ function applyBodyPadding(doc: Document) {
   const body = doc.body;
   const view = doc.defaultView;
   if (!body || !view) return;
+  // Writing an unchanged value would still be a style mutation, and this runs
+  // from a ResizeObserver-adjacent path — assign only on a real change so it
+  // cannot feed itself.
+  const set = (v: string) => {
+    if (body.style.padding !== v) body.style.padding = v;
+  };
   const bleeds = Array.from(body.children).some((el) => {
     const bg = view.getComputedStyle(el).backgroundColor;
     // rgba(...,0) and "transparent" both mean nothing is painted.
     if (!bg || bg === "transparent" || /,\s*0\s*\)$/.test(bg)) return false;
     return el.getBoundingClientRect().width >= body.clientWidth - 2;
   });
-  body.style.padding = bleeds ? "0" : "16px";
+  set(bleeds ? "0px" : "16px");
 }
 
 function EmailFrame({ html, title }: { html: string; title: string }) {
@@ -595,8 +598,23 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
     const themeObserver = new MutationObserver(syncTheme);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
     syncTheme();
+
+    // Whether an email paints to the edge is a LAYOUT answer, so it can change
+    // when the viewport does: a newsletter whose fixed-width table stops
+    // spanning the frame at a narrow width needs the padding a wide one does
+    // not. Deciding it once on load left that stale for the rest of the read.
+    const onResize = () => {
+      try {
+        if (iframe.contentDocument) applyBodyPadding(iframe.contentDocument);
+      } catch {
+        /* cosmetic */
+      }
+      measure();
+    };
+    window.addEventListener("resize", onResize);
     return () => {
       iframe.removeEventListener("load", onLoad);
+      window.removeEventListener("resize", onResize);
       ro?.disconnect();
       themeObserver.disconnect();
     };
@@ -663,7 +681,8 @@ function ReaderToolbar({
             variant="outline"
             size="sm"
             onClick={() => onAction("restore")}
-            aria-label="Restore"
+            className="max-md:h-11"
+          aria-label="Restore"
           >
             <RotateCcw className="h-4 w-4" />
             Restore
@@ -708,6 +727,7 @@ function ReaderToolbar({
           variant="outline"
           size="sm"
           onClick={() => onAction("archive")}
+          className="max-md:h-11"
           aria-label="Archive"
         >
           <Archive className="h-4 w-4" />
@@ -721,6 +741,7 @@ function ReaderToolbar({
         variant="outline"
         size="sm"
         onClick={() => onAction(isStarred ? "unstar" : "star")}
+        className="max-md:h-11"
         aria-label={isStarred ? "Unstar" : "Star"}
       >
         <Star
@@ -738,7 +759,8 @@ function ReaderToolbar({
         variant="outline"
         size="sm"
         onClick={() => onAction("unread")}
-        aria-label="Mark as unread"
+        className="max-md:h-11"
+          aria-label="Mark as unread"
       >
         <MailOpen className="h-4 w-4" />
         Unread
@@ -757,7 +779,7 @@ function ReaderToolbar({
             size="sm"
             onClick={() => onAction("trash")}
             aria-label="Move to trash"
-            className="text-muted-foreground hover:text-destructive"
+            className="text-muted-foreground hover:text-destructive max-md:h-11"
           >
             <Trash2 className="h-4 w-4" />
             Trash
