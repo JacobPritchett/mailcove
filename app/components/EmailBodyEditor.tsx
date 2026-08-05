@@ -7,6 +7,7 @@ import { forwardRef, useCallback, useImperativeHandle, useRef } from "react";
 import { EmailEditor, type EmailEditorProps, type EmailEditorRef } from "@react-email/editor";
 import "@react-email/editor/themes/default.css";
 import { plainTextToHtml } from "@/lib/plainText";
+import { toEmailFragment } from "@/lib/outboundHtml";
 import { parseEditorDoc } from "@/lib/editorDoc";
 import { cn } from "@/lib/utils";
 
@@ -95,7 +96,9 @@ const EmailBodyEditor = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
         async getEmail() {
           const r = apiRef.current;
           if (!r) return { html: "", text: "" };
-          return r.getEmail();
+          const { html, text } = await r.getEmail();
+          // Personal mail, not a newsletter: see toEmailFragment.
+          return { html: toEmailFragment(html), text };
         },
         getDocJson() {
           const r = apiRef.current;
