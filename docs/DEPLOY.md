@@ -8,7 +8,7 @@ returns 401).
 Prerequisites:
 
 - A domain already added to Cloudflare (this guide calls it `example.com`).
-- Node 20 or newer, and `npm install` run once in the repo.
+- Node 22.13 or newer, and `npm install` run once in the repo.
 - Wrangler authenticated: `npx wrangler login`.
 
 ## 1. Create D1 and R2
@@ -25,7 +25,34 @@ Copy the `database_id` that `d1 create` prints into `wrangler.jsonc` under
 
 Migrations live in `migrations/` (`NNNN-name.sql`, applied in order) and are tracked by
 Cloudflare's D1 migrations framework (a `d1_migrations` table), so each runs exactly
-once. The full schema is also in `schema.sql` for reference.
+once. There are 20 of them, `0000` to `0019`:
+
+| Migration | What it adds |
+| --- | --- |
+| `0000-init` | The base `messages` table and its first indexes |
+| `0001-mailbox-state` | Archive, trash, and star state |
+| `0002-pre-trash-state` | The state to restore a trashed message to |
+| `0003-search-fts` | The FTS5 search index |
+| `0004-category` | Category labels |
+| `0005-push-subscriptions` | Web Push subscriptions |
+| `0006-filters` | Inbox rules |
+| `0007-domains` | The domain registry (with an example seed row, see below) |
+| `0008-drafts` | Drafts |
+| `0009-managed-routing-rules` | Routing rules created from the app |
+| `0010-images` and `0011-image-from-addr` | Remote image allowlist and DMARC flag |
+| `0012-signature` | Per-identity signatures |
+| `0013-draft-attachments` | Attachments on drafts |
+| `0014-message-id-index` | Index for threading lookups |
+| `0015-pending-deletes` | Tombstones for permanent deletes |
+| `0016-draft-cc` | Cc and Bcc on drafts |
+| `0017-junk` | The junk mark and blocked senders |
+| `0018-snooze` | Snooze |
+| `0019-envelope-to` | The address each inbound message was delivered to |
+
+`0000-init` creates the base tables, so the set applies cleanly to the empty database
+you made in step 1. On a database that already has the tables it does nothing. The same
+schema is in `schema.sql` as one file, and a test (`src/test/migrations.test.ts`) fails
+if the two ever differ.
 
 ```bash
 # remote (production); also run automatically by `npm run deploy`
@@ -35,10 +62,15 @@ npm run migrate:remote      # wrangler d1 migrations apply mailcove --remote
 npm run migrate             # wrangler d1 migrations apply mailcove --local
 ```
 
-After deploy is wired up (step 8), `npm run deploy` applies pending migrations before
+After deploy is wired up (step 9), `npm run deploy` applies pending migrations before
 shipping the Worker, so the live schema never drifts behind the code. To add a schema
 change later: drop a new `migrations/NNNN-name.sql`, update `schema.sql`, and the next
 deploy applies it.
+
+When you update an existing install, always deploy with `npm run deploy` (or run
+`npm run migrate:remote` first), not a bare `wrangler deploy`. New code expects the new
+columns, and the inbox does not load until they exist. Inbound mail is still stored in
+the meantime, without the delivered-to address that `0019` adds.
 
 `migrations/0007-domains.sql` contains an example seed row for `example.com`. Edit it to
 your domain before applying, or remove the INSERT and add your domain through the in-app
@@ -78,7 +110,7 @@ Then set the catch-all action to send to this Worker:
 
 Every message to any address at your domain is then delivered to the Worker's `email()`
 handler. (The Worker must be deployed at least once before it appears in the Worker
-list. If it is not there yet, do step 8 first, then return here.)
+list. If it is not there yet, do step 9 first, then return here.)
 
 ## 5. Enable Email Sending (outbound)
 
@@ -116,7 +148,23 @@ Push notifications use VAPID keys. Generate a fresh pair (for example with the
 Never commit the private key, and never reuse a key pair across deployments. If you skip
 this step, push notifications are disabled and the rest of the app works normally.
 
-## 8. Set secrets and deploy
+## 8. Check the cron triggers and the AI model
+
+`wrangler.jsonc` ships with two cron triggers, and `wrangler deploy` creates both:
+
+- `0 4 * * *` runs once a day. It purges Trash and Junk older than 30 days and
+  finishes any permanent deletes that were left half done.
+- `*/5 * * * *` runs every five minutes and only wakes snoozed mail: it marks the
+  conversation unread and sends a push notification. Snoozed mail reappears in the inbox
+  on time even if this trigger never runs, because the inbox compares against the clock.
+
+The Workers AI features use the model `@cf/meta/llama-3.1-8b-instruct-fast`. It is a
+constant in `src/ai.ts` (`SUMMARY_MODEL`) and `src/categorize.ts` (`CATEGORIZE_MODEL`).
+Cloudflare retires models from time to time. If summaries and labels stop working,
+check that the model is still listed in the Workers AI catalog and change the two
+constants if it is not.
+
+## 9. Set secrets and deploy
 
 ```bash
 npx wrangler secret put AUTH_TOKEN        # bearer fallback for automation (see SECURITY.md)
@@ -131,7 +179,7 @@ npm run deploy   # applies pending D1 migrations, then deploys the Worker
 Routing, DNS read for the onboarding flow). If you do not use the in-app domain
 onboarding, you can leave it unset.
 
-## 9. Test inbound and outbound
+## 10. Test inbound and outbound
 
 ```bash
 # the hostname should redirect to the Access login (302), not return 200

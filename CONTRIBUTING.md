@@ -18,7 +18,11 @@ npm run typecheck && npm run test && npm run build
 ```
 
 Add or update tests for anything you change. The Worker tests live in `src/test/` and the
-SPA tests in `app/test/`.
+SPA tests in `app/test/`. The tests need Node 22.13 or newer.
+
+If you change the UI, also run the browser specs (`app/test/e2e-*.spec.ts`) with
+`npm run e2e`. If you change the schema, add a migration in `migrations/` and make the
+same change in `schema.sql`. `src/test/migrations.test.ts` fails when the two differ.
 
 ## Guidelines
 
