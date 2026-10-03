@@ -9,7 +9,42 @@ import {
   avatarHue,
   avatarColor,
   formatFullDate,
+  conversationSubject,
 } from "@/lib/format";
+
+describe("conversationSubject", () => {
+  it("drops a leading reply or forward prefix, whatever its case", () => {
+    expect(conversationSubject("Re: Lunch")).toBe("Lunch");
+    expect(conversationSubject("RE: Lunch")).toBe("Lunch");
+    expect(conversationSubject("Fwd: Lunch")).toBe("Lunch");
+    expect(conversationSubject("FW: Lunch")).toBe("Lunch");
+  });
+
+  it("drops a whole chain of them", () => {
+    expect(conversationSubject("Re: RE: Fwd: re:Lunch on Friday")).toBe("Lunch on Friday");
+    expect(conversationSubject("  Re : Re[2]: Lunch")).toBe("Lunch");
+  });
+
+  it("leaves words that merely start like a prefix, and prefixes that are not leading", () => {
+    expect(conversationSubject("Regarding lunch")).toBe("Regarding lunch");
+    expect(conversationSubject("Fwd lunch")).toBe("Fwd lunch");
+    expect(conversationSubject("Lunch re: Friday")).toBe("Lunch re: Friday");
+    expect(conversationSubject("Reply: needed")).toBe("Reply: needed");
+  });
+
+  it("is empty for a subject that was only prefixes, or missing", () => {
+    expect(conversationSubject("Re: ")).toBe("");
+    expect(conversationSubject("")).toBe("");
+    expect(conversationSubject(null)).toBe("");
+  });
+
+  it("reads a hostile subject once", () => {
+    const start = performance.now();
+    conversationSubject("re" + " ".repeat(200_000) + "x");
+    conversationSubject("re: ".repeat(50_000) + "x");
+    expect(performance.now() - start).toBeLessThan(500);
+  });
+});
 
 describe("formatDate", () => {
   // Fixed reference: 2026-06-03T15:30:00 local time.
@@ -261,5 +296,61 @@ describe("avatarColor", () => {
 
   it("is stable for the same sender", () => {
     expect(avatarColor("alice@example.com")).toBe(avatarColor("alice@example.com"));
+  });
+});
+
+describe("senderLabel hardening (adversarial review, 2026-08-03)", () => {
+  it("stays fast on many angle brackets with no closing one", () => {
+    // The old /^(.*?)<[^>]*>\s*$/ was O(n^2) on this shape: 147ms at 20k chars,
+    // 9s at 160k. Reachable from one inbound message - postal-mime strips the
+    // quotes around '"<<<<...<"@evil.example' and stores the run raw, and
+    // recipientSummary now feeds To/Cc through here on every render.
+    const nasty = "<".repeat(80000);
+    const t0 = Date.now();
+    senderLabel(nasty);
+    expect(Date.now() - t0).toBeLessThan(100);
+  });
+
+  it("does not eat backslashes in an unquoted name", () => {
+    // Unescaping unconditionally turned an ordinary Windows-style name into
+    // "DomainUser".
+    expect(senderLabel("Domain\\User <a@x.com>")).toBe("Domain\\User");
+    expect(senderLabel("C:\\path\\to <a@x.com>")).toBe("C:\\path\\to");
+  });
+
+  it("leaves a name alone when it is not one well-formed quoted string", () => {
+    // Greedy ^"(.*)"$ turned this into 'a" and "b'.
+    expect(senderLabel('"a" and "b" <a@x.com>')).toBe('"a" and "b"');
+  });
+
+  it("leaves an unterminated quote alone rather than reinterpreting it", () => {
+    expect(senderLabel('"Doe, Jane <j@x.com>')).toBe('"Doe, Jane');
+  });
+});
+
+describe("splitAddressList hardening (adversarial review, 2026-08-03)", () => {
+  it("does not report forty recipients as one when a bracket is unpaired", () => {
+    // depth never recovered, so a single stray "<" swallowed every later comma
+    // and the summary claimed one recipient for a message sent to many.
+    expect(splitAddressList("<a@x.com, b@y.com").length).toBe(2);
+    expect(splitAddressList('"Doe, John <j@x.com>, real@y.com').length).toBeGreaterThan(1);
+  });
+
+  it("treats a backslash outside quotes as an ordinary character", () => {
+    // RFC 5322 escapes only inside a quoted-string; honouring it outside merged
+    // two recipients into one.
+    expect(splitAddressList("a\\, b@y.com").length).toBe(2);
+  });
+
+  it("bounds the header it will parse", () => {
+    const huge = Array.from({ length: 5000 }, (_, i) => `u${i}@x.com`).join(",");
+    const t0 = Date.now();
+    const out = splitAddressList(huge);
+    expect(Date.now() - t0).toBeLessThan(100);
+    expect(out.length).toBeLessThan(5000);
+  });
+
+  it("still counts a normal long list correctly", () => {
+    expect(splitAddressList("a@x.com, b@y.com, c@z.com").length).toBe(3);
   });
 });

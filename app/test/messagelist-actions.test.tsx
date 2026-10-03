@@ -132,11 +132,11 @@ describe("MessageList row actions — inbox view", () => {
     );
   });
 
-  it("star button sends 'star' action for an unstarred thread", async () => {
+  it("Star, under the row's More menu, sends 'star' for an unstarred thread", async () => {
     renderList([THREAD_INBOX]);
 
-    const starBtn = await screen.findByRole("button", { name: "Star" });
-    fireEvent.click(starBtn);
+    fireEvent.keyDown(await screen.findByRole("button", { name: /^More actions/ }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Star" }));
 
     await waitFor(() => {
       expect(mutateThread).toHaveBeenCalledWith("t-inbox", "star");
@@ -147,15 +147,27 @@ describe("MessageList row actions — inbox view", () => {
     );
   });
 
-  it("star button sends 'unstar' action for an already-starred thread", async () => {
+  it("the same item sends 'unstar' for an already-starred thread", async () => {
     renderList([THREAD_STARRED], "inbox");
 
-    const unstarBtn = await screen.findByRole("button", { name: "Unstar" });
-    fireEvent.click(unstarBtn);
+    fireEvent.keyDown(await screen.findByRole("button", { name: /^More actions/ }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Unstar" }));
 
     await waitFor(() => {
       expect(mutateThread).toHaveBeenCalledWith("t-starred", "unstar");
     });
+  });
+
+  it("the More menu marks an unread thread read, and a read one unread", async () => {
+    renderList([THREAD_INBOX]);
+    fireEvent.keyDown(await screen.findByRole("button", { name: /^More actions/ }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Mark as read" }));
+    await waitFor(() => expect(mutateThread).toHaveBeenCalledWith("t-inbox", "read"));
+  });
+
+  it("the More button says which thread it belongs to", async () => {
+    renderList([THREAD_INBOX]);
+    expect(await screen.findByRole("button", { name: "More actions for Inbox thread" })).toBeInTheDocument();
   });
 
   it("Archive/Trash buttons appear in inbox view (not Restore/Delete)", async () => {

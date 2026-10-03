@@ -15,6 +15,7 @@ vi.mock("../lib/api", () => ({
   getMe: vi.fn(),
   getIdentities: vi.fn(() => Promise.resolve({ identities: [], defaultLocal: "hello", defaultDomain: "example.com" })),
   send: vi.fn(),
+  getContacts: vi.fn(() => Promise.resolve({ contacts: [] })),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
   getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
   putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),

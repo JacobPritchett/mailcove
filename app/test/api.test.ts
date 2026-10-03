@@ -9,6 +9,9 @@ import {
   getThread,
   getMe,
   attachmentUrl,
+  listBlocked,
+  addBlocked,
+  removeBlocked,
   ApiError,
 } from "@/lib/api";
 import type { ThreadsResponse, ViewCounts, MessageDetail, ThreadResponse, Me } from "@/lib/types";
@@ -57,7 +60,26 @@ describe("listThreads", () => {
   it("appends &q= only when q is a non-empty trimmed string", async () => {
     (globalThis.fetch as any).mockResolvedValue(jsonResponse({ threads: [], unread: 0, user: "x" }));
     await listThreads({ view: "trash", q: "hi" });
-    expect(lastCall()[0]).toBe("/api/messages?view=trash&q=hi");
+    // With the search goes the user's UTC offset, so date operators mean their days.
+    expect(lastCall()[0]).toBe(`/api/messages?view=trash&q=hi&tz=${new Date().getTimezoneOffset()}`);
+  });
+
+  it("keeps the domain on a search, and drops only the category", async () => {
+    (globalThis.fetch as any).mockResolvedValue(jsonResponse({ threads: [], unread: 0, user: "x" }));
+    await listThreads({ view: "inbox", q: "hi", category: "updates", domain: "example.com" });
+    expect(lastCall()[0]).toBe(`/api/messages?view=inbox&q=hi&tz=${new Date().getTimezoneOffset()}&domain=example.com`);
+  });
+
+  it("sends both the category and the domain for a plain view", async () => {
+    (globalThis.fetch as any).mockResolvedValue(jsonResponse({ threads: [], unread: 0, user: "x" }));
+    await listThreads({ view: "inbox", category: "updates", domain: "example.com" });
+    expect(lastCall()[0]).toBe("/api/messages?view=inbox&category=updates&domain=example.com");
+  });
+
+  it("sends the page size and cursor when given", async () => {
+    (globalThis.fetch as any).mockResolvedValue(jsonResponse({ threads: [], unread: 0, user: "x" }));
+    await listThreads({ view: "inbox", limit: 50, cursor: "d.5.t@x" });
+    expect(lastCall()[0]).toBe("/api/messages?view=inbox&limit=50&cursor=d.5.t%40x");
   });
 
   it("omits q when it is an empty or whitespace-only string", async () => {
@@ -122,6 +144,67 @@ describe("mutateThreads (bulk)", () => {
     expect(url).toBe("/api/messages/mutate");
     expect((init.method ?? "").toUpperCase()).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ threadIds: ["t1", "t2", "t3"], action: "read" });
+  });
+});
+
+describe("snooze, bulk limits, and the block list", () => {
+  const bodies = () =>
+    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+      JSON.parse(String((c[1] as RequestInit).body)),
+    );
+
+  it("sends the snooze time with a single and a bulk snooze", async () => {
+    (globalThis.fetch as any).mockImplementation(() => Promise.resolve(jsonResponse({ ok: true, count: 2 })));
+    await mutateThread("t1", "snooze", 1_800_000_000_000);
+    await mutateThreads(["t1", "t2"], "snooze", 1_800_000_000_000);
+    expect(bodies()).toEqual([
+      { action: "snooze", until: 1_800_000_000_000 },
+      { threadIds: ["t1", "t2"], action: "snooze", until: 1_800_000_000_000 },
+    ]);
+  });
+
+  it("splits a selection larger than the Worker's 200 per request, and adds up the counts", async () => {
+    (globalThis.fetch as any).mockImplementation((_url: string, init: RequestInit) =>
+      Promise.resolve(jsonResponse({ ok: true, count: JSON.parse(String(init.body)).threadIds.length })),
+    );
+    const ids = Array.from({ length: 450 }, (_, i) => `t${i}`);
+    const out = await mutateThreads(ids, "archive");
+    expect(bodies().map((b) => b.threadIds.length)).toEqual([200, 200, 50]);
+    expect(bodies().flatMap((b) => b.threadIds)).toEqual(ids);
+    expect(out).toEqual({ ok: true, count: 450 });
+  });
+
+  it("says which threads were not changed when a later request of a split selection fails", async () => {
+    let n = 0;
+    (globalThis.fetch as any).mockImplementation(() =>
+      Promise.resolve(++n === 1 ? jsonResponse({ ok: true, count: 200 }) : jsonResponse({ error: "boom" }, 502)),
+    );
+    const ids = Array.from({ length: 450 }, (_, i) => `t${i}`);
+    const err = await mutateThreads(ids, "archive").catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.failedIds).toEqual(ids.slice(200));
+  });
+
+  it("lists, adds and removes blocked senders, encoding the entry in the path", async () => {
+    (globalThis.fetch as any).mockImplementation(() =>
+      Promise.resolve(jsonResponse({ ok: true, blocked: [], address: "@ads.example" })),
+    );
+    await listBlocked();
+    expect(lastCall()[0]).toBe("/api/blocked");
+    await addBlocked("@Ads.Example");
+    expect(lastCall()[1].method).toBe("POST");
+    expect(JSON.parse(String(lastCall()[1].body))).toEqual({ address: "@Ads.Example" });
+    await removeBlocked("@ads.example");
+    expect(lastCall()[0]).toBe("/api/blocked/%40ads.example");
+    expect(lastCall()[1].method).toBe("DELETE");
+  });
+
+  it("surfaces the Worker's reason when a block is refused", async () => {
+    (globalThis.fetch as any).mockResolvedValue(jsonResponse({ error: "that is one of your own domains" }, 400));
+    await expect(addBlocked("@example.com")).rejects.toMatchObject({
+      status: 400,
+      message: "that is one of your own domains",
+    });
   });
 });
 

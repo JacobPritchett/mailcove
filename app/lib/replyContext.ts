@@ -1,14 +1,31 @@
 // Reply prefill construction, shared by the inline thread composer (Reader)
 // and the full compose dialog (App keyboard/menu paths).
 import { addressOf, senderLabel } from "@/lib/format";
+import {
+  deliveredTo,
+  forwardBody,
+  forwardableParts,
+  forwardSubject,
+  replyRecipients,
+  replySubject,
+  type ReplyMode,
+} from "@/lib/conversation";
 import type { ComposeInitial } from "@/components/ComposeDialog";
+import { baseLocal } from "@/lib/identity";
 import type { MessageDetail, ThreadMessage } from "@/lib/types";
 
-/** Build reply prefill (To, Re: subject, quoted body, inReplyTo/threadId). */
-export function buildReplyInitial(detail: MessageDetail): ComposeInitial {
+/**
+ * Build reply prefill (To/Cc, Re: subject, quoted body, inReplyTo/threadId).
+ * `mine` lists the user's own addresses, which reply all never adds back.
+ */
+export function buildReplyInitial(
+  detail: MessageDetail,
+  mode: ReplyMode = "reply",
+  mine: Iterable<string> = [],
+): ComposeInitial {
   const { message: m, body } = detail;
-  const subject = m.subject || "";
-  const reSubject = /^re:/i.test(subject) ? subject : `Re: ${subject}`;
+  const target = { ...m, body } as ThreadMessage;
+  const { to, cc } = replyRecipients(target, mode, mine);
   // Gmail-style attribution: "On Jun 9, 2026 at 2:30 PM, Alice wrote:" —
   // sender display name (not the full Name <addr> form), no seconds.
   const d = new Date(m.date);
@@ -25,36 +42,80 @@ export function buildReplyInitial(detail: MessageDetail): ComposeInitial {
   // seed preserves it); the quoted history follows.
   const text = `\n\n${quoted}`;
   return {
-    to: addressOf(m.msg_from),
-    subject: reSubject,
+    to: to.join(", "),
+    ...(cc.length ? { cc: cc.join(", ") } : {}),
+    subject: replySubject(m.subject || ""),
     text,
     // Marks this prefill as a genuine reply, so a composer knows the body is
     // ours to seed a signature into (a resumed draft's body is not).
     replyQuote: text,
     inReplyTo: m.message_id ?? undefined,
     threadId: m.thread_id,
-    // Reply as the identity the original mail was addressed to (multi-domain);
-    // the compose picker ignores it when that domain can't send.
-    fromDomain: m.domain ?? undefined,
+    ...replyIdentity(target),
   };
 }
 
 /**
- * The reply target for a thread: the latest INBOUND message (fallback: latest
- * message), stamped with the thread root id so the reply joins the thread.
+ * Reply as the address the mail was actually sent to (shop@, billing@), not
+ * the default one: the other side wrote to that address and expects it back.
+ * A follow-up on our own sent mail keeps the address it went out from. The
+ * compose picker ignores the domain when it cannot send.
+ */
+function replyIdentity(m: ThreadMessage): Pick<ComposeInitial, "fromDomain" | "fromLocal"> {
+  const domain = (m.domain ?? "").toLowerCase();
+  const own = m.direction === "out" ? addressOf(m.msg_from).toLowerCase() : deliveredTo(m);
+  const at = own ? own.lastIndexOf("@") : -1;
+  const sameDomain = !!own && at > 0 && own.slice(at + 1) === domain;
+  // The mailbox, without a plus tag: mail to me+shop@ is answered from me@.
+  // The Worker cannot send from a tagged address anyway (its sanitizer drops
+  // the "+", which would make it "meshop@"), so naming one here would show a
+  // From that is not the one used.
+  const local = sameDomain ? baseLocal(own!.slice(0, at)) : "";
+  return {
+    fromDomain: m.domain ?? undefined,
+    ...(local ? { fromLocal: local } : {}),
+  };
+}
+
+/** The message a reply answers by default: the latest inbound, else the latest. */
+export function defaultReplyTarget(messages: ThreadMessage[]): ThreadMessage | null {
+  if (messages.length === 0) return null;
+  return [...messages].reverse().find((m) => m.direction === "in") ?? messages[messages.length - 1];
+}
+
+/**
+ * The reply prefill for a thread, stamped with the thread root id so the reply
+ * joins the thread. `targetId` picks a specific message (the per-message
+ * menu); otherwise the default target is used.
  */
 export function replyInitialForThread(
   threadRootId: string,
   messages: ThreadMessage[],
+  mode: ReplyMode = "reply",
+  targetId?: string | null,
+  mine: Iterable<string> = [],
 ): ComposeInitial | null {
-  if (messages.length === 0) return null;
-  const lastInbound =
-    [...messages].reverse().find((m) => m.direction === "in") ??
-    messages[messages.length - 1];
-  return buildReplyInitial({
-    message: { ...lastInbound, thread_id: threadRootId },
-    body: lastInbound.body,
-  });
+  const target = (targetId && messages.find((m) => m.id === targetId)) || defaultReplyTarget(messages);
+  if (!target) return null;
+  return buildReplyInitial({ message: { ...target, thread_id: threadRootId }, body: target.body }, mode, mine);
+}
+
+/**
+ * Forward prefill: a new message (no threading headers, so it starts its own
+ * conversation for the recipient) carrying the original text and a list of the
+ * original's files for the composer to fetch and attach.
+ */
+export function forwardInitial(m: ThreadMessage): ComposeInitial {
+  const { parts, notStored } = forwardableParts(m);
+  return {
+    subject: forwardSubject(m.subject || ""),
+    text: forwardBody(m),
+    // Everything in it so far is generated: closed unchanged, there is nothing
+    // of the user's to keep as a draft.
+    generated: true,
+    ...replyIdentity(m),
+    ...(parts.length || notStored.length ? { forward: { messageId: m.id, parts, notStored } } : {}),
+  };
 }
 
 /**

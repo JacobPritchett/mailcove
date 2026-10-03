@@ -3,7 +3,7 @@
 // LAZY-loaded (React.lazy in ComposeDialog) so the editor bundle stays out of
 // the initial chunk; in jsdom tests it's aliased to a textarea-backed mock
 // (vitest.config.ts) implementing the same ComposeBodyHandle contract.
-import { forwardRef, useCallback, useImperativeHandle, useRef } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
 import { EmailEditor, type EmailEditorProps, type EmailEditorRef } from "@react-email/editor";
 import "@react-email/editor/themes/default.css";
 import { plainTextToHtml } from "@/lib/plainText";
@@ -37,6 +37,8 @@ export interface EmailBodyEditorProps {
   onCaretAtEndChange?: (atEnd: boolean) => void;
   /** Focus the document at this position once the editor is ready. */
   autoFocus?: "start" | "end";
+  /** Show the document but accept no edits (a reply that is being sent). */
+  readOnly?: boolean;
   className?: string;
 }
 
@@ -65,7 +67,7 @@ function caretAtEnd(editor: TiptapEditor): boolean {
 
 const EmailBodyEditor = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
   function EmailBodyEditor(
-    { initialText, initialJson, placeholder, onTextChange, onFocusChange, onCaretAtEndChange, autoFocus, className },
+    { initialText, initialJson, placeholder, onTextChange, onFocusChange, onCaretAtEndChange, autoFocus, readOnly, className },
     ref,
   ) {
     const apiRef = useRef<EmailEditorRef | null>(null);
@@ -74,11 +76,17 @@ const EmailBodyEditor = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
     const cbs = useRef({ onTextChange, onFocusChange, onCaretAtEndChange });
     cbs.current = { onTextChange, onFocusChange, onCaretAtEndChange };
     const autoFocusRef = useRef(autoFocus);
+    const readOnlyRef = useRef(!!readOnly);
+    readOnlyRef.current = !!readOnly;
+    useEffect(() => {
+      apiRef.current?.editor?.setEditable(!readOnly);
+    }, [readOnly]);
 
     const handleReady = useCallback((r: EmailEditorRef) => {
       apiRef.current = r;
       const ed = r.editor;
       if (!ed) return;
+      if (readOnlyRef.current) ed.setEditable(false);
       if (autoFocusRef.current) ed.commands.focus(autoFocusRef.current);
       const sel = () => cbs.current.onCaretAtEndChange?.(caretAtEnd(ed));
       ed.on("focus", () => cbs.current.onFocusChange?.(true));

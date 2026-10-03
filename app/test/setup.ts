@@ -36,3 +36,18 @@ if (typeof window !== "undefined" && !window.matchMedia) {
     } as unknown as MediaQueryList;
   };
 }
+
+// Radix (FocusScope) defers part of its unmount work to a zero-delay timer. A
+// test that ends with a dialog still open leaves that timer pending; when it
+// was the last test in its file, the timer could fire after jsdom had been torn
+// down and surface as an unhandled "dispatchEvent ... is not of type 'Event'"
+// that failed the run without failing any test. Unmount here and give those
+// timers one turn while the window still exists.
+import { afterEach, vi } from "vitest";
+import { cleanup } from "@testing-library/react";
+
+afterEach(async () => {
+  cleanup();
+  if (vi.isFakeTimers()) return;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});

@@ -132,8 +132,8 @@ function ConnectCards({ detail, inboxWorker }: { detail: DomainDetail; inboxWork
   const routingActive = !!detail.routing?.enabled && detail.routing.status === "ready";
 
   const receiveDescription = routingActive
-    ? `All mail to *@${detail.name} will land in this inbox. The current catch-all is replaced — reversible any time.`
-    : `Email Routing will be turned on for ${detail.name} (Cloudflare adds its receiving MX + SPF records — this domain has no other mail provider), and all mail to *@${detail.name} will land in this inbox.`;
+    ? `All mail to *@${detail.name} will land in this inbox. The current catch-all is replaced. You can change it back any time.`
+    : `Email Routing will be turned on for ${detail.name} (Cloudflare adds its receiving MX + SPF records, since this domain has no other mail provider), and all mail to *@${detail.name} will land in this inbox.`;
 
   const sendDescription =
     `${detail.name} will be onboarded for Email Sending. Cloudflare adds bounce/auth DNS records under cf-bounce.${detail.name} ` +
@@ -165,7 +165,7 @@ function ConnectCards({ detail, inboxWorker }: { detail: DomainDetail; inboxWork
             <Lock className="mt-0.5 h-4 w-4 shrink-0" />
             <span>
               Mail for {detail.name} is handled by another provider (its MX records point elsewhere).
-              Receiving here is locked so that mail keeps working — sending can still be enabled.
+              Receiving here is locked so that mail keeps working. Sending can still be enabled.
             </span>
           </p>
         )}
@@ -234,7 +234,7 @@ function ConnectCards({ detail, inboxWorker }: { detail: DomainDetail; inboxWork
                 {
                   onSuccess: (r) => {
                     const dnsNote = r.dns.errors.length
-                      ? ` — ${r.dns.errors.length} DNS record(s) need attention`
+                      ? `. ${r.dns.errors.length} DNS record(s) need attention`
                       : "";
                     toast.success(`Sending enabled for ${detail.name}${dnsNote}`);
                   },
@@ -663,7 +663,7 @@ function CatchAllEditor({ detail }: { detail: DomainDetail }) {
           />
         </>
       ) : (
-        <span className="text-xs text-muted-foreground">No verified destinations — add one in Cloudflare first.</span>
+        <span className="text-xs text-muted-foreground">No verified destinations. Add one in Cloudflare first.</span>
       )}
       <ConfirmButton
         disabled={setCatchAll.isPending}

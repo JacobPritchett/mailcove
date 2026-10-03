@@ -11,10 +11,14 @@ function makeHandlers(): ShortcutHandlers {
     onArchive: vi.fn(),
     onTrash: vi.fn(),
     onStar: vi.fn(),
+    onSpam: vi.fn(),
+    onSnooze: vi.fn(),
     onSelect: vi.fn(),
     onSelectAll: vi.fn(),
     onSelectNone: vi.fn(),
     onReply: vi.fn(),
+  onReplyAll: vi.fn(),
+  onForward: vi.fn(),
     onCompose: vi.fn(),
     onFocusSearch: vi.fn(),
     onUndo: vi.fn(),
@@ -99,6 +103,20 @@ describe("useKeyboardShortcuts", () => {
       renderHook(() => useKeyboardShortcuts(h, false));
       key("s");
       expect(h.onStar).toHaveBeenCalledTimes(1);
+    });
+
+    it("! → onSpam", () => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      key("!");
+      expect(h.onSpam).toHaveBeenCalledTimes(1);
+    });
+
+    it("b → onSnooze", () => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      key("b");
+      expect(h.onSnooze).toHaveBeenCalledTimes(1);
     });
 
     it("x → onSelect", () => {
@@ -319,6 +337,69 @@ describe("useKeyboardShortcuts", () => {
       unmount();
       key("j");
       expect(h.onNext).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("keys that belong to something else", () => {
+    afterEach(() => {
+      document.body.innerHTML = "";
+    });
+
+    it("ignores a key another handler already consumed (defaultPrevented)", () => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      const e = new KeyboardEvent("keydown", { key: "Escape", cancelable: true, bubbles: true });
+      e.preventDefault();
+      document.dispatchEvent(e);
+      expect(h.onEscape).not.toHaveBeenCalled();
+    });
+
+    it.each(["dialog", "alertdialog"])("ignores keys pressed inside a %s", (role) => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      document.body.innerHTML = `<div role="${role}"><button id="b">Cancel</button></div>`;
+      const btn = document.getElementById("b")!;
+      for (const k of ["e", "#", "Escape", "j"]) {
+        btn.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true }));
+      }
+      expect(h.onArchive).not.toHaveBeenCalled();
+      expect(h.onTrash).not.toHaveBeenCalled();
+      expect(h.onEscape).not.toHaveBeenCalled();
+      expect(h.onNext).not.toHaveBeenCalled();
+    });
+
+    it("ignores keys while focus is inside a dialog, wherever the event lands", () => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      document.body.innerHTML = `<div role="dialog"><button id="b">Close</button></div>`;
+      document.getElementById("b")!.focus();
+      key("e");
+      expect(h.onArchive).not.toHaveBeenCalled();
+    });
+
+    it("ignores keys during IME composition", () => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      key("e", { isComposing: true });
+      key("Enter", { isComposing: true });
+      expect(h.onArchive).not.toHaveBeenCalled();
+      expect(h.onOpen).not.toHaveBeenCalled();
+    });
+
+    it.each(["c", "r", "/"])("consumes %s so the character is not typed into the field it opens", (k) => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      const e = new KeyboardEvent("keydown", { key: k, cancelable: true, bubbles: true });
+      document.dispatchEvent(e);
+      expect(e.defaultPrevented).toBe(true);
+    });
+
+    it("still handles keys from ordinary page content", () => {
+      const h = makeHandlers();
+      renderHook(() => useKeyboardShortcuts(h, false));
+      document.body.innerHTML = `<button id="b">Row</button>`;
+      document.getElementById("b")!.dispatchEvent(new KeyboardEvent("keydown", { key: "e", bubbles: true }));
+      expect(h.onArchive).toHaveBeenCalledTimes(1);
     });
   });
 });

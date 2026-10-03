@@ -16,6 +16,7 @@ vi.mock("../lib/api", () => ({
     Promise.resolve({ identities: [], defaultLocal: "hello", defaultDomain: "example.com" }),
   ),
   send: vi.fn(() => Promise.resolve({ ok: true, id: "sent-1" })),
+  getContacts: vi.fn(() => Promise.resolve({ contacts: [] })),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
   getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
   putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),
@@ -26,7 +27,7 @@ vi.mock("../lib/api", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() }, Toaster: () => null }));
 
-import { listThreads, getCounts, getMe, send, putDraft, deleteDraft, listDrafts, getDraft } from "../lib/api";
+import { listThreads, getCounts, getMe, send, putDraft, deleteDraft, listDrafts, getDraft, getIdentities, putDraftAttachments } from "../lib/api";
 
 const THREADS_RESP: ThreadsResponse = { threads: [], unread: 0, user: "hello@send.example.com" };
 
@@ -69,6 +70,13 @@ beforeEach(() => {
     ],
   });
   vi.mocked(getDraft).mockResolvedValue(FULL);
+  vi.mocked(getIdentities).mockResolvedValue({
+    identities: [
+      { domain: "example.com", sendingDomain: "send.example.com", displayName: "S", signature: "Alex\nExample Co" },
+    ],
+    defaultLocal: "sales",
+    defaultDomain: "example.com",
+  });
 });
 
 describe("Drafts view", () => {
@@ -84,6 +92,12 @@ describe("Drafts view", () => {
     expect(within(list).getByText("(no recipients)")).toBeInTheDocument();
   });
 
+  // Also the pin for the signature-seeding regression: `initial.text` on resume
+  // is the WHOLE saved body, not a reply quote. When the signature effect
+  // treated it as one it prepended a second signature AND, because seeding goes
+  // through setPlainText, replaced the restored rich document with flattened
+  // text - destroying saved images and formatting. beforeEach configures a
+  // signature so that path is live here.
   it("resumes a draft in the compose dialog (rich doc wins over plain text)", async () => {
     renderApp();
     fireEvent.click(await screen.findByRole("button", { name: /drafts/i }));
@@ -168,5 +182,45 @@ describe("Compose draft autosave", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     // The discarded draft must not be resurrected by the close-flush.
     expect(putDraft).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("resuming a draft restores its files", () => {
+  it("pulls the bytes back, not just the names", async () => {
+    // The manifest on the draft row is metadata only. Without fetching the
+    // bytes the dialog would list a file it could not actually send.
+    const { getDraftAttachments } = await import("../lib/api");
+    vi.mocked(getDraftAttachments).mockResolvedValue({
+      attachments: [{ name: "notes.txt", type: "text/plain", size: 5, data: "aGVsbG8=" }],
+    });
+
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: /drafts/i }));
+    fireEvent.click(await screen.findByText("WIP subject"));
+    const dialog = await screen.findByRole("dialog");
+
+    expect(await within(dialog).findByText("notes.txt")).toBeInTheDocument();
+    expect(getDraftAttachments).toHaveBeenCalledWith(DRAFT_ID);
+  });
+
+  it("does not re-upload what it just restored", async () => {
+    // The restored set is already in R2; treating it as new would push the
+    // same bytes straight back on the first autosave.
+    const { getDraftAttachments } = await import("../lib/api");
+    vi.mocked(getDraftAttachments).mockResolvedValue({
+      attachments: [{ name: "notes.txt", type: "text/plain", size: 5, data: "aGVsbG8=" }],
+    });
+
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: /drafts/i }));
+    fireEvent.click(await screen.findByText("WIP subject"));
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByText("notes.txt");
+
+    fireEvent.change(screen.getByLabelText("Subject"), { target: { value: "edited" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+
+    await waitFor(() => expect(putDraft).toHaveBeenCalled());
+    expect(putDraftAttachments).not.toHaveBeenCalled();
   });
 });

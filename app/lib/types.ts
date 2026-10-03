@@ -1,6 +1,6 @@
 // Shared frontend types, mirroring the Worker API contract in src/index.ts.
 
-export const VIEWS = ["inbox", "starred", "sent", "all", "trash"] as const;
+export const VIEWS = ["inbox", "starred", "sent", "all", "trash", "spam", "snoozed"] as const;
 export type View = (typeof VIEWS)[number];
 /**
  * Sidebar navigation views: the server-backed thread views plus Drafts, which
@@ -11,6 +11,9 @@ export type NavView = View | "drafts";
 export const MAIL_ACTIONS = [
   "archive", "unarchive", "trash", "restore", "delete",
   "star", "unstar", "read", "unread",
+  "spam", "unspam",
+  // `snooze` needs an `until` (epoch ms, in the future) alongside it.
+  "snooze", "unsnooze",
 ] as const;
 export type MailAction = (typeof MAIL_ACTIONS)[number];
 
@@ -31,8 +34,18 @@ export interface ThreadListRow {
   category: string | null;
   /** Identity domain of the latest message (multi-domain inbox). */
   domain?: string | null;
+  /** What a view is ordered by: the latest message, or when a snooze ended. */
+  sort_date?: number;
+  /** When a snoozed thread comes back (epoch ms); null or absent when not snoozed. */
+  snoozedUntil?: number | null;
 }
-export interface ThreadsResponse { threads: ThreadListRow[]; unread: number; user: string; }
+export interface ThreadsResponse {
+  threads: ThreadListRow[];
+  unread: number;
+  user: string;
+  /** Hand back as `cursor` for the next page; null or absent at the end. */
+  nextCursor?: string | null;
+}
 /** Per-domain inbox counts for the sidebar's inbox switcher. */
 export interface DomainCount { domain: string; threads: number; unread: number; }
 export interface ViewCounts {
@@ -41,7 +54,18 @@ export interface ViewCounts {
   domains?: DomainCount[];
   /** Saved drafts count (absent on Workers predating the drafts store). */
   drafts?: number;
+  /** Threads in Junk (absent on Workers predating it). */
+  spam?: number;
+  /** Threads snoozed and still waiting. */
+  snoozed?: number;
 }
+
+/** One entry of the block list: an address, or a whole domain as "@example.com". */
+export interface BlockedSender {
+  address: string;
+  created: number;
+}
+export interface BlockedResponse { blocked: BlockedSender[]; }
 
 /** A row from the `messages` table as returned by list/detail endpoints. */
 export interface MessageRow {
@@ -70,26 +94,62 @@ export interface MessageRow {
   starred?: 0 | 1;
   trashed_at?: number | null;
   domain?: string | null;
+  /** 1 when the message is in Junk (trash with the junk mark). Thread detail only. */
+  spam?: 0 | 1;
+  /** When a snoozed message comes back (epoch ms). Thread detail only. */
+  snoozed_until?: number | null;
+  /** Normalized SMTP envelope recipient (RCPT TO), when captured by the Worker. */
+  envelope_to?: string | null;
   /** Authenticated sender mailbox (parsed.from.address) — the image-allowlist
    *  key. null on pre-existing rows. Use this, not msg_from, to trust a sender. */
   from_addr?: string | null;
 }
 
 export interface Attachment {
+  /** MIME part id. Names are not unique within a message; this is. Absent on
+   *  messages stored before the Worker recorded it. */
+  partId?: string;
   name: string;
   mimeType: string;
   size: number;
+  /** Set on inline (cid:) parts, which the body already displays. */
+  contentId?: string | null;
+  disposition?: string;
   /** False when the bytes were never written (over the per-message cap, or
    *  the write failed). The name is still worth showing; the link is not. */
   stored?: boolean;
+}
+
+/** A mailbox with its display name, as parsed from a header. */
+export interface MailboxRef {
+  name: string;
+  address: string;
+}
+
+export type AuthVerdict = "pass" | "fail" | "none";
+
+/** Header details stored beside the body (src/mailHeaders.ts). All optional:
+ *  mail stored before they were captured simply lacks them. */
+export interface StoredHeaders {
+  messageId?: string;
+  inReplyTo?: string;
+  references?: string[];
+  replyTo?: MailboxRef[];
+  to?: MailboxRef[];
+  cc?: MailboxRef[];
+  bcc?: MailboxRef[];
+  unsubscribe?: { url?: string; mailto?: { address: string; subject: string }; oneClick: boolean };
+  auth?: { spf: AuthVerdict; dkim: AuthVerdict; dmarc: AuthVerdict };
 }
 
 export interface MessageBody {
   text: string;
   html: string;
   attachments: Attachment[];
+  /** `text` was derived from the HTML part; the HTML is the real body. */
+  textDerived?: boolean;
   /** The Worker stores RFC822 header echoes alongside the body (src/index.ts). */
-  headers?: { messageId?: string; inReplyTo?: string };
+  headers?: StoredHeaders;
 }
 
 /** GET /api/messages?folder=…&q=… */
@@ -126,6 +186,9 @@ export interface DraftFull {
   threadId: string | null;
   inReplyTo: string | null;
   to: string;
+  /** Absent on a Worker that predates Cc/Bcc drafts. */
+  cc?: string;
+  bcc?: string;
   subject: string;
   bodyText: string;
   /** Stringified TipTap document — faithful rich resume. "" = use bodyText. */
@@ -148,6 +211,8 @@ export interface DraftPut {
   threadId?: string;
   inReplyTo?: string;
   to?: string;
+  cc?: string;
+  bcc?: string;
   subject?: string;
   bodyText?: string;
   bodyJson?: string;
@@ -175,6 +240,8 @@ export interface IdentitiesResponse {
 /** POST /api/send body. */
 export interface SendPayload {
   to: string | string[];
+  cc?: string[];
+  bcc?: string[];
   subject: string;
   text: string;
   html?: string;
@@ -185,6 +252,8 @@ export interface SendPayload {
   // PR6 (threading): /api/threads/:id endpoint + In-Reply-To send wiring land in PR6; declared here for the typed client.
   inReplyTo?: string;
   threadId?: string;
+  /** Files to send, base64-encoded. */
+  attachments?: { filename: string; type: string; data: string }[];
 }
 
 /** A thread message row carries its body inline for the conversation reader. */
@@ -207,6 +276,9 @@ export interface BodyImagesResponse {
 export interface ThreadResponse {
   thread_id: string;
   messages: ThreadMessage[];
+  /** Messages in the whole thread; `messages` holds at most the newest 100. */
+  total?: number;
+  truncated?: boolean;
 }
 
 /** GET /api/me */

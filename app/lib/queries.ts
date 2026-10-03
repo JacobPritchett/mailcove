@@ -1,10 +1,12 @@
 // TanStack Query hooks over the typed api client. Polling (15s) + refetch on
 // focus keeps the inbox live.
 
+import { useCallback } from "react";
 import {
   useQuery,
   useMutation,
   useQueryClient,
+  type QueryClient,
 } from "@tanstack/react-query";
 import {
   listThreads,
@@ -35,9 +37,12 @@ import {
   deleteFilter,
   listDrafts,
   deleteDraft,
+  listBlocked,
+  addBlocked,
+  removeBlocked,
 } from "./api";
 import type {
-  ThreadsResponse,
+  ThreadListRow,
   ViewCounts,
   View,
   MailAction,
@@ -55,9 +60,72 @@ import type {
   DomainSettings,
   DomainSettingsPatch,
   DraftsResponse,
+  BlockedResponse,
 } from "./types";
+import { actionView } from "./actions";
+import { THREADS_PAGE_SIZE, appendPage, mergeFirstPage, reinsertRow, type ThreadListData } from "./threadPages";
 
-/** GET /api/messages?view=…[&q=…][&category=…][&domain=…] with 15s polling + refetch on focus. */
+interface ThreadListArgs {
+  view: View;
+  q?: string;
+  category?: string | null;
+  domain?: string | null;
+}
+
+/** The cache key of one list. Everything that reads or writes a list uses it. */
+function threadsKey({ view, q, category, domain }: ThreadListArgs) {
+  return ["threads", view, q ?? "", category ?? "", domain ?? ""];
+}
+
+/** "Load more" requests under way, by list and cursor, so one page is fetched once. */
+const loadingMore = new Map<string, Promise<ThreadListRow[]>>();
+
+/**
+ * Fetch the page after the last loaded one and append it to the cached list.
+ * Resolves to the rows it added (none at the end of the list, on failure, or
+ * when the list was reset while the request was in flight). Safe to call
+ * repeatedly: a second call for the same page joins the first.
+ */
+export function loadMoreThreads(qc: QueryClient, args: ThreadListArgs): Promise<ThreadListRow[]> {
+  const key = threadsKey(args);
+  const cursor = qc.getQueryData<ThreadListData>(key)?.nextCursor;
+  if (!cursor) return Promise.resolve([]);
+  const id = JSON.stringify([key, cursor]);
+  const running = loadingMore.get(id);
+  if (running) return running;
+
+  qc.setQueryData<ThreadListData>(key, (d) => d && { ...d, loadingMore: true, moreFailed: false });
+  const request = listThreads({ ...args, limit: THREADS_PAGE_SIZE, cursor })
+    .then(
+      (page) => {
+        let added: ThreadListRow[] = [];
+        qc.setQueryData<ThreadListData>(key, (d) => {
+          if (!d) return d;
+          const merged = appendPage(d, page, cursor);
+          added = merged.added;
+          return merged.data;
+        });
+        return added;
+      },
+      () => {
+        qc.setQueryData<ThreadListData>(key, (d) => d && { ...d, loadingMore: false, moreFailed: true });
+        return [];
+      },
+    )
+    .finally(() => loadingMore.delete(id));
+  loadingMore.set(id, request);
+  return request;
+}
+
+/**
+ * GET /api/messages?view=…[&q=…][&category=…][&domain=…], a page at a time,
+ * with 15s polling + refetch on focus.
+ *
+ * The cache holds every page loaded so far as one flat list. Polling, focus
+ * and post-action refetches fetch the FIRST page only and merge it in (see
+ * lib/threadPages), so the cost of staying live does not grow with how far
+ * the user has scrolled. `fetchMore` loads the next page.
+ */
 export function useThreads(
   view: View,
   q?: string,
@@ -65,13 +133,35 @@ export function useThreads(
   domain?: string | null,
   enabled = true,
 ) {
-  return useQuery<ThreadsResponse>({
-    queryKey: ["threads", view, q ?? "", category ?? "", domain ?? ""],
-    queryFn: () => listThreads({ view, q, category, domain }),
+  const qc = useQueryClient();
+  const query = useQuery<ThreadListData>({
+    queryKey: threadsKey({ view, q, category, domain }),
+    queryFn: async () => {
+      const fresh = await listThreads({ view, q, category, domain, limit: THREADS_PAGE_SIZE });
+      // Read the cache AFTER the request: a page appended or an optimistic
+      // change made while it was in flight must be what the merge builds on.
+      return mergeFirstPage(
+        qc.getQueryData<ThreadListData>(threadsKey({ view, q, category, domain })),
+        fresh,
+        !!q?.trim(),
+      );
+    },
     refetchInterval: 15000,
     refetchOnWindowFocus: true,
     enabled,
   });
+  const fetchMore = useCallback(
+    () => loadMoreThreads(qc, { view, q, category, domain }),
+    [qc, view, q, category, domain],
+  );
+  return {
+    ...query,
+    /** True while the server has rows beyond the ones loaded. */
+    hasMore: !!query.data?.nextCursor,
+    isFetchingMore: !!query.data?.loadingMore,
+    moreFailed: !!query.data?.moreFailed,
+    fetchMore,
+  };
 }
 
 // ---- Drafts ----
@@ -112,12 +202,124 @@ export function useCounts() {
  * e.g. archiving removes from "inbox" but not from "all".
  */
 const REMOVES_FROM_VIEW: Record<View, Set<MailAction>> = {
-  inbox:   new Set(["archive", "trash"]),
-  starred: new Set(["unstar", "trash"]),
-  sent:    new Set(["trash"]),
-  all:     new Set(["trash"]),
-  trash:   new Set(["restore", "delete"]),
+  inbox:   new Set(["archive", "trash", "spam", "snooze"]),
+  starred: new Set(["unstar", "trash", "spam"]),
+  sent:    new Set(["trash", "spam"]),
+  all:     new Set(["trash", "spam"]),
+  trash:   new Set(["restore", "delete", "spam"]),
+  spam:    new Set(["unspam", "restore", "delete", "trash"]),
+  // Snoozing again from here only moves the time; the thread stays listed.
+  snoozed: new Set(["unsnooze", "archive", "trash", "spam"]),
 };
+
+/** Does `action` take a thread out of the list shown under `rules`? */
+export function removesFromView(rules: View, action: MailAction): boolean {
+  return REMOVES_FROM_VIEW[rules].has(action);
+}
+
+/**
+ * Rows an action took out of a list, by list and thread. A refetch renews only
+ * a list's first page, so undoing an archive further down would otherwise
+ * leave the thread missing: the undo puts the remembered row back instead.
+ */
+const removedRows = new Map<string, { row: ThreadListRow; index: number; action: MailAction }>();
+const REMEMBERED_MAX = 500;
+const rememberKey = (key: readonly unknown[], threadId: string) => `${JSON.stringify(key)}\u0000${threadId}`;
+
+/** A list as it will look once `action` has been applied to `threadIds`. */
+function applyAction(
+  list: ThreadListData,
+  threadIds: string[],
+  action: MailAction,
+  rules: View,
+  key: readonly unknown[],
+  until?: number,
+): ThreadListData {
+  const ids = new Set(threadIds);
+  const removes = removesFromView(rules, action);
+  let threads = list.threads;
+  if (removes) {
+    threads.forEach((row, index) => {
+      if (!ids.has(row.thread_id)) return;
+      if (removedRows.size >= REMEMBERED_MAX) removedRows.clear();
+      removedRows.set(rememberKey(key, row.thread_id), { row, index, action });
+    });
+  } else {
+    // Put a row back only for the exact inverse of what took it out (the undo
+    // of an archive is an unarchive). Any other action on that thread, a star
+    // from All Mail say, has nothing to do with whether it belongs here.
+    for (const id of threadIds) {
+      const k = rememberKey(key, id);
+      const was = removedRows.get(k);
+      if (!was || INVERSE_ACTION[was.action] !== action) continue;
+      removedRows.delete(k);
+      threads = reinsertRow(threads, was.row, was.index, key[2] !== "");
+    }
+  }
+  return {
+    ...list,
+    threads: threads
+      .filter((t) => !(removes && ids.has(t.thread_id)))
+      .map((t) => ids.has(t.thread_id)
+        ? {
+            ...t,
+            starred: action === "star" ? 1 : action === "unstar" ? 0 : t.starred,
+            anyUnread: action === "read" ? 0 : action === "unread" ? 1 : t.anyUnread,
+            snoozedUntil: action === "snooze" ? (until ?? t.snoozedUntil) : t.snoozedUntil,
+          }
+        : t),
+  };
+}
+
+/**
+ * Undo an optimistic change for `threadIds` only, from the snapshot taken
+ * before it. Restoring the whole snapshot would also undo every other action
+ * made since (and bring back rows a later, successful action removed).
+ */
+function rollBack(cur: ThreadListData, prev: ThreadListData, threadIds: string[], key: readonly unknown[]): ThreadListData {
+  let threads = cur.threads;
+  for (const id of threadIds) {
+    const index = prev.threads.findIndex((t) => t.thread_id === id);
+    const at = threads.findIndex((t) => t.thread_id === id);
+    if (index === -1) {
+      // It was not listed before (the failed action was itself an undo).
+      if (at !== -1) threads = threads.filter((t) => t.thread_id !== id);
+      continue;
+    }
+    const row = prev.threads[index];
+    if (at !== -1) {
+      threads = threads.map((t, i) => (i === at ? row : t));
+    } else {
+      // Back in after the nearest row that preceded it and is still listed,
+      // which is its old place whatever the list is ordered by.
+      let after = -1;
+      for (let i = index - 1; i >= 0 && after === -1; i--) {
+        after = threads.findIndex((t) => t.thread_id === prev.threads[i].thread_id);
+      }
+      threads = [...threads.slice(0, after + 1), row, ...threads.slice(after + 1)];
+    }
+    removedRows.delete(rememberKey(key, id));
+  }
+  // (A "load more" caught mid-flight has its own ending and must not be left
+  // looking permanently busy.)
+  return { ...cur, threads, loadingMore: false };
+}
+
+function sameKey(a: readonly unknown[], b: readonly unknown[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/**
+ * Change rows in every cached list at once (the reader marking a thread read).
+ * Needed because a refetch renews only the first page of a list: a row further
+ * down would otherwise keep its old state.
+ */
+export function patchThreadRows(qc: QueryClient, threadIds: string[], patch: Partial<ThreadListRow>) {
+  const ids = new Set(threadIds);
+  qc.setQueriesData<ThreadListData>({ queryKey: ["threads"] }, (d) =>
+    d && { ...d, threads: d.threads.map((t) => (ids.has(t.thread_id) ? { ...t, ...patch } : t)) },
+  );
+}
 
 /** The inverse action used to undo a mutation (for future Undo affordance). */
 export const INVERSE_ACTION: Partial<Record<MailAction, MailAction>> = {
@@ -125,6 +327,9 @@ export const INVERSE_ACTION: Partial<Record<MailAction, MailAction>> = {
   trash: "restore", restore: "trash",
   star: "unstar", unstar: "star",
   read: "unread", unread: "read",
+  spam: "unspam", unspam: "spam",
+  // Undoing an unsnooze needs the time it had; see useThreadActions.
+  snooze: "unsnooze", unsnooze: "snooze",
 };
 
 /**
@@ -134,35 +339,55 @@ export const INVERSE_ACTION: Partial<Record<MailAction, MailAction>> = {
 export function useMutateThreads(view: View, q?: string, category?: string | null, domain?: string | null) {
   const qc = useQueryClient();
   // Must mirror useThreads' queryKey exactly or optimistic updates miss the cache.
-  const key = ["threads", view, q ?? "", category ?? "", domain ?? ""];
+  const key = threadsKey({ view, q, category, domain });
+  // Every OTHER cached list gets the same change. A refetch only renews a
+  // list's first page, so without this a thread trashed from the Inbox would
+  // stay listed further down a cached All Mail until it expired.
+  function applyToOtherLists(threadIds: string[], action: MailAction, until: number | undefined, active: readonly unknown[]) {
+    for (const query of qc.getQueryCache().findAll({ queryKey: ["threads"] })) {
+      if (sameKey(query.queryKey, active)) continue;
+      const [, otherView, otherQ] = query.queryKey as [string, View, string];
+      qc.setQueryData<ThreadListData>(
+        query.queryKey,
+        (d) => d && applyAction(d, threadIds, action, actionView(otherView, otherQ), query.queryKey, until),
+      );
+    }
+  }
   return useMutation({
-    mutationFn: ({ threadIds, action }: { threadIds: string[]; action: MailAction }) =>
-      threadIds.length === 1
-        ? apiMutateThread(threadIds[0], action).then(() => undefined)
-        : apiMutateThreads(threadIds, action).then(() => undefined),
-    onMutate: async ({ threadIds, action }) => {
-      await qc.cancelQueries({ queryKey: key });
-      const prev = qc.getQueryData<ThreadsResponse>(key);
-      if (prev) {
-        const ids = new Set(threadIds);
-        const removes = REMOVES_FROM_VIEW[view].has(action);
-        qc.setQueryData<ThreadsResponse>(key, {
-          ...prev,
-          threads: prev.threads
-            .filter((t) => !(removes && ids.has(t.thread_id)))
-            .map((t) => ids.has(t.thread_id)
-              ? {
-                  ...t,
-                  starred: action === "star" ? 1 : action === "unstar" ? 0 : t.starred,
-                  anyUnread: action === "read" ? 0 : action === "unread" ? 1 : t.anyUnread,
-                }
-              : t),
-        });
-      }
-      return { prev };
+    mutationFn: ({ threadIds, action, until }: { threadIds: string[]; action: MailAction; until?: number }) => {
+      // `until` is passed only when there is one, so every other action makes
+      // exactly the call it always made.
+      const rest: [] | [number] = until === undefined ? [] : [until];
+      return threadIds.length === 1
+        ? apiMutateThread(threadIds[0], action, ...rest).then(() => undefined)
+        : apiMutateThreads(threadIds, action, ...rest).then(() => undefined);
     },
-    onError: (_e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(key, ctx.prev);
+    onMutate: async ({ threadIds, action, until }) => {
+      await qc.cancelQueries({ queryKey: key });
+      const prev = qc.getQueryData<ThreadListData>(key);
+      if (prev) {
+        // The key says where the list is cached; the rules come from what the
+        // list actually holds (search results are All Mail, see actionView).
+        qc.setQueryData<ThreadListData>(key, applyAction(prev, threadIds, action, actionView(view, q), key, until));
+      }
+      // The key travels with the snapshot. By the time this fails the hook
+      // may have re-rendered for another view or search, and `key` would then
+      // name a different list: the rollback wrote this view's rows into it.
+      return { prev, key };
+    },
+    onError: (e, { threadIds, action, until }, ctx) => {
+      // A bulk action sent in several requests can fail part way: only the
+      // threads from the failing request onward were left unchanged.
+      const failed = (e as { failedIds?: string[] } | null)?.failedIds ?? threadIds;
+      if (ctx?.prev) {
+        const { prev, key: listKey } = ctx;
+        qc.setQueryData<ThreadListData>(listKey, (cur) => (cur ? rollBack(cur, prev, failed, listKey) : cur));
+      }
+      const done = threadIds.filter((id) => !failed.includes(id));
+      if (done.length) applyToOtherLists(done, action, until, ctx?.key ?? key);
+    },
+    onSuccess: (_d, { threadIds, action, until }, ctx) => {
+      applyToOtherLists(threadIds, action, until, ctx?.key ?? key);
     },
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["threads"] });
@@ -255,6 +480,24 @@ export function useFilters(enabled: boolean) {
     queryFn: () => listFilters(),
     enabled,
   });
+}
+
+/** GET /api/blocked — the block list; only fetched while the manager is open. */
+export function useBlocked(enabled: boolean) {
+  return useQuery<BlockedResponse>({
+    queryKey: ["blocked"],
+    queryFn: () => listBlocked(),
+    enabled,
+  });
+}
+
+/** Block or unblock a sender, refreshing the list on success. */
+export function useBlockedMutations() {
+  const qc = useQueryClient();
+  const refresh = () => void qc.invalidateQueries({ queryKey: ["blocked"] });
+  const add = useMutation({ mutationFn: (address: string) => addBlocked(address), onSuccess: refresh });
+  const remove = useMutation({ mutationFn: (address: string) => removeBlocked(address), onSuccess: refresh });
+  return { add, remove };
 }
 
 /** Create/toggle/delete a rule, refreshing the list on success. */

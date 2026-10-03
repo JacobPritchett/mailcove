@@ -3,11 +3,17 @@ import { AlertDialog as AlertDialogPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 import { buttonVariants } from "@/components/ui/button"
+import { BACK_LAYER, useModalBackLayer } from "@/lib/useBackClose"
 
 function AlertDialog({
+  open,
+  defaultOpen,
+  onOpenChange,
   ...props
 }: React.ComponentProps<typeof AlertDialogPrimitive.Root>) {
-  return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} />
+  // Mobile Back closes this confirm (and only it) instead of leaving the app.
+  const layer = useModalBackLayer(open, defaultOpen, onOpenChange, BACK_LAYER.alert)
+  return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} {...layer} />
 }
 
 function AlertDialogTrigger({

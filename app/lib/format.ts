@@ -204,3 +204,22 @@ export function formatFullDate(ms: number, now: number): string {
   if (days > 1 && days < 30) return `${date} (${days} days ago)`;
   return date;
 }
+
+/** A server message as a sentence: "that is one of your own domains" reads as a fragment. */
+export function asSentence(message: string): string {
+  const s = message.trim();
+  if (!s) return "";
+  return s[0].toUpperCase() + s.slice(1) + (/[.!?]$/.test(s) ? "" : ".");
+}
+
+/**
+ * A subject as the name of a conversation: the reply and forward prefixes that
+ * pile up as it goes back and forth ("Re: RE: Fwd: Lunch") are dropped. Only
+ * leading ones, and only whole prefixes ("Regarding lunch" is left alone).
+ */
+export function conversationSubject(subject: string | null | undefined): string {
+  const s = (subject ?? "").trim();
+  // Anchored, and no two adjacent parts can match the same text, so a subject
+  // made of thousands of spaces is still read once.
+  return s.replace(/^(?:(?:re|fwd?)\s*(?:\[\d{1,3}\]\s*)?:\s*)+/i, "").trim();
+}

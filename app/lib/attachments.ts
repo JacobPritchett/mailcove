@@ -16,6 +16,29 @@ export interface StagedAttachment {
   data: string;
 }
 
+/**
+ * Which of a forwarded message's files fit the send limits, in their original
+ * order, and why each of the others does not. "Too large" and "too many" are
+ * different problems with different remedies, so they are kept apart.
+ */
+export function planForward<T extends { name: string; size: number }>(
+  parts: readonly T[],
+): { fits: T[]; tooLarge: string[]; tooMany: string[] } {
+  const fits: T[] = [];
+  const tooLarge: string[] = [];
+  const tooMany: string[] = [];
+  let total = 0;
+  for (const part of parts) {
+    if (part.size > MAX_ATTACHMENT_BYTES || total + part.size > MAX_TOTAL_ATTACHMENT_BYTES) tooLarge.push(part.name);
+    else if (fits.length >= MAX_ATTACHMENTS) tooMany.push(part.name);
+    else {
+      fits.push(part);
+      total += part.size;
+    }
+  }
+  return { fits, tooLarge, tooMany };
+}
+
 /** Human-readable size, e.g. "1.2 MB". */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

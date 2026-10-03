@@ -78,7 +78,11 @@ export default function ShortcutHelpDialog({
             <Row keys={["e"]} label="Archive" />
             <Row keys={["#"]} label="Move to trash" />
             <Row keys={["s"]} label="Toggle star" />
+            <Row keys={["!"]} label="Report junk" />
+            <Row keys={["b"]} label="Snooze" />
             <Row keys={["r"]} label="Reply" />
+            <Row keys={["a"]} label="Reply all" />
+            <Row keys={["f"]} label="Forward" />
             <Row keys={["c"]} label="Compose" />
             <Row keys={["z"]} label="Undo last action" />
           </Group>

@@ -138,6 +138,26 @@
   color: color-mix(in oklch, var(--muted-foreground) 70%, transparent);
 }
 
+/* The placeholder is one line, always. The editor draws it as a zero-height
+   float, which takes no room: when the text wrapped (a phone, or any narrow
+   reply box) its second line was painted on top of whatever came next, the
+   quoted message in a reply. Laid over the empty line instead and cut short
+   with an ellipsis, it cannot reach past that line at any width. */
+.compose-editor .tiptap.ProseMirror .is-empty[data-placeholder] {
+  position: relative;
+}
+.compose-editor .tiptap.ProseMirror .is-empty[data-placeholder]::before {
+  float: none !important;
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: auto !important;
+  overflow: hidden;
+  white-space: nowrap !important;
+  text-overflow: ellipsis;
+}
+
 /* The editor's floating menus (bubble menu, slash command, link form) theme
    via --re-* variables with a prefers-color-scheme fallback. The app's dark
    mode is CLASS-driven, so bind the variables to app tokens both ways.

@@ -91,6 +91,31 @@ describe("Sidebar inbox switcher (multi-domain)", () => {
     );
   });
 
+  it("keeps the chosen domain while searching, and says so beside the result count", async () => {
+    renderApp();
+    await screen.findByText("Inboxes");
+    const aside = within(screen.getByRole("complementary"));
+    fireEvent.click(aside.getByRole("button", { name: /example\.org/ }));
+    fireEvent.change(screen.getByLabelText("Search messages"), { target: { value: "mail" } });
+    await waitFor(() =>
+      expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ q: "mail", domain: "example.org" })),
+    );
+    expect(await screen.findByText("2 results in example.org")).toBeInTheDocument();
+
+    // With no domain chosen the line is the plain count.
+    fireEvent.click(aside.getByRole("button", { name: /All inboxes/ }));
+    expect(await screen.findByText("2 results")).toBeInTheDocument();
+  });
+
+  it("says where it looked when a domain search finds nothing", async () => {
+    renderApp();
+    await screen.findByText("Inboxes");
+    fireEvent.click(within(screen.getByRole("complementary")).getByRole("button", { name: /example\.org/ }));
+    vi.mocked(listThreads).mockResolvedValue({ threads: [], unread: 0, user: "x" } as ThreadsResponse);
+    fireEvent.change(screen.getByLabelText("Search messages"), { target: { value: "nothing" } });
+    expect(await screen.findByText("No matches in example.org")).toBeInTheDocument();
+  });
+
   it("hides the switcher for a single-domain inbox", async () => {
     vi.mocked(getCounts).mockResolvedValue({
       ...MULTI_COUNTS,

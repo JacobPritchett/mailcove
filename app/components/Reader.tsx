@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { Archive, ChevronDown, Mail, MailOpen, Paperclip, RotateCcw, Sparkles, Star, Trash2 } from "lucide-react";
+import { AlarmClock, AlarmClockOff, Archive, Ban, ChevronDown, Download, ExternalLink, Forward, Mail, MailMinus, MailOpen, MoreHorizontal, OctagonAlert, Paperclip, Reply, ReplyAll, RotateCcw, ShieldAlert, ShieldCheck, Sparkles, Star, Trash2, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -16,66 +16,43 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { useThread, useSummarizeThread } from "@/lib/queries";
-import { mutateThread, attachmentUrl, showMessageImages, allowImagesFrom } from "@/lib/api";
-import { useReaderMode } from "@/lib/useReaderMode";
+import { useThread, useSummarizeThread, useIdentities, patchThreadRows } from "@/lib/queries";
+import { ApiError, mutateThread, attachmentUrl, showMessageImages, allowImagesFrom, unsubscribeFrom } from "@/lib/api";
+import { blockAddress, failedCheckWarning } from "@/lib/blockSender";
+import SnoozeMenu from "@/components/SnoozeMenu";
+import { formatSnoozeTime } from "@/lib/snooze";
+import type { ActionOptions } from "@/lib/useThreadActions";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useReaderMode, type ReaderMode } from "@/lib/useReaderMode";
+import { useIsDesktop } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
+import ChatView from "@/components/ChatView";
+import RelativeTime from "@/components/RelativeTime";
+import { linkifyText } from "@/lib/chatNormalize";
 import {
   addressOf,
   avatarColor,
   initialsOf,
+  asSentence,
+  conversationSubject,
   recipientSummary,
   senderLabel,
 } from "@/lib/format";
-import ChatView from "@/components/ChatView";
-import { linkifyText } from "@/lib/chatNormalize";
-import RelativeTime from "@/components/RelativeTime";
-import InlineReply from "@/components/InlineReply";
-import { replyInitialForThread } from "@/lib/replyContext";
+import InlineReply, { type InlineReplyHandle } from "@/components/InlineReply";
+import { defaultReplyTarget, forwardInitial, replyInitialForThread } from "@/lib/replyContext";
+import { addressClaimedInName, hasReplyAll, ownDomains, type ReplyMode } from "@/lib/conversation";
+import { IFRAME_SANDBOX, wrapHtml, autoSizeEmailFrame } from "@/lib/emailFrame";
 import type { ComposeInitial } from "@/components/ComposeDialog";
 import type { MailAction, ThreadMessage, View } from "@/lib/types";
-
-/**
- * Strict CSP applied to every email-body iframe. `default-src 'none'` blocks ALL
- * remote subresource loads (scripts, remote images/tracking pixels, fonts,
- * frames). Inline styles and data:-URI images/fonts are allowed so legit HTML
- * email still renders. The iframe itself is sandboxed with allow-popups only —
- * NO allow-scripts, NO allow-popups-to-escape-sandbox. Reused unchanged for
- * every message in a multi-message conversation.
- */
-// `allow-same-origin` lets the PARENT read the frame's contentDocument to
-// auto-size it to its content (see EmailFrame). It is safe ONLY because
-// `allow-scripts` is deliberately absent: the sandbox blocks all script
-// execution in the frame, so the email can never run code to abuse the
-// same-origin grant. Removing allow-scripts is the load-bearing guarantee here.
-const IFRAME_SANDBOX = "allow-popups allow-same-origin";
-const MEDIA_ORIGIN = typeof location !== "undefined" ? location.origin : "";
-const CSP =
-  `default-src 'none'; img-src data: ${MEDIA_ORIGIN}/api/media; style-src 'unsafe-inline'; font-src data:; base-uri 'none'`;
-
-// Injected into every email document: a viewport so fixed-width (e.g. 600px
-// table) newsletters don't overflow on mobile, theme-aware defaults for simple
-// rich messages, and a small reset so images/tables never exceed the reading
-// column. Email HTML that brings its own backgrounds still wins; plain HTML
-// messages inherit an app-theme surface instead of a forced white body.
-const BASE_STYLE =
-  "html{color-scheme:light}html[data-app-theme='dark']{color-scheme:dark}body{box-sizing:border-box;margin:0;background:#fff;color:#1a1a1a;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;overflow-wrap:anywhere}a{color:#2563eb}html[data-app-theme='dark'] body:not([data-email-background='true']){background:#0f172a;color:#e5e7eb}html[data-app-theme='dark'] body:not([data-email-background='true']) a{color:#93c5fd!important}html[data-app-theme='dark'] body:not([data-email-background='true']) :where(p,div,span,font,td,th,li,strong,em,b,i,h1,h2,h3,h4,h5,h6,blockquote){color:inherit!important;background-color:transparent!important}img{max-width:100%;height:auto}table{max-width:100%}";
-
-function emailDeclaresBackground(html: string): boolean {
-  return /(?:style\s*=\s*["'][^"']*background(?:-[a-z]+)?\s*:|\bbgcolor\s*=|\bbackground\s*=)/i.test(html);
-}
-
-function currentAppTheme(): "dark" | "light" {
-  if (typeof document !== "undefined" && document.documentElement.classList.contains("dark")) return "dark";
-  return "light";
-}
-
-/** Wrap untrusted email HTML so the CSP meta is the first thing in <head>. */
-function wrapHtml(html: string): string {
-  const theme = currentAppTheme();
-  const hasBackground = emailDeclaresBackground(html) ? "true" : "false";
-  return `<!doctype html><html data-app-theme="${theme}"><head><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><style>${BASE_STYLE}</style></head><body data-email-background="${hasBackground}">${html}</body></html>`;
-}
 
 export interface ReaderProps {
   /** The selected thread_id (null = nothing selected). */
@@ -86,11 +63,28 @@ export interface ReaderProps {
    *  can open it and thread switches close it). */
   replyOpen?: boolean;
   onReplyOpenChange?: (open: boolean) => void;
+  /** Who the open reply goes to: the sender, or everyone on the message. */
+  replyMode?: ReplyMode;
+  /** Ask for a reply of this kind to be opened (the toolbar, a message menu). */
+  onReplyRequest?: (mode: ReplyMode) => void;
+  /** The `r` and `a` shortcuts: start a reply of this kind to the default
+   *  message. A new `nonce` is a new press. */
+  replyRequest?: { mode: ReplyMode; nonce: number };
+  /** Bumped by the `f` shortcut: forward the default message of this thread. */
+  forwardNonce?: number;
   /** Escape hatch: open the full compose dialog with this prefill (used by the
    *  inline composer's expand button, carrying the in-progress body). */
   onOpenCompose?: (initial: ComposeInitial) => void;
   /** Action handler — called when the user clicks an action in the toolbar. */
-  onAction?: (action: MailAction) => void;
+  onAction?: (action: MailAction, opts?: ActionOptions) => void;
+  /** Bumped by the `b` shortcut: open the snooze menu for this thread. */
+  snoozeNonce?: number;
+  /**
+   * On a phone the reader fills the screen and owns its top bar, so the
+   * thread's actions can share one row with Back instead of stacking under
+   * the subject. App supplies the two ends of that bar. Absent on desktop.
+   */
+  mobileChrome?: { leading: React.ReactNode; trailing?: React.ReactNode };
 }
 
 export default function Reader({
@@ -98,9 +92,39 @@ export default function Reader({
   view = "inbox",
   replyOpen = false,
   onReplyOpenChange,
+  replyMode = "reply",
+  onReplyRequest,
+  replyRequest,
+  forwardNonce = 0,
+  snoozeNonce = 0,
   onOpenCompose,
   onAction,
+  mobileChrome,
 }: ReaderProps) {
+  const isDesktop = useIsDesktop();
+  // Every state of the reader sits under the phone's top bar (Back must work
+  // while a thread is still loading); only a loaded thread puts actions in it.
+  const frame = (body: React.ReactNode, actions?: React.ReactNode) =>
+    mobileChrome ? (
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* The safe-area padding is on an OUTER box and the 56px row inside
+            it. On one box (border-box) the padding eats into the 56px, and in
+            the installed app the buttons hung up into the status bar. */}
+        <div className="shrink-0 border-b pt-[env(safe-area-inset-top)]">
+          <div className="flex h-14 items-center px-2">
+            {mobileChrome.leading}
+            <div className="min-w-0 flex-1" />
+            {actions}
+            {mobileChrome.trailing}
+          </div>
+        </div>
+        {body}
+      </main>
+    ) : (
+      body
+    );
+  // With the bar around it the frame is the page's <main>; without, the body is.
+  const Body = mobileChrome ? "div" : "main";
   const qc = useQueryClient();
   const { data, isLoading, isError, error, refetch, isFetching } =
     useThread(threadId);
@@ -115,51 +139,139 @@ export default function Reader({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [threadId]);
 
-  // Mark the thread read once when it first loads (if any message is unread).
-  const markedThreadRef = useRef<string | null>(null);
+  // Mark the thread read when it is opened, and again when a new message
+  // arrives in it (if any message is unread). The guard remembers one opening
+  // of one thread at one length, not "this thread, ever": remembering only the
+  // id left a thread unread forever once it had been marked unread and
+  // reopened. It is NOT re-marked while it simply stays open, or Mark unread
+  // would be undone by its own refetch.
+  const markedRef = useRef<string | null>(null);
+  useEffect(() => {
+    markedRef.current = null;
+  }, [threadId]);
   useEffect(() => {
     if (!data) return;
-    if (markedThreadRef.current === data.thread_id) return;
+    const opening = `${data.thread_id}:${data.messages.length}`;
+    if (markedRef.current === opening) return;
     const hasUnread = data.messages.some((m) => m.unread === 1);
     if (!hasUnread) return;
-    markedThreadRef.current = data.thread_id;
+    markedRef.current = opening;
     // Best-effort read marking. Fire-and-forget, but invalidate the list/counts
     // caches on success so the sidebar unread badge and row bolding update
     // promptly (not just on the next 15s poll). `.catch` keeps the rejection
     // from escaping — read marking is non-critical.
-    mutateThread(data.thread_id, "read")
+    const openedId = data.thread_id;
+    mutateThread(openedId, "read")
       .then(() => {
+        // In place first: the refetch below renews only the first page of a
+        // list, and this thread may sit further down.
+        patchThreadRows(qc, [openedId], { anyUnread: 0 });
         void qc.invalidateQueries({ queryKey: ["threads"] });
         void qc.invalidateQueries({ queryKey: ["counts"] });
       })
       .catch(() => {
         // ignore — best-effort
       });
-  }, [data?.thread_id, data?.messages.length, qc]);
+  }, [threadId, data?.thread_id, data?.messages.length, qc]);
+
+  // A reply answers the latest inbound message unless a message's own menu
+  // picked another one. Per thread: the choice must not follow a thread switch.
+  const [replyTargetId, setReplyTargetId] = useState<string | null>(null);
+  useEffect(() => {
+    setReplyTargetId(null);
+  }, [threadId]);
+  // And per reply: once it closes (sent, discarded, handed to the dialog) the
+  // next one answers the default message again unless told otherwise.
+  useEffect(() => {
+    if (!replyOpen) setReplyTargetId(null);
+  }, [replyOpen]);
+  // The inline composer: whether it holds something the user wrote, a handle
+  // to throw that away, and a counter that gives a retargeted reply a fresh
+  // composer (so nothing of the previous one, quote included, carries over).
+  const replyDirtyRef = useRef(false);
+  const replyRef = useRef<InlineReplyHandle>(null);
+  const [replyNonce, setReplyNonce] = useState(0);
+  // A request to reply to someone else while an edited reply is open, waiting
+  // on the user's answer.
+  const [pendingReply, setPendingReply] = useState<{ mode: ReplyMode; messageId: string | null } | null>(null);
+  useEffect(() => {
+    setPendingReply(null);
+  }, [threadId]);
+  // My own domains, so reply all never copies another address of mine.
+  const identities = useIdentities(!!threadId).data;
+
+  // `r` and `a` live in App, which has no thread data. They arrive as a
+  // request and take the same path as every button (startReply, below).
+  const startReplyRef = useRef<((mode: ReplyMode) => void) | null>(null);
+  const replySeenRef = useRef(replyRequest?.nonce ?? 0);
+  // A press made for one thread is never carried out on another.
+  useEffect(() => {
+    replySeenRef.current = replyRequest?.nonce ?? 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId]);
+  const loaded = !!data;
+  useEffect(() => {
+    const nonce = replyRequest?.nonce ?? 0;
+    if (nonce === replySeenRef.current) return;
+    // Pressed while the thread was still loading: wait for it (this runs
+    // again when it arrives) rather than drop the key.
+    if (!loaded || !startReplyRef.current) return;
+    replySeenRef.current = nonce;
+    if (replyRequest) startReplyRef.current(replyRequest.mode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [replyRequest?.nonce, loaded]);
+
+  // The `f` shortcut lives in App, which has no thread data; it bumps a nonce
+  // and the forward is built here. The ref keeps a remount or a thread switch
+  // from replaying an old press.
+  const forwardSeenRef = useRef(forwardNonce);
+  useEffect(() => {
+    if (forwardNonce === forwardSeenRef.current) return;
+    forwardSeenRef.current = forwardNonce;
+    const target = data ? defaultReplyTarget(data.messages) : null;
+    if (target) onOpenCompose?.(forwardInitial(target));
+    // Only a new press should fire this, not a refetch or a new callback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forwardNonce]);
+
+  // `b` works the same way, opening the toolbar's snooze menu.
+  const [snoozeOpen, setSnoozeOpen] = useState(false);
+  const snoozeSeenRef = useRef(snoozeNonce);
+  useEffect(() => {
+    if (snoozeNonce === snoozeSeenRef.current) return;
+    snoozeSeenRef.current = snoozeNonce;
+    setSnoozeOpen(true);
+  }, [snoozeNonce]);
+  useEffect(() => {
+    setSnoozeOpen(false);
+  }, [threadId]);
 
   if (!threadId) {
-    return (
-      <main className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-muted-foreground">
+    return frame(
+      <Body className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-muted-foreground">
         <Mail className="h-10 w-10 opacity-30" aria-hidden />
         <p className="text-sm">Select a message to read it here</p>
-      </main>
+      </Body>
     );
   }
 
   if (isLoading) {
-    return (
-      <main className="flex min-w-0 flex-1 flex-col gap-3 p-8" aria-hidden>
+    return frame(
+      <Body className="flex min-w-0 flex-1 flex-col gap-3 p-8" aria-hidden>
         <div className="h-6 w-2/3 animate-pulse rounded bg-muted" />
         <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
         <div className="h-3 w-1/3 animate-pulse rounded bg-muted" />
         <div className="mt-6 h-40 w-full animate-pulse rounded bg-muted" />
-      </main>
+      </Body>
     );
   }
 
-  if (isError || !data) {
-    return (
-      <main className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+  // Only when there is nothing to show. A refetch that fails under a loaded
+  // thread keeps `data`, and swapping the conversation for this screen would
+  // also unmount a reply in progress.
+  if (!data) {
+    return frame(
+      <Body className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
         <p className="text-sm text-destructive">
           Couldn’t load this conversation
           {error instanceof Error ? `: ${error.message}` : "."}
@@ -173,114 +285,178 @@ export default function Reader({
         >
           {isFetching ? "Retrying…" : "Retry"}
         </Button>
-      </main>
+      </Body>
     );
   }
 
   if (data.messages.length === 0) {
-    return (
-      <main className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-muted-foreground">
+    return frame(
+      <Body className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-muted-foreground">
         <Mail className="h-10 w-10 opacity-30" aria-hidden />
         <p className="text-sm">This conversation has no messages.</p>
-      </main>
+      </Body>
     );
   }
 
   const messages = data.messages; // oldest → newest (server ordered date ASC)
   const threadRootId = data.thread_id;
   const isThread = messages.length > 1;
-  const subject = messages[messages.length - 1].subject || "(no subject)";
+  // The heading names the conversation, so the reply prefixes each message
+  // accumulates ("Re: RE: Fwd:") are noise there.
+  const subject = conversationSubject(messages[messages.length - 1].subject) || "(no subject)";
 
-  // Reply targets the latest INBOUND message (fallback: latest message), and
+  // Reply targets the latest INBOUND message (fallback: latest message, which
+  // makes a reply to our own sent mail a follow-up to the same people), and
   // carries the thread root id so the reply joins this conversation.
-  const replyInitial = replyInitialForThread(threadRootId, messages);
-  const canReply = messages.some((m) => m.direction === "in") && !!replyInitial;
+  const mine = ownDomains(identities?.identities.map((i) => i.domain) ?? [], messages);
+  const defaultTarget = defaultReplyTarget(messages);
+  // A closed reply box always describes, and opens as, a plain reply to the
+  // default message. Who an OPEN one goes to is whatever was last asked for.
+  const openTargetId = replyOpen ? replyTargetId : null;
+  const openMode: ReplyMode = replyOpen ? replyMode : "reply";
+  const replyTarget = (openTargetId && messages.find((m) => m.id === openTargetId)) || defaultTarget;
+  const replyInitial = replyInitialForThread(threadRootId, messages, openMode, openTargetId, mine);
+  const canReply = !!replyInitial?.to;
+  // Offered for the default message: that is what the toolbar and the row of
+  // buttons under the thread reply to.
+  const canReplyAll = !!defaultTarget && hasReplyAll(defaultTarget, mine);
 
-  return (
-    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+  const beginReply = (mode: ReplyMode, messageId: string | null) => {
+    setReplyTargetId(messageId);
+    // A fresh composer whenever an open one changes hands.
+    if (replyOpen) setReplyNonce((n) => n + 1);
+    if (onReplyRequest) onReplyRequest(mode);
+    else onReplyOpenChange?.(true);
+  };
+  /**
+   * The one way a reply starts: toolbar, a message's menu, the box under the
+   * thread, and the keyboard all come through here. With no `messageId` it
+   * answers the default message, never a leftover choice from an earlier reply.
+   */
+  const startReply = (wanted: ReplyMode, messageId: string | null = null) => {
+    const target = (messageId && messages.find((m) => m.id === messageId)) || defaultTarget;
+    // Reply all to a message with nobody else on it is just a reply.
+    const mode: ReplyMode = wanted === "reply-all" && target && hasReplyAll(target, mine) ? "reply-all" : "reply";
+    if (replyOpen) {
+      const same = mode === openMode && target?.id === replyTarget?.id;
+      // Already writing exactly that reply: nothing to do (a stray `r`).
+      if (same) return;
+      // Writing a different one: its text and quote were for other people, so
+      // it is never silently pointed somewhere else.
+      if (replyDirtyRef.current) return setPendingReply({ mode, messageId });
+    }
+    beginReply(mode, messageId);
+  };
+  startReplyRef.current = (mode) => {
+    if (canReply && onReplyOpenChange) startReply(mode);
+  };
+  const startForward = (m: ThreadMessage) => onOpenCompose?.(forwardInitial(m));
+  const total = data.total ?? messages.length;
+  // What the thread itself says about where it is, which holds wherever it
+  // was opened from (a search result, All Mail): junk gets the Junk actions,
+  // and a snoozed thread says so and offers Unsnooze.
+  const isJunk = messages.some((m) => m.spam === 1 && m.state === "trash");
+  const allTrashed = messages.every((m) => m.state === "trash");
+  const threadView: View = isJunk ? "spam" : allTrashed && view !== "spam" ? "trash" : view;
+  const snoozedUntil = messages.reduce<number | null>((latest, m) => {
+    const t = m.state === "inbox" ? (m.snoozed_until ?? 0) : 0;
+    return t > Date.now() && t > (latest ?? 0) ? t : latest;
+  }, null);
+  // Only mail in the inbox can be snoozed (the Worker refuses anything else,
+  // and its reason is shown). Not offered where it can never apply.
+  const canSnooze =
+    snoozedUntil === null &&
+    threadView !== "trash" && threadView !== "spam" && threadView !== "sent" && threadView !== "snoozed" &&
+    (messages.some((m) => m.state !== undefined) ? messages.some((m) => m.state === "inbox") : true);
+
+  // On a phone Reply, Reply all and Forward live at the end of the thread (the
+  // inline reply row). When that row is not shown, Forward has no other home.
+  const hasReplyRow = canReply && !!replyInitial && !!onReplyOpenChange;
+  const toolbar = onAction ? (
+    <ReaderToolbar
+      compact={!isDesktop}
+      view={threadView}
+      snoozedUntil={snoozedUntil}
+      isStarred={data.messages.some((m) => m.starred === 1)}
+      canSnooze={canSnooze}
+      snoozeOpen={snoozeOpen}
+      onSnoozeOpenChange={setSnoozeOpen}
+      onAction={onAction}
+      onReply={canReply && onReplyOpenChange ? () => startReply("reply") : undefined}
+      onReplyAll={canReply && canReplyAll && onReplyOpenChange ? () => startReply("reply-all") : undefined}
+      onForward={
+        defaultTarget && onOpenCompose && (isDesktop || !hasReplyRow) ? () => startForward(defaultTarget) : undefined
+      }
+      onSummarize={() => summarize.mutate(threadRootId)}
+      summarizing={summarize.isPending}
+      mode={mode}
+      onMode={setMode}
+    />
+  ) : null;
+
+  return frame(
+    // min-h-0 on BOTH: a flex child will not shrink below its content height
+    // without it, so the auto-sized message iframe inflated this container
+    // instead of scrolling inside it - the ScrollArea reported
+    // scrollHeight === clientHeight and the overflow escaped to the document,
+    // which is why the thread could not be scrolled with a reply box open.
+    // @container: the toolbar shows its labels by the width of THIS pane.
+    <Body className="@container flex min-h-0 min-w-0 flex-1 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         {/* mx-auto + max-w caps the reading measure so a message doesn't sprawl
             to 150+ chars/line on a wide monitor (standard mail-client behavior). */}
         <article className="mx-auto w-full max-w-3xl px-4 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] md:px-7 md:py-6">
+          {isError && (
+            <div
+              role="status"
+              className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
+            >
+              <span>Couldn't refresh this conversation.</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs max-md:h-11"
+                onClick={() => void refetch()}
+                disabled={isFetching}
+              >
+                {isFetching ? "Retrying…" : "Retry"}
+              </Button>
+            </div>
+          )}
           <h1 className="text-xl font-semibold [overflow-wrap:anywhere]">{subject}</h1>
           {isThread && (
             <p className="mt-1 text-xs text-muted-foreground">
-              {messages.length} messages
+              {total} messages
+            </p>
+          )}
+          {snoozedUntil !== null && (
+            <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <AlarmClock className="size-3.5" aria-hidden />
+              Snoozed until {formatSnoozeTime(snoozedUntil, Date.now())}
+            </p>
+          )}
+          {data.truncated && (
+            <p role="note" className="mt-1 text-xs text-muted-foreground">
+              Showing the latest {messages.length}. Search to find earlier messages in this conversation.
             </p>
           )}
 
-          {/* Action bar — left action cluster + a pinned Rich/Chat toggle. The
-              toggle is a flex sibling (not ml-auto) so it stays right-aligned and
-              wraps cleanly instead of orphaning when the cluster gets wide. */}
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              {canReply && (
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={() => onReplyOpenChange?.(true)}
-                  disabled={!onReplyOpenChange}
-                  className="max-md:h-11 max-md:px-5"
-                >
-                  Reply
-                </Button>
-              )}
-
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => summarize.mutate(threadRootId)}
-                disabled={summarize.isPending}
-                className="gap-1.5 max-md:h-11"
-              >
-                <Sparkles className="size-3.5" />
-                {summarize.isPending ? "Summarizing…" : "Summarize"}
-              </Button>
-
-              {onAction && (
-                <ReaderToolbar
-                  view={view}
-                  isStarred={data.messages.some((m) => m.starred === 1)}
-                  onAction={onAction}
-                />
-              )}
+          {/* Desktop action bar: one row that never wraps, and stays at the top
+              of the pane while the conversation scrolls under it. On a phone
+              the same actions sit in the top bar instead (see `frame`), so the
+              first message starts right under the subject. */}
+          {isDesktop && toolbar ? (
+            <div className="sticky top-0 z-10 -mx-4 mt-3 mb-5 border-b bg-background px-4 py-2 md:-mx-7 md:px-7">
+              {toolbar}
             </div>
-
-            {/* Rich / Chat segmented toggle */}
-            <div
-              className="flex items-center rounded-md border bg-background"
-              role="group"
-              aria-label="Reading mode"
-            >
-              <Button
-                type="button"
-                size="sm"
-                variant={mode === "rich" ? "default" : "ghost"}
-                aria-pressed={mode === "rich"}
-                title="Read the formatted email"
-                className="rounded-r-none border-r px-3 h-8 text-xs max-md:h-10"
-                onClick={() => setMode("rich")}
-              >
-                Rich
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={mode === "chat" ? "default" : "ghost"}
-                aria-pressed={mode === "chat"}
-                title="Ask AI questions about this conversation"
-                className="rounded-l-none px-3 h-8 text-xs max-md:h-10"
-                onClick={() => setMode("chat")}
-              >
-                Chat
-              </Button>
-            </div>
-          </div>
+          ) : (
+            <Separator className="mt-4 mb-5" />
+          )}
 
           {/* AI summary panel — appears once Summarize is clicked. */}
           {(summarize.isPending || summarize.data || summarize.error) && (
-            <div className="mt-3 rounded-lg border bg-muted/40 p-3">
+            <div className="mb-5 rounded-lg border bg-muted/40 p-3" role="status">
               <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <Sparkles className="size-3.5" />
                 AI summary
@@ -301,14 +477,18 @@ export default function Reader({
             </div>
           )}
 
-          <Separator className="my-5" />
-
           <div className="flex flex-col gap-6">
             {mode === "chat" ? (
               <ChatView data={data} />
             ) : (
               messages.map((m) => (
-                <MessageEntry key={m.id} msg={m} />
+                <MessageEntry
+                  key={m.id}
+                  msg={m}
+                  own={mine}
+                  onReply={onReplyOpenChange ? (mode) => startReply(mode, m.id) : undefined}
+                  onForward={onOpenCompose ? () => startForward(m) : undefined}
+                />
               ))
             )}
           </div>
@@ -318,28 +498,108 @@ export default function Reader({
           {canReply && replyInitial && onReplyOpenChange && (
             <div className="mt-6">
               <InlineReply
-                key={threadRootId}
+                key={`${threadRootId}:${replyNonce}`}
+                ref={replyRef}
                 initial={replyInitial}
                 open={replyOpen}
                 onOpenChange={onReplyOpenChange}
+                onStart={() => startReply("reply")}
+                onDirtyChange={(dirty) => {
+                  replyDirtyRef.current = dirty;
+                }}
                 onOpenFull={onOpenCompose}
+                collapsedActions={
+                  <>
+                    {canReplyAll && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => startReply("reply-all")}
+                        className="h-auto gap-1.5 rounded-xl px-4 text-sm text-muted-foreground max-md:min-h-11"
+                      >
+                        <ReplyAll className="size-4" />
+                        Reply all
+                      </Button>
+                    )}
+                    {defaultTarget && onOpenCompose && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => startForward(defaultTarget)}
+                        className="h-auto gap-1.5 rounded-xl px-4 text-sm text-muted-foreground max-md:min-h-11"
+                      >
+                        <Forward className="size-4" />
+                        Forward
+                      </Button>
+                    )}
+                  </>
+                }
               />
             </div>
           )}
+          <AlertDialog open={!!pendingReply} onOpenChange={(o) => !o && setPendingReply(null)}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Discard this reply and start a new one?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  The reply you are writing goes to different people. Starting a new one deletes what
+                  you have written.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Keep writing</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={() => {
+                    if (!pendingReply) return;
+                    replyRef.current?.discard();
+                    replyDirtyRef.current = false;
+                    beginReply(pendingReply.mode, pendingReply.messageId);
+                    setPendingReply(null);
+                  }}
+                >
+                  Discard and start new
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </article>
       </ScrollArea>
-    </main>
+    </Body>,
+    // Desktop renders the toolbar inside the article, above.
+    isDesktop ? null : toolbar,
   );
 }
 
+/** The URL when it is a well-formed https address, else null. */
+function safeHttpsUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    return new URL(raw).protocol === "https:" ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One message within the conversation: header + sandboxed body. */
-function MessageEntry({ msg }: { msg: ThreadMessage }) {
+function MessageEntry({
+  msg,
+  own,
+  onReply,
+  onForward,
+}: {
+  msg: ThreadMessage;
+  /** The user's own domains (see ownDomains), so Reply all is offered honestly. */
+  own?: string[];
+  onReply?: (mode: ReplyMode) => void;
+  onForward?: () => void;
+}) {
   const body = msg.body;
   const cc = msg.msg_cc?.trim();
   const qc = useQueryClient();
   const [shownHtml, setShownHtml] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showDetail, setShowDetail] = useState(false);
+  const [confirmBlock, setConfirmBlock] = useState(false);
 
   const html = shownHtml ?? body.html;
   const blocked = shownHtml ? 0 : (msg.remoteShown ? 0 : msg.remoteImageCount ?? 0);
@@ -347,18 +607,27 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
   async function handleShow() {
     setBusy(true);
     try { const r = await showMessageImages(msg.id); setShownHtml(r.html); }
-    catch { toast.error("Couldn't load images — please try again."); }
+    catch { toast.error("Couldn't load images. Please try again."); }
     finally { setBusy(false); }
   }
   async function handleAlways() {
     // Allowlist the AUTHENTICATED mailbox (from_addr), which is what the server
     // matches against — not the spoofable rendered msg_from. Fall back to
     // msg_from only for pre-existing rows that have no from_addr.
-    await allowImagesFrom(msg.from_addr ?? msg.msg_from);
+    try {
+      await allowImagesFrom(msg.from_addr ?? msg.msg_from);
+    } catch {
+      toast.error("Couldn't save that. Images from this sender are still blocked.");
+      return;
+    }
     void qc.invalidateQueries({ queryKey: ["thread"] });
   }
 
+  const mine = msg.direction === "out";
   const fromLabel = senderLabel(msg.msg_from) || msg.msg_from;
+  // Our own messages read as "You"; the address beside it still says which
+  // identity sent it.
+  const fromName = mine ? "You" : fromLabel;
   // The AUTHENTICATED mailbox where we have one; msg_from is the sender's own
   // unescaped text and a display name can contain anything, including a second
   // address. See showAddr below.
@@ -368,8 +637,46 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
   // byte-identically to the real Legit Corp. Keeping the true address beside
   // the name is the one defence a mail client owes against that. Suppressed
   // only when the "name" already is the address.
-  const showAddr = fromAddr && fromAddr !== fromLabel;
+  const showAddr = fromAddr && fromAddr !== fromName;
   const toSummary = recipientSummary(msg.msg_to, cc);
+  const headers = body.headers;
+  // Two cheap, honest signals. A name that itself claims an address on another
+  // domain is the classic impersonation; a DMARC fail means the sending domain
+  // disowned the message. Neither is shown for our own sent mail.
+  const claimed = msg.direction === "in" ? addressClaimedInName(fromLabel, fromAddr) : null;
+  const dmarcFailed = msg.direction === "in" && headers?.auth?.dmarc === "fail";
+  const unsubscribe = msg.direction === "in" ? headers?.unsubscribe : undefined;
+  const [unsubState, setUnsubState] = useState<"idle" | "busy" | "done">("idle");
+  // A page the user has to visit themselves. Known up front when the list
+  // offers a web address and nothing the Worker can act on; learned from the
+  // Worker when it tried and the list sent it to a page instead. Either way it
+  // is shown as a real link for the user to tap: opening a tab from code after
+  // a request has come back is outside the tap, and Safari blocks it silently.
+  const [unsubPage, setUnsubPage] = useState<string | null>(null);
+  const pageOnly = unsubscribe?.url && !unsubscribe.oneClick && !unsubscribe.mailto ? unsubscribe.url : null;
+  const unsubLink = safeHttpsUrl(unsubPage ?? pageOnly);
+  async function handleUnsubscribe() {
+    setUnsubState("busy");
+    try {
+      const r = await unsubscribeFrom(msg.id);
+      if (r.method === "open") {
+        setUnsubState("idle");
+        if (safeHttpsUrl(r.url)) setUnsubPage(r.url);
+        else toast.error("This list can only be left on its own page. Use the link in the message.");
+        return;
+      }
+      setUnsubState("done");
+      toast.success(r.method === "mailto" ? "Unsubscribe request sent" : "Unsubscribed");
+    } catch (e) {
+      setUnsubState("idle");
+      // The Worker says why it could not (the list refused, the message could
+      // not be verified): that is more use than "something went wrong".
+      const why = e instanceof ApiError && (e.status === 409 || e.status === 502) && e.message ? asSentence(e.message) : "";
+      toast.error(why ? `Couldn't unsubscribe. ${why}` : "Couldn't unsubscribe. Try the link in the message instead.");
+    }
+  }
+  const bccList = headers?.bcc?.map((b) => b.address).join(", ");
+  const replyToList = headers?.replyTo?.map((r) => r.address).join(", ");
 
   return (
     <section className="overflow-hidden rounded-lg border bg-card">
@@ -384,10 +691,14 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
         </span>
 
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-baseline gap-2" title={msg.msg_from}>
-            <span className="truncate text-sm font-semibold text-foreground">{fromLabel}</span>
+          {/* Desktop: name, then the address in what is left of the line (never
+              less than a few characters: it is the part that cannot be faked).
+              Phone: one under the other. Side by side there, with the date
+              also on the line, each got about three letters ("Ma…"). */}
+          <div className="flex min-w-0 flex-col md:flex-row md:items-baseline md:gap-2" title={msg.msg_from}>
+            <span className="truncate text-sm font-semibold text-foreground">{fromName}</span>
             {showAddr && (
-              <span className="truncate text-xs text-muted-foreground">{fromAddr}</span>
+              <span className="truncate text-xs text-muted-foreground md:min-w-16 md:flex-1">{fromAddr}</span>
             )}
           </div>
           <button
@@ -420,6 +731,26 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
                   <dd className="[overflow-wrap:anywhere]">{cc}</dd>
                 </>
               )}
+              {bccList && (
+                <>
+                  <dt className="font-medium">Bcc</dt>
+                  <dd className="[overflow-wrap:anywhere]">{bccList}</dd>
+                </>
+              )}
+              {replyToList && (
+                <>
+                  <dt className="font-medium">Reply to</dt>
+                  <dd className="[overflow-wrap:anywhere]">{replyToList}</dd>
+                </>
+              )}
+              {headers?.auth && msg.direction === "in" && (
+                <>
+                  <dt className="font-medium">Checks</dt>
+                  <dd>
+                    SPF {headers.auth.spf}, DKIM {headers.auth.dkim}, DMARC {headers.auth.dmarc}
+                  </dd>
+                </>
+              )}
               {/* The header shows a relative date; the exact time lived only in
                   a title tooltip, which a touch device cannot reach at all. */}
               <dt className="font-medium">Date</dt>
@@ -432,36 +763,150 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
           date={msg.date}
           className="shrink-0 pt-0.5 text-xs text-muted-foreground"
         />
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Message actions"
+              className="-mr-2 -mt-1 size-8 shrink-0 text-muted-foreground max-md:size-11"
+            >
+              <MoreHorizontal className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {onReply && (
+              <DropdownMenuItem onSelect={() => onReply("reply")}>
+                <Reply /> Reply
+              </DropdownMenuItem>
+            )}
+            {onReply && hasReplyAll(msg, own) && (
+              <DropdownMenuItem onSelect={() => onReply("reply-all")}>
+                <ReplyAll /> Reply all
+              </DropdownMenuItem>
+            )}
+            {onForward && (
+              <DropdownMenuItem onSelect={onForward}>
+                <Forward /> Forward
+              </DropdownMenuItem>
+            )}
+            {msg.direction === "in" && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem asChild>
+                  <a href={`/api/messages/${encodeURIComponent(msg.id)}/raw`} download className="no-underline">
+                    <Download /> Download original
+                  </a>
+                </DropdownMenuItem>
+                {/* Only with an authenticated address to block: the rendered
+                    From text is the sender's own and proves nothing. */}
+                {msg.from_addr && (
+                  <DropdownMenuItem onSelect={() => setConfirmBlock(true)}>
+                    <Ban /> Block sender
+                  </DropdownMenuItem>
+                )}
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <AlertDialog open={confirmBlock} onOpenChange={setConfirmBlock}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Block {msg.from_addr}?</AlertDialogTitle>
+              <AlertDialogDescription>
+                {dmarcFailed && msg.from_addr ? `${failedCheckWarning(msg.from_addr)} ` : ""}
+                New mail from this address will go straight to Junk. You can unblock it any time
+                under Rules.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction onClick={() => msg.from_addr && void blockAddress(qc, msg.from_addr)}>
+                Block sender
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
+
+      {(claimed || dmarcFailed) && (
+        // A note, not an alert: an alert is announced the moment it appears,
+        // which here is once per flagged message on every opening of the thread.
+        <div
+          role="note"
+          aria-label="Sender warning"
+          className="mx-4 mb-3 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-foreground"
+        >
+          <ShieldAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <span className="[overflow-wrap:anywhere]">
+            {claimed
+              ? `The sender name mentions ${claimed}, but this message came from ${fromAddr}.`
+              : `This message failed the sender check for ${fromAddr.slice(fromAddr.lastIndexOf("@") + 1)}. It may not be from who it says.`}{" "}
+            Be careful with links and attachments.
+          </span>
+        </div>
+      )}
+
+      {unsubscribe && (
+        <div className="mx-4 mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground">
+          <span>This is a mailing list.</span>
+          {unsubLink ? (
+            <a
+              href={unsubLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-foreground no-underline hover:bg-accent max-md:h-11"
+            >
+              <ExternalLink className="size-3.5" />
+              Open the unsubscribe page
+            </a>
+          ) : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={unsubState !== "idle"}
+              onClick={() => void handleUnsubscribe()}
+              className="h-7 gap-1.5 px-2 text-xs text-foreground max-md:h-11"
+            >
+              <MailMinus className="size-3.5" />
+              {unsubState === "done" ? "Unsubscribed" : unsubState === "busy" ? "Unsubscribing…" : "Unsubscribe"}
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* Attachments — links to the download endpoint, shown as chips. */}
       {body.attachments.length > 0 && (
         <div className="flex flex-wrap gap-2 px-4 pb-3">
-          {body.attachments.map((a) =>
+          {body.attachments.map((a, i) =>
             a.stored === false ? (
               // The bytes were never written, so a link here would just 404.
               // Show the name (it is real information) and say plainly that the
-              // file is unavailable rather than offering a dead download.
+              // file is not available rather than offering a dead download.
               <span
-                key={a.name}
+                key={a.partId ?? i}
                 title="This file was not stored with the message"
-                className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-3 py-1.5 text-sm text-muted-foreground"
+                className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-dashed px-3 py-1.5 text-sm text-muted-foreground md:min-h-0"
               >
                 <Paperclip className="h-3.5 w-3.5" />
                 {a.name}
                 <span className="text-xs">(not stored)</span>
               </span>
             ) : (
-            <a
-              key={a.name}
-              href={attachmentUrl(msg.id, a.name)}
-              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm text-foreground no-underline transition-colors hover:bg-accent"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              <Paperclip className="h-3.5 w-3.5" />
-              {a.name}
-            </a>
+              // Keyed and linked by MIME part, not name: two files called
+              // "invoice.pdf" are two files.
+              <a
+                key={a.partId ?? i}
+                href={attachmentUrl(msg.id, a.name, a.partId)}
+                className="inline-flex min-h-11 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm text-foreground no-underline transition-colors hover:bg-accent md:min-h-0"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Paperclip className="h-3.5 w-3.5" />
+                {a.name}
+              </a>
             ),
           )}
         </div>
@@ -472,12 +917,13 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
           and a second inset frame around that reads as a widget, not a
           letter. */}
       <div className="border-t">
-
         {html ? (
           <>
             <MessageImageBanner
               count={busy ? 0 : blocked}
-              sender={msg.msg_from}
+              // The address that will actually be trusted (see handleAlways),
+              // not the display name, which is the sender's own text.
+              sender={msg.from_addr ?? msg.msg_from}
               onShow={handleShow}
               onAlways={handleAlways}
             />
@@ -512,115 +958,22 @@ function MessageEntry({ msg }: { msg: ThreadMessage }) {
 /**
  * Sandboxed email-body iframe that auto-sizes to its content height, so short
  * emails don't get a tall empty box and long emails don't get a nested inner
- * scrollbar (the whole reading pane scrolls instead). Height is measured from
- * the frame's own document via a ResizeObserver — possible because the sandbox
- * includes `allow-same-origin` (and never `allow-scripts`; see IFRAME_SANDBOX).
+ * scrollbar (the whole reading pane scrolls instead). The sizing, and the
+ * reasons behind the sandbox flags, live in lib/emailFrame.
  */
-/**
- * Decide whether an email needs breathing room inside its card.
- *
- * A newsletter ships its own full-width coloured canvas and must stay flush to
- * the card edge, or a gutter appears around a design that was meant to bleed.
- * An ordinary reply arrives as a bare `<div dir="ltr">` with no margins at all
- * and would otherwise sit jammed against the border. Decided by measuring the
- * rendered document rather than pattern-matching the HTML, because "does this
- * paint to the edge" is a layout question and only layout can answer it.
- */
-function applyBodyPadding(doc: Document) {
-  const body = doc.body;
-  const view = doc.defaultView;
-  if (!body || !view) return;
-  // Writing an unchanged value would still be a style mutation, and this runs
-  // from a ResizeObserver-adjacent path — assign only on a real change so it
-  // cannot feed itself.
-  const set = (v: string) => {
-    if (body.style.padding !== v) body.style.padding = v;
-  };
-  const bleeds = Array.from(body.children).some((el) => {
-    const bg = view.getComputedStyle(el).backgroundColor;
-    // rgba(...,0) and "transparent" both mean nothing is painted.
-    if (!bg || bg === "transparent" || /,\s*0\s*\)$/.test(bg)) return false;
-    return el.getBoundingClientRect().width >= body.clientWidth - 2;
-  });
-  set(bleeds ? "0px" : "16px");
-}
-
 function EmailFrame({ html, title }: { html: string; title: string }) {
   const ref = useRef<HTMLIFrameElement>(null);
-  const [height, setHeight] = useState(0);
 
   useEffect(() => {
     const iframe = ref.current;
     if (!iframe) return;
-    let ro: ResizeObserver | undefined;
-    const syncTheme = () => {
-      try {
-        const doc = iframe.contentDocument;
-        if (doc?.documentElement) {
-          doc.documentElement.dataset.appTheme = document.documentElement.classList.contains("dark") ? "dark" : "light";
-        }
-      } catch {
-        /* ignore */
-      }
-    };
-    const measure = () => {
-      try {
-        const doc = iframe.contentDocument;
-        if (doc?.documentElement) {
-          setHeight(Math.max(doc.documentElement.scrollHeight, doc.body?.scrollHeight ?? 0));
-        }
-      } catch {
-        // Opaque-origin frame (shouldn't happen with allow-same-origin) — keep
-        // the CSS fallback height.
-      }
-    };
-    const onLoad = () => {
-      syncTheme();
-      try {
-        if (iframe.contentDocument) applyBodyPadding(iframe.contentDocument);
-      } catch {
-        /* ignore - padding is cosmetic, never worth failing the render for */
-      }
-      measure();
-      try {
-        const doc = iframe.contentDocument;
-        if (doc && typeof ResizeObserver !== "undefined") {
-          ro = new ResizeObserver(measure);
-          ro.observe(doc.documentElement);
-          if (doc.body) ro.observe(doc.body);
-        }
-      } catch {
-        /* ignore */
-      }
-    };
-    iframe.addEventListener("load", onLoad);
-    if (iframe.contentDocument?.readyState === "complete") onLoad();
-    const themeObserver = new MutationObserver(syncTheme);
-    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
-    syncTheme();
-
-    // Whether an email paints to the edge is a LAYOUT answer, so it can change
-    // when the viewport does: a newsletter whose fixed-width table stops
-    // spanning the frame at a narrow width needs the padding a wide one does
-    // not. Deciding it once on load left that stale for the rest of the read.
-    const onResize = () => {
-      try {
-        if (iframe.contentDocument) applyBodyPadding(iframe.contentDocument);
-      } catch {
-        /* cosmetic */
-      }
-      measure();
-    };
-    window.addEventListener("resize", onResize);
-    return () => {
-      iframe.removeEventListener("load", onLoad);
-      window.removeEventListener("resize", onResize);
-      ro?.disconnect();
-      themeObserver.disconnect();
-    };
+    return autoSizeEmailFrame(iframe);
   }, [html]);
 
   return (
+    // The wrapper holds the frame's space while it is being measured (see
+    // measureContentHeight); the height itself is written straight to the
+    // iframe, outside React.
     <div className="overflow-hidden rounded-md border bg-card p-4">
       <iframe
         ref={ref}
@@ -628,7 +981,6 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
         sandbox={IFRAME_SANDBOX}
         srcDoc={wrapHtml(html)}
         scrolling="no"
-        style={height ? { height: `${height}px` } : undefined}
         className="block min-h-24 w-full overflow-hidden border-0 bg-transparent"
       />
     </div>
@@ -645,62 +997,139 @@ export function MessageImageBanner({
         {count} {count === 1 ? "image" : "images"} blocked for your privacy.
         Showing them lets the sender know you opened this message.
       </span>
-      <Button type="button" size="sm" variant="outline" onClick={onShow}>Display images</Button>
+      <Button type="button" size="sm" variant="outline" onClick={onShow} className="max-md:h-11">
+        Display images
+      </Button>
+      {/* The sender is the point of this button (it is a decision to trust
+          them), so it wraps onto a second line rather than being cut off. */}
       <Button
         type="button"
         size="sm"
         variant="ghost"
         onClick={onAlways}
-        title={`Always show images from ${sender}`}
-        className="max-w-full gap-1"
+        className="h-auto min-h-8 max-w-full justify-start py-1 text-left whitespace-normal max-md:min-h-11"
       >
-        <span className="shrink-0">Always show from</span>
-        <span className="min-w-0 truncate">{sender}</span>
+        <span className="[overflow-wrap:anywhere]">Always show from {sender}</span>
       </Button>
     </div>
   );
 }
 
-/** Toolbar with archive/trash/star/unread actions for the open conversation. */
+/**
+ * One toolbar button. Desktop: outlined, icon plus a label that shows once
+ * the reading pane is wide enough for the whole row (a container query, so it
+ * follows the pane and not the window). Phone (`compact`): a bare 44px icon.
+ * Either way the accessible name and tooltip are `name`.
+ */
+function ToolButton({
+  icon: Icon,
+  name,
+  label,
+  compact,
+  className,
+  iconClassName,
+  ...props
+}: Omit<React.ComponentProps<typeof Button>, "children"> & {
+  icon: LucideIcon;
+  /** Accessible name and tooltip. */
+  name: string;
+  /** Visible text on desktop; defaults to `name`. */
+  label?: string;
+  compact: boolean;
+  iconClassName?: string;
+}) {
+  return (
+    <Button
+      type="button"
+      variant={compact ? "ghost" : "outline"}
+      size={compact ? "icon" : "sm"}
+      aria-label={name}
+      title={name}
+      className={cn(compact && "size-11", className)}
+      {...props}
+    >
+      <Icon className={cn(compact ? "size-5" : "size-4", iconClassName)} />
+      {!compact && <span className="hidden @2xl:inline">{label ?? name}</span>}
+    </Button>
+  );
+}
+
+/**
+ * The open conversation's actions, as one row that never wraps: the few used
+ * constantly as buttons, everything else under More.
+ */
 function ReaderToolbar({
+  compact,
   view,
   isStarred,
+  canSnooze,
+  snoozedUntil,
+  snoozeOpen,
+  onSnoozeOpenChange,
   onAction,
+  onReply,
+  onReplyAll,
+  onForward,
+  onSummarize,
+  summarizing,
+  mode,
+  onMode,
 }: {
+  /** Phone layout: icons only, 44px targets, no Reply (that is at the end of the thread). */
+  compact: boolean;
   view: View;
   isStarred: boolean;
-  onAction: (action: MailAction) => void;
+  canSnooze: boolean;
+  /** When the open thread is snoozed until, or null. */
+  snoozedUntil: number | null;
+  snoozeOpen: boolean;
+  onSnoozeOpenChange: (open: boolean) => void;
+  onAction: (action: MailAction, opts?: ActionOptions) => void;
+  onReply?: () => void;
+  onReplyAll?: () => void;
+  onForward?: () => void;
+  onSummarize: () => void;
+  summarizing: boolean;
+  mode: ReaderMode;
+  onMode: (mode: ReaderMode) => void;
 }) {
   const isTrash = view === "trash";
+  const isJunk = view === "spam";
+  const [confirmDelete, setConfirmDelete] = useState(false);
   return (
-    <div className="flex items-center gap-1">
-      {isTrash ? (
-        <>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => onAction("restore")}
-            className="max-md:h-11"
-          aria-label="Restore"
-          >
-            <RotateCcw className="h-4 w-4" />
-            Restore
-          </Button>
+    <div
+      role="toolbar"
+      aria-label="Conversation actions"
+      // The scroll is a last resort for a pane too narrow for even the icons
+      // (a tablet in portrait); at every ordinary width nothing overflows.
+      className={cn(
+        "flex items-center",
+        compact ? "gap-0" : "gap-1 overflow-x-auto [scrollbar-width:none] @2xl:gap-1.5 [&::-webkit-scrollbar]:hidden",
+      )}
+    >
+      {/* Dropped in a very narrow pane, where the icons need the room; the
+          reply box at the end of the thread is still there. */}
+      {!compact && onReply && (
+        <Button type="button" size="sm" onClick={onReply} className="hidden @sm:inline-flex @2xl:mr-1">
+          Reply
+        </Button>
+      )}
 
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                aria-label="Delete forever"
-                className="text-destructive hover:text-destructive"
-              >
-                <Trash2 className="h-4 w-4" />
-                Delete forever
-              </Button>
-            </AlertDialogTrigger>
+      {isTrash || isJunk ? (
+        <>
+          {isJunk ? (
+            <ToolButton compact={compact} icon={ShieldCheck} name="Not junk" onClick={() => onAction("unspam")} />
+          ) : (
+            <ToolButton compact={compact} icon={RotateCcw} name="Restore" onClick={() => onAction("restore")} />
+          )}
+          <ToolButton
+            compact={compact}
+            icon={Trash2}
+            name="Delete forever"
+            onClick={() => setConfirmDelete(true)}
+            className="text-destructive hover:text-destructive"
+          />
+          <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
             <AlertDialogContent>
               <AlertDialogHeader>
                 <AlertDialogTitle>Delete forever?</AlertDialogTitle>
@@ -722,70 +1151,84 @@ function ReaderToolbar({
           </AlertDialog>
         </>
       ) : (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => onAction("archive")}
-          className="max-md:h-11"
-          aria-label="Archive"
-        >
-          <Archive className="h-4 w-4" />
-          Archive
-        </Button>
-      )}
-
-      {/* Star toggle */}
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        onClick={() => onAction(isStarred ? "unstar" : "star")}
-        className="max-md:h-11"
-        aria-label={isStarred ? "Unstar" : "Star"}
-      >
-        <Star
-          className={cn(
-            "h-4 w-4",
-            isStarred ? "fill-yellow-400 text-yellow-400" : "",
-          )}
-        />
-        {isStarred ? "Unstar" : "Star"}
-      </Button>
-
-      {/* Mark unread */}
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        onClick={() => onAction("unread")}
-        className="max-md:h-11"
-          aria-label="Mark as unread"
-      >
-        <MailOpen className="h-4 w-4" />
-        Unread
-      </Button>
-
-      {/* Destructive Trash isolated at the end (separator + de-emphasized) so it
-          isn't fired by accident next to the benign toggles. Reversible via the
-          undo toast App shows; the irreversible "Delete forever" lives in the
-          trash view behind a confirm dialog. */}
-      {!isTrash && (
         <>
-          <Separator orientation="vertical" className="mx-1 h-5" />
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
+          <ToolButton compact={compact} icon={Archive} name="Archive" onClick={() => onAction("archive")} />
+          <ToolButton
+            compact={compact}
+            icon={Trash2}
+            name="Move to trash"
+            label="Trash"
             onClick={() => onAction("trash")}
-            aria-label="Move to trash"
-            className="text-muted-foreground hover:text-destructive max-md:h-11"
-          >
-            <Trash2 className="h-4 w-4" />
-            Trash
-          </Button>
+          />
+          <ToolButton
+            compact={compact}
+            icon={MailOpen}
+            name="Mark as unread"
+            label="Unread"
+            onClick={() => onAction("unread")}
+          />
+          {canSnooze && (
+            <SnoozeMenu
+              open={snoozeOpen}
+              onOpenChange={onSnoozeOpenChange}
+              onSnooze={(until) => onAction("snooze", { until })}
+              align={compact ? "end" : "start"}
+            >
+              <ToolButton compact={compact} icon={AlarmClock} name="Snooze" />
+            </SnoozeMenu>
+          )}
+          {(snoozedUntil !== null || view === "snoozed") && (
+            <ToolButton
+              compact={compact}
+              icon={AlarmClockOff}
+              name="Unsnooze"
+              // With the time it had, so Undo can put the snooze back.
+              onClick={() => (snoozedUntil !== null ? onAction("unsnooze", { undoUntil: snoozedUntil }) : onAction("unsnooze"))}
+            />
+          )}
         </>
       )}
+
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <ToolButton compact={compact} icon={MoreHorizontal} name="More actions" label="More" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align={compact ? "end" : "start"} className="min-w-[13rem]">
+          {!compact && onReplyAll && (
+            <DropdownMenuItem onSelect={onReplyAll}>
+              <ReplyAll /> Reply all
+            </DropdownMenuItem>
+          )}
+          {onForward && (
+            <DropdownMenuItem onSelect={onForward}>
+              <Forward /> Forward
+            </DropdownMenuItem>
+          )}
+          {((!compact && onReplyAll) || onForward) && <DropdownMenuSeparator />}
+          <DropdownMenuItem onSelect={() => onAction(isStarred ? "unstar" : "star")}>
+            <Star className={cn(isStarred && "fill-yellow-400 !text-yellow-400")} />
+            {isStarred ? "Unstar" : "Star"}
+          </DropdownMenuItem>
+          {!isTrash && !isJunk && (
+            <DropdownMenuItem onSelect={() => onAction("spam")}>
+              <OctagonAlert /> Report junk
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onSelect={onSummarize} disabled={summarizing}>
+            <Sparkles /> {summarizing ? "Summarizing…" : "Summarize"}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>Reading mode</DropdownMenuLabel>
+          <DropdownMenuRadioGroup value={mode} onValueChange={(v) => onMode(v as ReaderMode)}>
+            <DropdownMenuRadioItem value="rich" title="Read the formatted email">
+              Rich
+            </DropdownMenuRadioItem>
+            <DropdownMenuRadioItem value="chat" title="Read the conversation as chat bubbles">
+              Chat
+            </DropdownMenuRadioItem>
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }

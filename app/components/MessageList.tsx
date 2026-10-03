@@ -1,6 +1,5 @@
-import { useRef } from "react";
-import { Archive, Inbox, PenSquare, RotateCcw, Star, Trash2 } from "lucide-react";
-import { toast } from "sonner";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { AlarmClock, AlarmClockOff, Archive, ArrowDown, Inbox, LoaderCircle, MailCheck, MailOpen, MoreHorizontal, OctagonAlert, PenSquare, RotateCcw, ShieldCheck, Star, Trash2, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,8 +16,21 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { useThreads, useMutateThreads, INVERSE_ACTION } from "@/lib/queries";
-import { actionLabel, isReversible } from "@/lib/actions";
+import { useQueryClient } from "@tanstack/react-query";
+import { useThreads, removesFromView } from "@/lib/queries";
+import { useMediaQuery } from "@/lib/useMediaQuery";
+import { useRowGestures, type SwipeDirection } from "@/lib/rowGestures";
+import { usePullToRefresh } from "@/lib/usePullToRefresh";
+import { actionView } from "@/lib/actions";
+import { useThreadActions, type ActionOptions } from "@/lib/useThreadActions";
+import SnoozeMenu from "@/components/SnoozeMenu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { formatSnoozeTime } from "@/lib/snooze";
 import { senderLabel, formatDate } from "@/lib/format";
 import { categoryOf, CATEGORY_META } from "@/lib/categories";
 import type { ThreadListRow, MailAction, View } from "@/lib/types";
@@ -40,6 +52,9 @@ export interface MessageListProps {
   selectedIds?: Set<string>;
   onToggleSelect?: (id: string) => void;
   onSelectRange?: (anchorId: string, id: string) => void;
+  /** Run a row action. App passes its own runner so row actions share undo
+   *  tracking with the toolbar and keyboard; standalone, the list runs them itself. */
+  onAction?: (threadIds: string[], action: MailAction, opts?: ActionOptions) => void;
   /** Empty-state CTA: start a new message (shown on an empty Inbox/All Mail). */
   onCompose?: () => void;
   /** Empty-state CTA: clear the active search (shown when a search has no hits). */
@@ -51,11 +66,16 @@ interface RowToggleHandler {
   (id: string, shiftKey: boolean): void;
 }
 
+/** Start loading the next page once the end of the list is this close. */
+const LOAD_MORE_WITHIN_PX = 600;
+
 const VIEW_LABELS: Record<View, string> = {
   inbox:   "Inbox",
   starred: "Starred",
   sent:    "Sent",
   all:     "All Mail",
+  spam:    "Junk",
+  snoozed: "Snoozed",
   trash:   "Trash",
 };
 
@@ -70,11 +90,19 @@ export default function MessageList({
   selectedIds,
   onToggleSelect,
   onSelectRange,
+  onAction,
   onCompose,
   onClearSearch,
 }: MessageListProps) {
-  const { data, isLoading, isError, error, refetch, isFetching } = useThreads(view, q, category, domain);
-  const { mutate } = useMutateThreads(view, q, category, domain);
+  const { data, isLoading, isError, error, refetch, isFetching, hasMore, isFetchingMore, moreFailed, fetchMore } =
+    useThreads(view, q, category, domain);
+  const own = useThreadActions(view, q, category, domain);
+  // A touch screen has no hover to reveal a checkbox with, and a column of
+  // them costs every row 28px. There, a long press on a row starts selecting
+  // (the checkboxes then show and a tap toggles), and rows can be swiped.
+  const touch = useMediaQuery("(pointer: coarse)");
+  const selecting = (selectedIds?.size ?? 0) > 0;
+  const runAction = onAction ?? own.run;
   const searching = !!q;
   const viewLabel = VIEW_LABELS[view];
 
@@ -92,10 +120,99 @@ export default function MessageList({
     }
   };
 
+  // ---- Paging: load the next page as the end of the list comes near ----
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const rowCount = data?.threads.length ?? 0;
+  const maybeLoadMore = useCallback(() => {
+    const el = viewportRef.current;
+    // A failed page waits for its Retry button rather than being re-requested
+    // on every scroll. clientHeight 0 is a hidden list (the mobile reader is
+    // showing): nothing is "near the end" of a list nobody can see.
+    if (!el || !hasMore || moreFailed || el.clientHeight === 0) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < LOAD_MORE_WITHIN_PX) void fetchMore();
+  }, [hasMore, moreFailed, fetchMore]);
+  // Also after every change in length: a page that does not fill the viewport
+  // never scrolls, so the scroll listener alone would stop there.
+  useEffect(() => {
+    maybeLoadMore();
+  }, [maybeLoadMore, rowCount]);
+
+  // ---- Scroll stability: new mail at the top must not move what is being read ----
+  // The first visible row and where it sat, noted on scroll; after the list
+  // changes, the scroll position is corrected so that row sits there again.
+  // Done by hand (and native anchoring turned off) because Safari has none.
+  const anchorRef = useRef<{ id: string; top: number } | null>(null);
+  const noteAnchor = useCallback(() => {
+    const el = viewportRef.current;
+    anchorRef.current = null;
+    if (!el || el.scrollTop <= 0) return; // at the top, new mail should show
+    const rows = el.querySelectorAll<HTMLElement>("li[data-thread-id]");
+    const top = el.getBoundingClientRect().top;
+    // Rows are in document order, so the first one reaching below the top
+    // edge is found by bisection.
+    let lo = 0;
+    let hi = rows.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (rows[mid].getBoundingClientRect().bottom > top) hi = mid;
+      else lo = mid + 1;
+    }
+    const first = rows[lo];
+    if (first) anchorRef.current = { id: first.dataset.threadId ?? "", top: first.getBoundingClientRect().top - top };
+  }, []);
+  const threads = data?.threads;
+  useLayoutEffect(() => {
+    const el = viewportRef.current;
+    const anchor = anchorRef.current;
+    if (el && anchor) {
+      for (const li of el.querySelectorAll<HTMLElement>("li[data-thread-id]")) {
+        if (li.dataset.threadId !== anchor.id) continue;
+        const delta = li.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.top;
+        if (delta !== 0) el.scrollTop += delta;
+        break;
+      }
+    }
+    noteAnchor();
+  }, [threads, noteAnchor]);
+
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      noteAnchor();
+      maybeLoadMore();
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [noteAnchor, maybeLoadMore]);
+
+  // Keyboard navigation (j/k) can select a row that is off screen.
+  useEffect(() => {
+    if (!selectedThreadId) return;
+    const el = viewportRef.current;
+    if (!el) return;
+    for (const li of el.querySelectorAll<HTMLElement>("li[data-thread-id]")) {
+      if (li.dataset.threadId === selectedThreadId) {
+        li.scrollIntoView({ block: "nearest" });
+        break;
+      }
+    }
+  }, [selectedThreadId]);
+
+  // ---- Pull down at the top to refresh (touch) ----
+  const qc = useQueryClient();
+  const pullRef = useRef<HTMLDivElement>(null);
+  const refreshing = usePullToRefresh(viewportRef, pullRef, () =>
+    // The list's first page (merged in, like any poll) and the sidebar counts.
+    Promise.all([refetch(), qc.invalidateQueries({ queryKey: ["counts"] })]),
+  );
+
   let content: React.ReactNode;
   if (isLoading) {
     content = <ListSkeleton />;
-  } else if (isError) {
+  } else if (isError && !data) {
+    // Only when there is nothing to show. A poll or focus refetch that fails
+    // keeps `data`; the rows stay and a notice goes above them instead.
     content = (
       <div className="flex flex-col items-center gap-3 p-8 text-center">
         <p className="text-sm text-destructive">
@@ -121,7 +238,9 @@ export default function MessageList({
         <p className="text-sm">
           {searching
             ? `No messages matching "${q}"`
-            : `No messages in ${viewLabel}`}
+            : view === "snoozed"
+              ? "Nothing is snoozed"
+              : `No messages in ${viewLabel}`}
         </p>
         {searching && onClearSearch ? (
           <Button type="button" variant="outline" size="sm" onClick={onClearSearch}>
@@ -144,42 +263,128 @@ export default function MessageList({
             key={t.thread_id}
             thread={t}
             view={view}
+            actions={actionView(view, q)}
             now={now}
             selected={t.thread_id === selectedThreadId}
             onSelect={onSelect}
-            mutate={mutate}
+            runAction={runAction}
             checkable={!!selectedIds}
+            touch={touch}
+            selecting={selecting}
             checked={selectedIds?.has(t.thread_id) ?? false}
             onToggle={handleRowToggle}
             showDomain={showDomain}
           />
         ))}
+        {isFetchingMore && (
+          <li role="status" className="px-4 py-3 text-center text-xs text-muted-foreground">
+            Loading more
+          </li>
+        )}
+        {moreFailed && !isFetchingMore && (
+          <li className="flex items-center justify-center gap-2 px-4 py-2 text-xs text-muted-foreground">
+            <span role="status">Couldn't load more.</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs max-md:h-11"
+              onClick={() => void fetchMore()}
+            >
+              Retry
+            </Button>
+          </li>
+        )}
       </ul>
     );
   }
 
-  return <ScrollArea className="flex-1">{content}</ScrollArea>;
+  // min-h-0: a flex child does not shrink below its content height without it,
+  // so this grew to fit every row and never actually scrolled.
+  return (
+    <>
+      {isError && data && (
+        <div
+          role="status"
+          className="flex items-center justify-between gap-2 border-b bg-muted/40 px-4 py-1 text-xs text-muted-foreground"
+        >
+          <span>Couldn't refresh.</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs max-md:h-11"
+            onClick={() => void refetch()}
+            disabled={isFetching}
+          >
+            {isFetching ? "Retrying…" : "Retry"}
+          </Button>
+        </div>
+      )}
+      {view === "spam" && !searching && (
+        <p role="note" className="border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+          Mail in Junk is deleted after 30 days.
+        </p>
+      )}
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* The pull-to-refresh indicator: parked just above the list, drawn
+            down by the gesture (see usePullToRefresh, which moves it). */}
+        <div
+          ref={pullRef}
+          aria-hidden
+          className="group/pull pointer-events-none absolute -top-11 left-1/2 z-20 flex size-9 -translate-x-1/2 items-center justify-center rounded-full border bg-background text-muted-foreground opacity-0 shadow-md"
+        >
+          {refreshing ? (
+            <LoaderCircle className="size-4 motion-safe:animate-spin" />
+          ) : (
+            <ArrowDown className="size-4 transition-transform group-data-[armed=true]/pull:rotate-180 motion-reduce:transition-none" />
+          )}
+        </div>
+        <span role="status" className="sr-only">
+          {refreshing ? "Refreshing" : ""}
+        </span>
+        <ScrollArea
+          className="min-h-0 flex-1"
+          viewportRef={viewportRef}
+          // overscroll-contain: the pull is ours, not the browser's own refresh.
+          viewportClassName="[overflow-anchor:none] overscroll-y-contain"
+        >
+          {content}
+        </ScrollArea>
+      </div>
+    </>
+  );
 }
 
 function Row({
   thread,
   view,
+  actions,
   now,
   selected,
   onSelect,
-  mutate,
+  runAction,
   checkable,
+  touch,
+  selecting,
   checked,
   onToggle,
   showDomain,
 }: {
   thread: ThreadListRow;
+  /** The selected view: how the row is DISPLAYED (e.g. "To:" in Sent). */
   view: View;
+  /** The view whose ACTIONS apply to this row (All Mail while searching). */
+  actions: View;
   now: number;
   selected: boolean;
   onSelect: (threadId: string) => void;
-  mutate: (args: { threadIds: string[]; action: MailAction }) => void;
+  runAction: (threadIds: string[], action: MailAction, opts?: ActionOptions) => void;
   checkable: boolean;
+  /** A touch screen: checkboxes stay out of sight until something is selected. */
+  touch: boolean;
+  /** At least one thread is selected (on touch: taps toggle, swipes are off). */
+  selecting: boolean;
   checked: boolean;
   onToggle?: RowToggleHandler;
   showDomain?: boolean;
@@ -188,19 +393,9 @@ function Row({
   const who =
     view === "sent" ? `To: ${thread.msg_to}` : senderLabel(thread.msg_from);
 
-  function handleAction(action: MailAction) {
-    mutate({ threadIds: [thread.thread_id], action });
-    const inv = INVERSE_ACTION[action];
-    if (isReversible(action) && inv) {
-      toast(actionLabel(action), {
-        action: {
-          label: "Undo",
-          onClick: () => mutate({ threadIds: [thread.thread_id], action: inv }),
-        },
-      });
-    } else {
-      toast(actionLabel(action));
-    }
+  function handleAction(action: MailAction, opts?: ActionOptions) {
+    if (opts) runAction([thread.thread_id], action, opts);
+    else runAction([thread.thread_id], action);
   }
 
   function handleCheckboxClick(e: React.MouseEvent) {
@@ -208,19 +403,78 @@ function Row({
     onToggle?.(thread.thread_id, e.shiftKey);
   }
 
-  const isTrash = view === "trash";
+  const isTrash = actions === "trash";
+  const isJunk = actions === "spam";
+  const isSnoozed = actions === "snoozed";
+  // Only mail in the inbox can be snoozed. A row does not say where its thread
+  // is, so outside the Inbox the offer may be refused (the Worker says why and
+  // the toast passes it on); it is left out only where it can never apply.
+  const canSnooze = actions === "inbox" || actions === "starred" || actions === "all";
   const isStarred = thread.starred === 1;
   // Show an AI-label chip for inbound rows that aren't "primary" (primary =
   // unlabeled, to keep the list quiet). Hidden on the Sent view.
   const cat = categoryOf(thread.category);
   const showChip = view !== "sent" && cat !== "primary";
 
+  // Touch: swipe right to archive, left to trash; in Trash and Junk either
+  // way puts the thread back. Hold to select. (None of it reacts to a mouse.)
+  const swipes = SWIPES[isTrash ? "trash" : isJunk ? "spam" : "other"];
+  const slideRef = useRef<HTMLDivElement>(null);
+  const underlayRef = useRef<HTMLDivElement>(null);
+  const gestures = useRowGestures(slideRef, underlayRef, {
+    swipeEnabled: !selecting,
+    onSwipe(direction: SwipeDirection) {
+      const { action } = swipes[direction];
+      handleAction(action);
+      // An action that leaves the row listed (archiving in All Mail) lets it
+      // slide back; otherwise it slides away as the list drops it.
+      return removesFromView(actions, action);
+    },
+    onLongPress() {
+      if (checkable) onToggle?.(thread.thread_id, false);
+    },
+  });
+  // The row slid away and then came back (the action failed, or was undone
+  // while still mounted): put it where it belongs.
+  useEffect(() => {
+    const slide = slideRef.current;
+    const underlay = underlayRef.current;
+    if (slide) slide.style.transform = "";
+    if (underlay) {
+      delete underlay.dataset.dir;
+      delete underlay.dataset.armed;
+    }
+  }, [thread]);
+  // On touch the checkbox takes up room only while selecting.
+  const showCheckbox = checkable && (!touch || selecting);
+  const LeftIcon = swipes.right.icon;
+  const RightIcon = swipes.left.icon;
+
   return (
-    <li>
+    <li data-thread-id={thread.thread_id}>
+      <div className="group relative overflow-hidden border-b border-border/60">
+        {/* What a swipe uncovers: the colour and icon of the action it will
+            take. Hidden until the row moves (the gesture sets data-dir), and
+            decorative: the same actions are in the reader and the bulk bar. */}
+        <div
+          ref={underlayRef}
+          aria-hidden
+          className={cn(
+            "group/swipe absolute inset-0 hidden items-center justify-between px-6 text-white data-[dir]:flex",
+            swipes.className,
+          )}
+        >
+          <LeftIcon className="size-5 transition-transform group-data-[armed=true]/swipe:scale-125 group-data-[dir=left]/swipe:invisible motion-reduce:transition-none" />
+          <RightIcon className="size-5 transition-transform group-data-[armed=true]/swipe:scale-125 group-data-[dir=right]/swipe:invisible motion-reduce:transition-none" />
+        </div>
       <div
+        ref={slideRef}
+        {...gestures}
         className={cn(
-          "group relative flex w-full border-b border-border/60",
-          checked && "bg-accent/50",
+          // Opaque, so it covers the underlay at rest. pan-y: the browser
+          // keeps vertical scrolling; sideways movement is ours. No text
+          // selection or callout on touch, or a long press starts those too.
+          "relative flex w-full bg-background [touch-action:pan-y] [@media(pointer:coarse)]:select-none [@media(pointer:coarse)]:[-webkit-touch-callout:none]",
         )}
       >
         {/* Selection checkbox — always in DOM, visible on hover or when any
@@ -230,7 +484,17 @@ function Row({
             this wrapper. */}
         {checkable && (
           <div
-            className="absolute top-1/2 left-0 z-10 flex size-11 -translate-y-1/2 items-center justify-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 data-[checked=true]:opacity-100 max-md:opacity-100"
+            className={
+              touch && !selecting
+                ? // Out of sight until selecting, but still there for a screen
+                  // reader, for which a long press is not a given.
+                  "sr-only"
+                : cn(
+                    "absolute top-1/2 left-0 z-10 flex size-11 -translate-y-1/2 items-center justify-center",
+                    !touch &&
+                      "opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 data-[checked=true]:opacity-100",
+                  )
+            }
             data-checked={checked}
             onClick={handleCheckboxClick}
           >
@@ -244,18 +508,18 @@ function Row({
 
         <button
           type="button"
-          onClick={() => onSelect(thread.thread_id)}
+          data-slot="thread-row"
+          // While selecting on touch, a tap adds or removes the row.
+          onClick={() => (touch && selecting && checkable ? onToggle?.(thread.thread_id, false) : onSelect(thread.thread_id))}
           aria-current={selected ? "true" : undefined}
           className={cn(
             // min-w-0 is essential: without it the flex item won't shrink below
             // its content width, so the truncate descendants overflow the pane.
-            "flex w-full min-w-0 flex-col gap-1 border-b-0 px-4 py-3.5 text-left transition-[padding,background-color] duration-150 md:py-3",
+            "flex w-full min-w-0 flex-col gap-1 border-b-0 px-4 py-3.5 text-left transition-colors duration-150 md:py-3",
             // Reserve the checkbox's 44px tap gutter so it never overlaps text.
-            checkable ? "pl-11" : "pl-4",
+            showCheckbox ? "pl-11" : "pl-4",
+            checked && !selected && "bg-accent/50",
             "outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            // Reserve room on the right (desktop) so the hover/focus action panel
-            // never overlaps the date, subject, or category chip.
-            "md:group-hover:pr-28 md:group-focus-within:pr-28",
             selected && "bg-accent shadow-[inset_3px_0_var(--primary)]",
           )}
         >
@@ -269,7 +533,7 @@ function Row({
               )}
             >
               {unread && <span className="sr-only">Unread. </span>}
-              {view !== "sent" && view !== "trash" && (
+              {view !== "sent" && view !== "trash" && view !== "spam" && (
                 <span
                   aria-hidden
                   className={cn(
@@ -290,7 +554,10 @@ function Row({
               )}
             </span>
             <span className="shrink-0 text-xs text-muted-foreground">
-              {formatDate(thread.date, now)}
+              {/* In Snoozed, when it comes back matters more than when it came. */}
+              {view === "snoozed" && thread.snoozedUntil
+                ? `Until ${formatSnoozeTime(thread.snoozedUntil, now)}`
+                : formatDate(thread.date, now)}
             </span>
           </div>
           <div
@@ -325,53 +592,35 @@ function Row({
           </div>
         </button>
 
-        {/* Hover/focus action buttons — right side */}
-        {/* Kept in the layout (not display:none) so keyboard focus-within can
-            reveal + reach these actions. Invisible + pointer-events-none until
-            hover/focus, so it doesn't swallow row clicks; opacity-0 elements stay
-            keyboard-focusable, which is what re-enables them on Tab. */}
-        <div className="absolute inset-y-0 right-0 z-10 flex items-center justify-end pr-2 pl-12 opacity-0 transition-opacity pointer-events-none bg-gradient-to-l from-accent from-65% to-transparent group-hover:opacity-100 group-focus-within:opacity-100 max-md:hidden">
-          {/* The panel itself stays pointer-events-none (its transparent fade
-              buffer must let row clicks through); only the buttons re-enable
-              pointer events, and only once revealed. */}
-          <div className="flex items-center gap-0.5 pointer-events-none group-hover:pointer-events-auto group-focus-within:pointer-events-auto">
-          {/* Interactive star */}
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            title={isStarred ? "Unstar" : "Star"}
-            aria-label={isStarred ? "Unstar" : "Star"}
-            onClick={(e) => {
-              e.stopPropagation();
-              handleAction(isStarred ? "unstar" : "star");
-            }}
-          >
-            <Star
-              className={cn(
-                "h-4 w-4",
-                isStarred
-                  ? "fill-yellow-400 text-yellow-400"
-                  : "text-muted-foreground",
-              )}
-            />
-          </Button>
-
-          {isTrash ? (
+        {/* Hover/focus action buttons: a small opaque panel laid OVER the right
+            edge of the row. The row's own layout never changes for it, so the
+            sender, subject and date stay exactly where they were (making room
+            for it instead squeezed all three every time the pointer passed).
+            Kept in the DOM (not display:none) so keyboard focus can reach the
+            buttons, which in turn reveals the panel; until then it is
+            invisible and lets clicks through to the row. It stays up while one
+            of its menus is open, when the pointer and focus are both elsewhere. */}
+        <div className="pointer-events-none absolute top-1/2 right-2 z-10 -translate-y-1/2 rounded-md border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 has-[[data-state=open]]:pointer-events-auto has-[[data-state=open]]:opacity-100 max-md:hidden">
+          <div className="flex items-center gap-0.5 [&_button]:size-7">
+          {isTrash || isJunk ? (
             <>
-              {/* Restore */}
+              {/* Back out of Trash or Junk, to wherever it was */}
               <Button
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                title="Restore"
-                aria-label="Restore"
+                title={isJunk ? "Not junk" : "Restore"}
+                aria-label={isJunk ? "Not junk" : "Restore"}
                 onClick={(e) => {
                   e.stopPropagation();
-                  handleAction("restore");
+                  handleAction(isJunk ? "unspam" : "restore");
                 }}
               >
-                <RotateCcw className="h-4 w-4 text-muted-foreground" />
+                {isJunk ? (
+                  <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+                ) : (
+                  <RotateCcw className="h-4 w-4 text-muted-foreground" />
+                )}
               </Button>
 
               {/* Delete forever — requires confirmation */}
@@ -400,13 +649,7 @@ function Row({
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
                     <AlertDialogAction
                       className="bg-destructive text-white hover:bg-destructive/90"
-                      onClick={() => {
-                        mutate({
-                          threadIds: [thread.thread_id],
-                          action: "delete",
-                        });
-                        toast("Deleted forever");
-                      }}
+                      onClick={() => handleAction("delete")}
                     >
                       Delete forever
                     </AlertDialogAction>
@@ -416,6 +659,22 @@ function Row({
             </>
           ) : (
             <>
+              {isSnoozed && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Unsnooze"
+                  aria-label="Unsnooze"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleAction("unsnooze", { undoUntil: thread.snoozedUntil });
+                  }}
+                >
+                  <AlarmClockOff className="h-4 w-4 text-muted-foreground" />
+                </Button>
+              )}
+
               {/* Archive */}
               <Button
                 type="button"
@@ -445,14 +704,87 @@ function Row({
               >
                 <Trash2 className="h-4 w-4 text-muted-foreground" />
               </Button>
+
+              {canSnooze && (
+                <SnoozeMenu onSnooze={(until) => handleAction("snooze", { until })}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    title="Snooze"
+                    aria-label="Snooze"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <AlarmClock className="h-4 w-4 text-muted-foreground" />
+                  </Button>
+                </SnoozeMenu>
+              )}
+
+              {/* The less frequent ones. Three buttons and this keep the
+                  panel narrow enough that most of the row stays readable (and
+                  clickable) under the pointer. */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    title="More actions"
+                    aria-label={`More actions for ${thread.subject || "(no subject)"}`}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <MoreHorizontal className="h-4 w-4 text-muted-foreground" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onSelect={() => handleAction(isStarred ? "unstar" : "star")}>
+                    <Star className={cn(isStarred && "fill-yellow-400 !text-yellow-400")} />
+                    {isStarred ? "Unstar" : "Star"}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => handleAction(unread ? "read" : "unread")}>
+                    {unread ? <MailCheck /> : <MailOpen />}
+                    {unread ? "Mark as read" : "Mark as unread"}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => handleAction("spam")}>
+                    <OctagonAlert /> Report junk
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </>
           )}
           </div>
         </div>
       </div>
+      </div>
     </li>
   );
 }
+
+interface SwipeAction {
+  action: MailAction;
+  icon: LucideIcon;
+}
+/**
+ * What a swipe does, by where the row is listed. The keys are the direction
+ * the row travels: right uncovers its left edge, left its right edge.
+ */
+const SWIPES: Record<"other" | "trash" | "spam", Record<SwipeDirection, SwipeAction> & { className: string }> = {
+  other: {
+    right: { action: "archive", icon: Archive },
+    left: { action: "trash", icon: Trash2 },
+    className: "data-[dir=right]:bg-emerald-600 data-[dir=left]:bg-red-600",
+  },
+  trash: {
+    right: { action: "restore", icon: RotateCcw },
+    left: { action: "restore", icon: RotateCcw },
+    className: "bg-sky-600",
+  },
+  spam: {
+    right: { action: "unspam", icon: ShieldCheck },
+    left: { action: "unspam", icon: ShieldCheck },
+    className: "bg-sky-600",
+  },
+};
 
 function ListSkeleton() {
   return (

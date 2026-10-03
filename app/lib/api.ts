@@ -27,7 +27,9 @@ import type {
   DraftFull,
   DraftPut,
   BodyImagesResponse,
+  BlockedResponse,
 } from "./types";
+import { sessionExpired } from "./session";
 
 /** Thrown on any non-2xx API response. */
 export class ApiError extends Error {
@@ -51,15 +53,51 @@ async function errorMessage(res: Response): Promise<string> {
   return res.statusText || `HTTP ${res.status}`;
 }
 
+/**
+ * Is this 401 "you are not signed in", as opposed to a route's own refusal?
+ *
+ * Two things say so. Cloudflare Access answering for itself, which is never
+ * our JSON error shape (HTML, or an empty body). And the Worker's auth gate,
+ * which is the one place it returns 401: `{ "error": "unauthorized" }`
+ * (src/index.ts, after verifyAccess). Any other JSON error with a 401 is some
+ * route's answer and surfaces as an ordinary ApiError.
+ */
+async function isAuthRejection(res: Response): Promise<boolean> {
+  try {
+    const data = (await res.clone().json()) as { error?: unknown } | null;
+    if (typeof data?.error !== "string") return true;
+    return data.error === "unauthorized";
+  } catch {
+    return true; // not JSON: not ours
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(url, { credentials: "same-origin", ...init });
+    res = await fetch(url, {
+      credentials: "same-origin",
+      // An expired Access session answers an API call with a redirect to its
+      // login page on another origin. Followed, that is a CORS failure
+      // indistinguishable from being offline; left unfollowed it is something
+      // we can recognise below.
+      redirect: "manual",
+      ...init,
+      // Marks the call as script-initiated, which makes Access answer 401
+      // instead of redirecting in the first place.
+      headers: { ...(init?.headers as Record<string, string> | undefined), "X-Requested-With": "XMLHttpRequest" },
+    });
   } catch (err) {
     // Network failure / abort: fetch() rejects with no Response. Surface a
     // typed ApiError (status 0) so callers handle it like any other API error.
     const detail = err instanceof Error && err.message ? err.message : "network error";
     throw new ApiError(0, `network error: ${detail}`);
+  }
+  if (res.type === "opaqueredirect" || (res.status === 401 && (await isAuthRejection(res)))) {
+    // The session is gone (the API itself never redirects). Offline errors
+    // never get here: fetch rejects for those, above.
+    sessionExpired();
+    throw new ApiError(401, "Session expired. Reload to sign in again.");
   }
   if (!res.ok) {
     throw new ApiError(res.status, await errorMessage(res));
@@ -75,16 +113,32 @@ function postJson<T>(url: string, body: unknown): Promise<T> {
   });
 }
 
-export interface ListThreadsArgs { view: View; q?: string; category?: string | null; domain?: string | null; }
+export interface ListThreadsArgs {
+  view: View;
+  q?: string;
+  category?: string | null;
+  domain?: string | null;
+  /** Page size (the Worker defaults to its maximum when absent). */
+  limit?: number;
+  /** `nextCursor` from the previous page. */
+  cursor?: string | null;
+}
 
-/** GET /api/messages?view=…[&q=…][&category=…][&domain=…] — server-collapsed thread list. */
-export function listThreads({ view, q, category, domain }: ListThreadsArgs): Promise<ThreadsResponse> {
+/** GET /api/messages?view=…[&q=…][&category=…][&domain=…][&limit=…][&cursor=…] — one page of the server-collapsed thread list. */
+export function listThreads({ view, q, category, domain, limit, cursor }: ListThreadsArgs): Promise<ThreadsResponse> {
   const params = new URLSearchParams({ view });
   const trimmed = q?.trim();
-  if (trimmed) params.set("q", trimmed);
-  // Category/domain narrow a plain view; both are ignored server-side while searching.
+  if (trimmed) {
+    params.set("q", trimmed);
+    // Minutes behind UTC, so before: and after: mean the user's days, not UTC's.
+    params.set("tz", String(new Date().getTimezoneOffset()));
+  }
+  // Category narrows a plain view only (search ignores it). The domain
+  // narrows both: a search stays inside the inbox being looked at.
   if (category && !trimmed) params.set("category", category);
-  if (domain && !trimmed) params.set("domain", domain);
+  if (domain) params.set("domain", domain);
+  if (limit) params.set("limit", String(limit));
+  if (cursor) params.set("cursor", cursor);
   return request<ThreadsResponse>(`/api/messages?${params.toString()}`);
 }
 
@@ -93,14 +147,47 @@ export function getCounts(): Promise<ViewCounts> {
   return request<ViewCounts>(`/api/counts`);
 }
 
-/** POST /api/threads/:id/mutate {action} — single-thread mutation. */
-export function mutateThread(threadId: string, action: MailAction): Promise<{ ok: true }> {
-  return postJson(`/api/threads/${encodeURIComponent(threadId)}/mutate`, { action });
+/**
+ * POST /api/threads/:id/mutate {action[, until]} — single-thread mutation.
+ * `until` (epoch ms) belongs to `snooze` and is required by it.
+ */
+export function mutateThread(threadId: string, action: MailAction, until?: number): Promise<{ ok: true }> {
+  return postJson(`/api/threads/${encodeURIComponent(threadId)}/mutate`, { action, until });
 }
 
-/** POST /api/messages/mutate {threadIds, action} — bulk mutation. */
-export function mutateThreads(threadIds: string[], action: MailAction): Promise<{ ok: true; count: number }> {
-  return postJson(`/api/messages/mutate`, { threadIds, action });
+/** Most thread ids the Worker takes in one bulk mutation. */
+const BULK_MAX = 200;
+
+/**
+ * POST /api/messages/mutate {threadIds, action} — bulk mutation. A selection
+ * larger than the Worker's per-request cap (possible once several pages are
+ * loaded and everything is selected) goes in consecutive requests.
+ *
+ * On failure the error carries `failedIds`: the threads from the failing
+ * request onward. Any before them were changed.
+ */
+export async function mutateThreads(
+  threadIds: string[],
+  action: MailAction,
+  until?: number,
+): Promise<{ ok: true; count: number }> {
+  let count = 0;
+  for (let i = 0; i < threadIds.length; i += BULK_MAX) {
+    try {
+      const r = await postJson<{ ok: true; count: number }>(`/api/messages/mutate`, {
+        threadIds: threadIds.slice(i, i + BULK_MAX),
+        action,
+        until,
+      });
+      count += r.count;
+    } catch (e) {
+      // Earlier requests went through: say which threads did NOT, so the
+      // caller undoes its optimistic change for those and no others.
+      if (e instanceof Error) (e as Error & { failedIds?: string[] }).failedIds = threadIds.slice(i);
+      throw e;
+    }
+  }
+  return { ok: true, count };
 }
 
 /** GET /api/messages/:id */
@@ -152,6 +239,25 @@ export function showMessageImages(id: string): Promise<BodyImagesResponse> {
 /** POST /api/senders/images — add sender address to the remote-images allowlist. */
 export function allowImagesFrom(address: string): Promise<{ ok: true }> {
   return postJson(`/api/senders/images`, { address });
+}
+
+/** GET /api/blocked — senders whose mail goes straight to Junk. */
+export function listBlocked(): Promise<BlockedResponse> {
+  return request<BlockedResponse>(`/api/blocked`);
+}
+
+/**
+ * POST /api/blocked — block an address, or a whole domain written
+ * "@example.com". Resolves to the entry as the Worker normalized it; a 400
+ * carries a message worth showing (not an address, one of our own domains).
+ */
+export function addBlocked(address: string): Promise<{ ok: true; address: string }> {
+  return postJson(`/api/blocked`, { address });
+}
+
+/** DELETE /api/blocked/:address */
+export function removeBlocked(address: string): Promise<{ ok: true }> {
+  return request(`/api/blocked/${encodeURIComponent(address)}`, { method: "DELETE" });
 }
 
 /** GET /api/me */
@@ -357,7 +463,41 @@ export function deleteDraft(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/drafts/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
-/** Pure URL builder for the binary attachment endpoint. */
-export function attachmentUrl(id: string, name: string): string {
-  return `/api/attachments/${encodeURIComponent(id)}/${encodeURIComponent(name)}`;
+/**
+ * Pure URL builder for the binary attachment endpoint. `partId` picks one MIME
+ * part when a message carries several files with the same name; without it the
+ * endpoint resolves by name alone.
+ */
+export function attachmentUrl(id: string, name: string, partId?: string): string {
+  const base = `/api/attachments/${encodeURIComponent(id)}/${encodeURIComponent(name)}`;
+  return partId ? `${base}?part=${encodeURIComponent(partId)}` : base;
 }
+
+/**
+ * Fetch one stored attachment as base64 (no data: prefix), for carrying a
+ * forwarded message's files into a new one.
+ */
+export async function getAttachmentBase64(id: string, name: string, partId?: string): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(attachmentUrl(id, name, partId), { credentials: "same-origin" });
+  } catch {
+    throw new ApiError(0, "network error");
+  }
+  if (!res.ok) throw new ApiError(res.status, `Could not fetch ${name}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  // Chunked: String.fromCharCode(...bytes) overflows the stack on a large file.
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+export type UnsubscribeResult =
+  | { ok: true; method: "one-click" | "mailto" }
+  | { ok: true; method: "open"; url: string };
+
+/** Act on a message's List-Unsubscribe header (see the Worker route). */
+export const unsubscribeFrom = (id: string) =>
+  request<UnsubscribeResult>(`/api/messages/${encodeURIComponent(id)}/unsubscribe`, { method: "POST" });

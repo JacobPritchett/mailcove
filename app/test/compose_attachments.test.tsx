@@ -18,6 +18,7 @@ vi.mock("../lib/api", () => ({
     Promise.resolve({ identities: [], defaultLocal: "hello", defaultDomain: "example.com" }),
   ),
   send: vi.fn(),
+  getContacts: vi.fn(() => Promise.resolve({ contacts: [] })),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
   getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
   putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),
@@ -32,7 +33,7 @@ vi.mock("sonner", () => ({
   Toaster: () => null,
 }));
 
-import { listThreads, getCounts, getMe, send } from "../lib/api";
+import { listThreads, getCounts, getMe, send, putDraft, putDraftAttachments } from "../lib/api";
 
 const THREADS_RESP: ThreadsResponse = { threads: [], unread: 0, user: "hello@example.com" };
 
@@ -121,5 +122,64 @@ describe("compose attachments", () => {
     await screen.findByRole("dialog");
 
     expect(screen.queryByText("first.pdf")).not.toBeInTheDocument();
+  });
+});
+
+describe("attachments survive a saved draft", () => {
+  it("saves a draft for a compose that holds only a file", async () => {
+    // Before, a staged file was not "content", so closing saved no draft - and
+    // with no draft row there was nowhere for the file to live.
+    renderApp();
+    fireEvent.click(screen.getAllByRole("button", { name: /compose/i })[0]);
+    await screen.findByRole("dialog");
+    attach("notes.txt");
+    await screen.findByText("notes.txt");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+
+    await waitFor(() => expect(putDraft).toHaveBeenCalled());
+    await waitFor(() => expect(putDraftAttachments).toHaveBeenCalled());
+    const [, sent] = vi.mocked(putDraftAttachments).mock.calls.at(-1)!;
+    expect(sent).toHaveLength(1);
+    expect(sent[0].name).toBe("notes.txt");
+  });
+
+  it("uploads the bytes to the same draft id as the row", async () => {
+    // An orphaned blob is one whose id no row points at.
+    renderApp();
+    fireEvent.click(screen.getAllByRole("button", { name: /compose/i })[0]);
+    await screen.findByRole("dialog");
+    attach("notes.txt");
+    await screen.findByText("notes.txt");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+
+    await waitFor(() => expect(putDraftAttachments).toHaveBeenCalled());
+    expect(vi.mocked(putDraftAttachments).mock.calls[0][0]).toBe(
+      vi.mocked(putDraft).mock.calls[0][0],
+    );
+  });
+
+  it("does not re-upload an unchanged set when only the body changes", async () => {
+    // The body autosaves every 1.5s. Re-sending 10MB of base64 each time - for
+    // a file the user has not touched - is the whole reason this is a separate
+    // endpoint.
+    renderApp();
+    fireEvent.click(screen.getAllByRole("button", { name: /compose/i })[0]);
+    await screen.findByRole("dialog");
+    attach("notes.txt");
+    await screen.findByText("notes.txt");
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "first" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+    await waitFor(() => expect(putDraftAttachments).toHaveBeenCalledTimes(1));
+
+    // Reopen, type more, close again: the row is written again, the bytes are not.
+    fireEvent.click(screen.getAllByRole("button", { name: /compose/i })[0]);
+    await screen.findByRole("dialog");
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "second" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+
+    await waitFor(() => expect(vi.mocked(putDraft).mock.calls.length).toBeGreaterThan(1));
+    expect(putDraftAttachments).toHaveBeenCalledTimes(1);
   });
 });

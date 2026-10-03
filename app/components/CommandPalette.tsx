@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Inbox, Keyboard, PenSquare, Search, Send, Star, Mails, Trash2, Globe, Filter } from "lucide-react";
+import { Inbox, Keyboard, PenSquare, Search, Send, Star, Mails, Trash2, Globe, Filter, OctagonAlert, AlarmClock } from "lucide-react";
 import {
   CommandDialog,
   CommandEmpty,
@@ -106,6 +106,10 @@ export default function CommandPalette({
             <Star />
             <span>Go to Starred</span>
           </CommandItem>
+          <CommandItem onSelect={() => run(() => onGoView("snoozed"))}>
+            <AlarmClock />
+            <span>Go to Snoozed</span>
+          </CommandItem>
           <CommandItem onSelect={() => run(() => onGoView("sent"))}>
             <Send />
             <span>Go to Sent</span>
@@ -113,6 +117,10 @@ export default function CommandPalette({
           <CommandItem onSelect={() => run(() => onGoView("all"))}>
             <Mails />
             <span>Go to All Mail</span>
+          </CommandItem>
+          <CommandItem onSelect={() => run(() => onGoView("spam"))}>
+            <OctagonAlert />
+            <span>Go to Junk</span>
           </CommandItem>
           <CommandItem onSelect={() => run(() => onGoView("trash"))}>
             <Trash2 />

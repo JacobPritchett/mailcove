@@ -3,9 +3,17 @@ import { Dialog as SheetPrimitive } from "radix-ui"
 import { XIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { BACK_LAYER, useModalBackLayer } from "@/lib/useBackClose"
 
-function Sheet({ ...props }: React.ComponentProps<typeof SheetPrimitive.Root>) {
-  return <SheetPrimitive.Root data-slot="sheet" {...props} />
+function Sheet({
+  open,
+  defaultOpen,
+  onOpenChange,
+  ...props
+}: React.ComponentProps<typeof SheetPrimitive.Root>) {
+  // Mobile Back closes this sheet (and only it) instead of leaving the app.
+  const layer = useModalBackLayer(open, defaultOpen, onOpenChange, BACK_LAYER.dialog)
+  return <SheetPrimitive.Root data-slot="sheet" {...props} {...layer} />
 }
 
 function SheetTrigger({

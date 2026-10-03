@@ -21,6 +21,8 @@ export function draftToComposeInitial(d: {
   threadId: string | null;
   inReplyTo: string | null;
   to: string;
+  cc?: string;
+  bcc?: string;
   subject: string;
   bodyText: string;
   bodyJson: string;
@@ -31,6 +33,8 @@ export function draftToComposeInitial(d: {
   return {
     draftId: d.id,
     to: d.to || undefined,
+    cc: d.cc || undefined,
+    bcc: d.bcc || undefined,
     subject: d.subject || undefined,
     text: d.bodyText || undefined,
     bodyJson: d.bodyJson || undefined,

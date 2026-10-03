@@ -139,6 +139,23 @@ self.addEventListener("fetch", (event) => {
 });
 
 // ---- Web Push (active once the client subscribes; see app/lib/push.ts) ----
+
+// The Worker clamps `tag` to this many UTF-8 bytes (MAX_PUSH_THREAD_ID_BYTES in
+// src/index.ts). A tag that long may be a cut-off id.
+const MAX_TAG_BYTES = 512;
+
+/**
+ * The thread a push payload is about. `threadId` when present. Otherwise the
+ * long-standing `tag`, which has always been the thread id too, unless it is
+ * long enough to have been clamped: a truncated id names no thread, and the
+ * Worker leaves `threadId` out for exactly that case.
+ */
+function threadIdOf(data) {
+  if (typeof data.threadId === "string" && data.threadId) return data.threadId;
+  if (typeof data.tag !== "string" || !data.tag) return "";
+  return new TextEncoder().encode(data.tag).length < MAX_TAG_BYTES ? data.tag : "";
+}
+
 self.addEventListener("push", (event) => {
   let data = {};
   try {
@@ -152,24 +169,31 @@ self.addEventListener("push", (event) => {
     icon: "/icon-192.png",
     badge: "/icon-192.png",
     tag: data.tag || "Mailcove-mail",
-    data: { url: data.url || "/" },
+    data: { threadId: threadIdOf(data) },
   };
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
+// Clicking a notification opens its thread. An already-open window is focused
+// and TOLD which thread to open (the app handles "open-thread"); it is never
+// navigated, because that reloads the app and throws away whatever is being
+// composed. Only when no window exists is one opened, at /?thread=<id>.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || "/";
+  const data = event.notification.data || {};
+  const threadId = typeof data.threadId === "string" ? data.threadId : "";
   event.waitUntil(
     (async () => {
       const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const c of all) {
         if ("focus" in c) {
-          c.navigate(target).catch(() => {});
+          if (threadId) c.postMessage({ type: "open-thread", threadId });
           return c.focus();
         }
       }
-      if (self.clients.openWindow) return self.clients.openWindow(target);
+      if (self.clients.openWindow) {
+        return self.clients.openWindow(threadId ? "/?thread=" + encodeURIComponent(threadId) : "/");
+      }
     })(),
   );
 });

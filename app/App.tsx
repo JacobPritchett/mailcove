@@ -1,8 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Menu, PenSquare, Search } from "lucide-react";
-import { toast } from "sonner";
-import { useQueryClient } from "@tanstack/react-query";
-import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -14,6 +11,7 @@ import {
 } from "@/components/ui/sheet";
 import Sidebar, { SidebarContent } from "@/components/Sidebar";
 import MessageList from "@/components/MessageList";
+import SearchField from "@/components/SearchField";
 import BulkActionBar from "@/components/BulkActionBar";
 import Reader from "@/components/Reader";
 import DraftsList from "@/components/DraftsList";
@@ -25,15 +23,18 @@ import ShortcutHelpDialog from "@/components/ShortcutHelpDialog";
 import DomainsDialog from "@/components/DomainsDialog";
 import FiltersDialog from "@/components/FiltersDialog";
 import { Toaster } from "@/components/ui/sonner";
-import { useThreads, useCounts, useMutateThreads, INVERSE_ACTION } from "@/lib/queries";
-import { actionLabel, isReversible } from "@/lib/actions";
+import { useThreads, useCounts } from "@/lib/queries";
+import { actionLabel, actionView } from "@/lib/actions";
+import { useThreadActions, type ActionOptions } from "@/lib/useThreadActions";
 import { useIsDesktop } from "@/lib/useMediaQuery";
-import { useBackClose } from "@/lib/useBackClose";
+import { useBackClose, BACK_LAYER } from "@/lib/useBackClose";
 import { useKeyboardScrollReset } from "@/lib/useKeyboardScrollReset";
+import { useUnreadBadge } from "@/lib/useUnreadBadge";
 import { CATEGORY_FILTERS } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 import type { MailAction, NavView, View, ViewCounts } from "@/lib/types";
+import type { ReplyMode } from "@/lib/conversation";
 
 const EMPTY_COUNTS: ViewCounts = {
   inbox: 0,
@@ -41,15 +42,19 @@ const EMPTY_COUNTS: ViewCounts = {
   sent: 0,
   all: 0,
   trash: 0,
+  spam: 0,
+  snoozed: 0,
   inboxUnread: 0,
 };
 
 const VIEW_TITLES: Record<NavView, string> = {
   inbox:   "Inbox",
   starred: "Starred",
+  snoozed: "Snoozed",
   drafts:  "Drafts",
   sent:    "Sent",
   all:     "All Mail",
+  spam:    "Junk",
   trash:   "Trash",
 };
 
@@ -65,7 +70,8 @@ export default function App() {
   // AI-label filter (null = All). Applies to plain views only — ignored while
   // searching (search is global FTS server-side).
   const [category, setCategory] = useState<string | null>(null);
-  // Identity-domain filter (null = all inboxes). Same plain-view scoping.
+  // Identity-domain filter (null = all inboxes). Unlike the category it also
+  // applies while searching.
   const [domainFilter, setDomainFilter] = useState<string | null>(null);
 
   // Multi-select state
@@ -109,10 +115,6 @@ export default function App() {
     setFiltersOpen(true);
   }
 
-  // Tracks the last reversible action dispatched via keyboard, so `z` can undo it.
-  const lastActionRef = useRef<{ threadIds: string[]; action: MailAction } | null>(null);
-
-  const qc = useQueryClient();
   useKeyboardScrollReset();
 
   function openCompose() {
@@ -150,12 +152,27 @@ export default function App() {
   // reset it; the dialog remains the escape hatch (expand button) for
   // recipient/subject edits.
   const [replyOpen, setReplyOpen] = useState(false);
+  // Who the open reply goes to. Reset to a plain reply whenever one is opened
+  // without saying otherwise, so reply all is always a deliberate choice.
+  const [replyMode, setReplyMode] = useState<ReplyMode>("reply");
+  // `r` and `a`: a request the reader carries out, since only it knows who the
+  // thread's default reply goes to (and whether a reply is already being written).
+  const [replyRequest, setReplyRequest] = useState<{ mode: ReplyMode; nonce: number }>({ mode: "reply", nonce: 0 });
+  const [forwardNonce, setForwardNonce] = useState(0);
+  // Same idea for `b`: the snooze menu belongs to the reader's toolbar.
+  const [snoozeNonce, setSnoozeNonce] = useState(0);
 
   // ANY thread change closes the inline composer — including j/k keyboard
   // navigation, which doesn't go through handleSelectThread.
   useEffect(() => {
     setReplyOpen(false);
+    setReplyMode("reply");
   }, [selectedThreadId]);
+  // A reply that has closed (sent, discarded) leaves nothing behind: the next
+  // one is a plain reply again unless it is asked for as reply all.
+  useEffect(() => {
+    if (!replyOpen) setReplyMode("reply");
+  }, [replyOpen]);
 
   // Belt-and-braces for the iOS keyboard scroll trap (see the hook): when a
   // composer closes, make sure the fixed shell is back at the top. The
@@ -178,6 +195,48 @@ export default function App() {
     setMobileView("reader");
   }
 
+  // Escape in the search box: clear a query first, and only leave the field
+  // once it is already empty (the reverse of `/`, which focuses it).
+  function onSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    if (search) setSearch("");
+    else e.currentTarget.blur();
+  }
+
+  // A thread can be opened from outside the app's own UI: a notification tap
+  // on an open window arrives as a service-worker message, and a cold start
+  // from one arrives as /?thread=<id> (see public/sw.js). Either way it is just
+  // a selection — nothing here navigates or reloads, so an open compose stays.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get("thread");
+    if (fromUrl) {
+      handleSelectThread(fromUrl);
+      // Strip it, or a later reload would reopen a thread the user has since
+      // left. replaceState: this must not add a Back entry.
+      params.delete("thread");
+      const rest = params.toString();
+      window.history.replaceState(
+        window.history.state,
+        "",
+        window.location.pathname + (rest ? `?${rest}` : "") + window.location.hash,
+      );
+    }
+    const sw = typeof navigator !== "undefined" ? navigator.serviceWorker : undefined;
+    if (!sw) return;
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: unknown; threadId?: unknown } | null;
+      if (data?.type === "open-thread" && typeof data.threadId === "string" && data.threadId) {
+        handleSelectThread(data.threadId);
+      }
+    };
+    sw.addEventListener("message", onMessage);
+    return () => sw.removeEventListener("message", onMessage);
+    // handleSelectThread only calls state setters; mount-only on purpose.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Debounce the search input (~250ms) before it drives the messages query.
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => {
@@ -190,9 +249,12 @@ export default function App() {
   // Category narrows plain views; while searching it's not applied (passed null).
   const searching = q.length > 0;
   const activeCategory = searching ? null : category;
-  const activeDomain = searching ? null : domainFilter;
+  // The domain filter stays on while searching (the Worker honours it there).
+  const activeDomain = domainFilter;
   const active = useThreads(threadView, q, activeCategory, activeDomain, !isDraftsView);
   const counts = useCounts();
+  // "(3) Inbox" in the tab, and the badge on the installed app's icon.
+  useUnreadBadge(counts.data?.inboxUnread);
 
   // If the filtered domain disappears from the counts (e.g. its last thread was
   // deleted, or the setup went back to single-domain and the switcher hides),
@@ -203,7 +265,11 @@ export default function App() {
       setDomainFilter(null);
     }
   }, [domainFilter, countDomains]);
-  const { mutate: bulkMutate } = useMutateThreads(threadView, q, activeCategory, activeDomain);
+  // Every thread action (keyboard, reader toolbar, list rows, bulk bar) goes
+  // through this one runner, so `z` undoes whichever came last.
+  const threadActions = useThreadActions(threadView, q, activeCategory, activeDomain);
+  // Which actions apply to what is listed: All Mail rules while searching.
+  const actionsView = actionView(threadView, q);
   const debouncePending = searching && q !== search.trim();
   let searchHint: string | null = null;
   if (searching) {
@@ -211,7 +277,12 @@ export default function App() {
       searchHint = "Searching…";
     } else if (active.data) {
       const n = active.data.threads.length;
-      searchHint = n === 0 ? "No matches" : `${n} result${n === 1 ? "" : "s"}`;
+      // More pages to come: the loaded count is a floor, not the total.
+      const count = `${n}${active.hasMore ? "+" : ""}`;
+      // Say so when the results are narrowed to one domain: a search that
+      // quietly leaves out the other inboxes looks like missing mail.
+      const where = activeDomain ? ` in ${activeDomain}` : "";
+      searchHint = n === 0 ? `No matches${where}` : `${count} result${n === 1 ? "" : "s"}${where}`;
     }
   }
 
@@ -224,12 +295,13 @@ export default function App() {
     clearSelection();
   }
 
-  // Clear multi-select whenever the debounced search query OR the category
-  // filter changes — selected threads may no longer be visible in the new set.
+  // Clear multi-select whenever the debounced search query, the category
+  // filter OR the domain filter changes — selected threads may no longer be
+  // visible in the new set, and the bulk bar would act on rows nobody can see.
   useEffect(() => {
     clearSelection();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, category]);
+  }, [q, category, domainFilter]);
 
   // Selection helpers for multi-select.
   function toggleSelect(id: string) {
@@ -258,62 +330,70 @@ export default function App() {
     setSelectedIds(new Set(threadOrder.slice(start, end + 1)));
   }
 
-  function handleBulkAction(action: MailAction) {
+  function handleBulkAction(action: MailAction, opts?: ActionOptions) {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
-    bulkMutate({ threadIds: ids, action });
     clearSelection();
-    const label = `${ids.length} ${actionLabel(action).toLowerCase()}`;
-    const inv = INVERSE_ACTION[action];
-    if (isReversible(action) && inv) {
-      toast(label, {
-        action: {
-          label: "Undo",
-          onClick: () => bulkMutate({ threadIds: ids, action: inv }),
-        },
-      });
-    } else {
-      toast(label);
-    }
+    threadActions.run(ids, action, {
+      ...opts,
+      undoUntil: action === "unsnooze" ? sharedSnoozeTime(ids) : undefined,
+      label: `${ids.length} ${actionLabel(action).toLowerCase()}`,
+    });
   }
 
   /**
-   * Execute a thread action via the bulk mutation, record it for undo,
-   * and show an undo toast when the action is reversible.
+   * The time these threads are snoozed until, when they all share one. Undoing
+   * an unsnooze has a single time to put back; with several it offers no Undo.
    */
-  function runThreadAction(threadIds: string[], action: MailAction) {
-    bulkMutate({ threadIds, action });
-    const inv = INVERSE_ACTION[action];
-    if (isReversible(action) && inv) {
-      lastActionRef.current = { threadIds, action };
-      toast(actionLabel(action), {
-        action: {
-          label: "Undo",
-          onClick: () => {
-            bulkMutate({ threadIds, action: inv });
-            lastActionRef.current = null;
-          },
-        },
-      });
-    } else {
-      lastActionRef.current = null;
-      toast(actionLabel(action));
-    }
+  function sharedSnoozeTime(ids: string[]): number | null {
+    const rows = active.data?.threads ?? [];
+    const times = new Set(ids.map((id) => rows.find((t) => t.thread_id === id)?.snoozedUntil ?? null));
+    const [only] = times;
+    return times.size === 1 ? (only ?? null) : null;
   }
 
-  // Ordered list of thread_ids for j/k navigation.
+  /**
+   * After a keyboard archive/trash: carry on to the next thread on desktop
+   * (the previous one when it was the last), so `j` continues from where the
+   * user was instead of jumping back to the top. On mobile there is one pane,
+   * and leaving it on a now-empty reader is a dead end, so go back to the list.
+   */
+  function leaveThread(id: string) {
+    if (!isDesktop) {
+      setSelectedThreadId(null);
+      setMobileView("list");
+      return;
+    }
+    const idx = threadOrder.indexOf(id);
+    setSelectedThreadId(idx === -1 ? null : (threadOrder[idx + 1] ?? threadOrder[idx - 1] ?? null));
+  }
+
+  // Ordered list of thread_ids for j/k navigation. Empty in Drafts: the
+  // threads query is disabled there but still holds the cached inbox, and the
+  // shortcuts would select and trash threads that are not on screen.
   const threadOrder = useMemo(
     () =>
-      active.data ? active.data.threads.map((t) => t.thread_id) : [],
-    [active.data],
+      active.data && !isDraftsView ? active.data.threads.map((t) => t.thread_id) : [],
+    [active.data, isDraftsView],
   );
 
-  // Central keyboard shortcut handler. Suppressed while any dialog is open.
+  // Central keyboard shortcut handler. Suppressed while any dialog is open
+  // (the hook also bails for keys typed inside ANY dialog, which covers the
+  // confirm dialogs and the mobile drawer that are not listed here).
   useKeyboardShortcuts(
     {
       onNext() {
         if (threadOrder.length === 0) return;
         const idx = selectedThreadId ? threadOrder.indexOf(selectedThreadId) : -1;
+        // On the last loaded row with more on the server: fetch the next page
+        // and step onto its first row, unless the selection moved meanwhile.
+        if (idx === threadOrder.length - 1 && active.hasMore) {
+          const from = selectedThreadId;
+          void active.fetchMore().then((added) => {
+            if (added.length > 0) setSelectedThreadId((cur) => (cur === from ? added[0].thread_id : cur));
+          });
+          return;
+        }
         const next = Math.min(idx + 1, threadOrder.length - 1);
         setSelectedThreadId(threadOrder[next < 0 ? 0 : next]);
         setMobileView("reader");
@@ -333,23 +413,34 @@ export default function App() {
         setMobileView("list");
       },
       onArchive() {
-        if (!selectedThreadId) return;
+        // Trash and Junk have nothing to archive (the Worker ignores it there).
+        if (!selectedThreadId || actionsView === "trash" || actionsView === "spam") return;
         const id = selectedThreadId;
-        setSelectedThreadId(null);
-        runThreadAction([id], "archive");
+        leaveThread(id);
+        threadActions.run([id], "archive");
       },
       onTrash() {
-        if (!selectedThreadId || view === "trash") return;
+        if (!selectedThreadId || actionsView === "trash") return;
         const id = selectedThreadId;
-        setSelectedThreadId(null);
-        runThreadAction([id], "trash");
+        leaveThread(id);
+        threadActions.run([id], "trash");
+      },
+      onSpam() {
+        // Nothing to report in Junk itself, and Trash offers Restore instead.
+        if (!selectedThreadId || actionsView === "trash" || actionsView === "spam") return;
+        const id = selectedThreadId;
+        leaveThread(id);
+        threadActions.run([id], "spam");
+      },
+      onSnooze() {
+        if (selectedThreadId) setSnoozeNonce((n) => n + 1);
       },
       onStar() {
         if (!selectedThreadId) return;
         const threads = active.data?.threads ?? [];
         const row = threads.find((t) => t.thread_id === selectedThreadId);
         const action: MailAction = row?.starred === 1 ? "unstar" : "star";
-        runThreadAction([selectedThreadId], action);
+        threadActions.run([selectedThreadId], action);
       },
       onSelect() {
         if (selectedThreadId) toggleSelect(selectedThreadId);
@@ -362,7 +453,13 @@ export default function App() {
       },
       onReply() {
         // `r` opens the INLINE reply at the bottom of the open thread.
-        if (selectedThreadId) setReplyOpen(true);
+        if (selectedThreadId) setReplyRequest((r) => ({ mode: "reply", nonce: r.nonce + 1 }));
+      },
+      onReplyAll() {
+        if (selectedThreadId) setReplyRequest((r) => ({ mode: "reply-all", nonce: r.nonce + 1 }));
+      },
+      onForward() {
+        if (selectedThreadId) setForwardNonce((n) => n + 1);
       },
       onCompose() {
         openCompose();
@@ -371,12 +468,7 @@ export default function App() {
         focusSearch();
       },
       onUndo() {
-        const last = lastActionRef.current;
-        if (!last) return;
-        const inv = INVERSE_ACTION[last.action];
-        if (!inv) return;
-        bulkMutate({ threadIds: last.threadIds, action: inv });
-        lastActionRef.current = null;
+        threadActions.undoLast();
       },
       onHelp() {
         setHelpOpen(true);
@@ -404,10 +496,14 @@ export default function App() {
   const mobileShowingReader = !isDesktop && mobileView === "reader";
 
   // Hardware/browser Back closes mobile overlays instead of leaving the app.
-  // Drawer: Back closes the drawer. Reader: Back returns to the list. Both are
-  // no-ops on desktop (enabled gated by !isDesktop), so desktop nav is intact.
-  useBackClose(drawerOpen, () => setDrawerOpen(false), !isDesktop);
-  useBackClose(mobileShowingReader, () => setMobileView("list"), !isDesktop);
+  // Reader: Back returns to the list. A no-op on desktop (enabled is gated by
+  // !isDesktop), so desktop nav is intact. The drawer and every dialog register
+  // themselves (see the ui Dialog/Sheet/AlertDialog wrappers) at a higher
+  // priority, so Back always closes what is on top of the reader first.
+  useBackClose(mobileShowingReader, () => setMobileView("list"), !isDesktop, BACK_LAYER.pane);
+  // Selection mode on a phone is a state the user entered (a long press) and
+  // expects Back to leave, like any other.
+  useBackClose(!mobileShowingReader && selectedIds.size > 0, clearSelection, !isDesktop, BACK_LAYER.pane);
 
   // Crossing to desktop (resize/rotate): close the drawer so a Sheet can't
   // linger over the three-pane desktop layout.
@@ -466,7 +562,9 @@ export default function App() {
           Mobile: full width; hidden when the reader is showing. */}
       <section
         className={cn(
-          "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border-r md:w-80 md:flex-none md:shrink-0",
+          // min-h-0 for the same reason as the reader column: without it this
+          // grows to its content height and the list's ScrollArea never scrolls.
+          "flex min-w-0 flex-1 flex-col border-r md:w-80 md:flex-none md:shrink-0",
           mobileShowingReader && "hidden md:flex",
         )}
       >
@@ -474,7 +572,20 @@ export default function App() {
             Rendered only on mobile while the list view is active, so the DOM
             mirrors what's on screen (the desktop layout uses CSS classes; mobile
             view selection is JS-driven). pt safe-area for the notch. */}
-        {!isDesktop && !mobileShowingReader && (
+        {/* While threads are selected on a phone, the selection's own bar takes
+            the app bar's place: its actions, and the way out of selecting. */}
+        {!isDesktop && !mobileShowingReader && selectedIds.size > 0 && (
+          <div className="bg-accent/30 pt-[env(safe-area-inset-top)] md:hidden">
+            <BulkActionBar
+              count={selectedIds.size}
+              view={actionsView}
+              onClear={clearSelection}
+              onAction={handleBulkAction}
+              className="min-h-14 bg-transparent"
+            />
+          </div>
+        )}
+        {!isDesktop && !mobileShowingReader && selectedIds.size === 0 && (
           <div className="flex flex-col border-b pt-[env(safe-area-inset-top)] md:hidden">
             <div className="flex h-14 items-center gap-1 px-2">
               <Button
@@ -513,18 +624,15 @@ export default function App() {
             </div>
             {mobileSearchOpen && (
               <div className="px-2 pb-2">
-                <div className="relative">
-                  <Search className="pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    ref={searchRef}
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Search all mail…"
-                    aria-label="Search messages input"
-                    autoFocus
-                    className="h-11 pl-8"
-                  />
-                </div>
+                <SearchField
+                  inputRef={searchRef}
+                  value={search}
+                  onChange={setSearch}
+                  onKeyDown={onSearchKeyDown}
+                  label="Search messages input"
+                  autoFocus
+                  inputClassName="h-11"
+                />
               </div>
             )}
           </div>
@@ -532,15 +640,14 @@ export default function App() {
 
         {/* Desktop search bar. */}
         <div className="hidden h-14 items-center gap-2 px-4 md:flex">
-          <div className="relative flex-1">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              ref={isDesktop ? searchRef : undefined}
+          <div className="flex-1">
+            <SearchField
+              inputRef={isDesktop ? searchRef : undefined}
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search all mail…"
-              aria-label="Search messages"
-              className="h-9 pl-8"
+              onChange={setSearch}
+              onKeyDown={onSearchKeyDown}
+              label="Search messages"
+              inputClassName="h-9"
             />
           </div>
         </div>
@@ -553,10 +660,10 @@ export default function App() {
           </p>
         )}
         <Separator className="hidden md:block" />
-        {selectedIds.size > 0 && (
+        {isDesktop && selectedIds.size > 0 && (
           <BulkActionBar
             count={selectedIds.size}
-            view={threadView}
+            view={actionsView}
             onClear={clearSelection}
             onAction={handleBulkAction}
           />
@@ -609,6 +716,7 @@ export default function App() {
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}
           onSelectRange={selectRange}
+          onAction={threadActions.run}
           onCompose={openCompose}
           onClearSearch={() => setSearch("")}
         />
@@ -620,39 +728,12 @@ export default function App() {
           Mobile: full-screen; hidden unless mobileView === "reader". */}
       <div
         className={cn(
-          "min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+          // min-h-0: without it this column grows to its content height and the
+          // reader's internal ScrollArea never becomes the scroller.
+          "min-w-0 flex-1 flex-col",
           mobileShowingReader ? "flex" : "hidden md:flex",
         )}
       >
-        {/* Mobile reader app bar with a back arrow. Rendered only while the
-            reader view is active on mobile. */}
-        {mobileShowingReader && (
-          <div className="flex h-14 items-center gap-1 border-b px-2 pt-[env(safe-area-inset-top)] md:hidden">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-11"
-              onClick={() => setMobileView("list")}
-              aria-label="Back to list"
-            >
-              <ArrowLeft className="h-5 w-5" />
-            </Button>
-            <span className="flex-1 truncate text-base font-semibold">
-              {viewTitle}
-            </span>
-            <Button
-              type="button"
-              size="icon"
-              className="size-11"
-              onClick={openCompose}
-              aria-label="Compose"
-            >
-              <PenSquare className="h-5 w-5" />
-            </Button>
-          </div>
-        )}
-
         {/* Desktop top bar — command palette + compose. */}
         <div className="hidden h-14 items-center justify-end gap-2 px-4 md:flex">
           <Button
@@ -678,30 +759,69 @@ export default function App() {
         <Separator className="hidden md:block" />
         <Reader
           threadId={selectedThreadId}
-          view={threadView}
+          view={actionsView}
           replyOpen={replyOpen}
           onReplyOpenChange={setReplyOpen}
+          replyMode={replyMode}
+          onReplyRequest={(mode) => {
+            setReplyMode(mode);
+            setReplyOpen(true);
+          }}
+          replyRequest={replyRequest}
+          forwardNonce={forwardNonce}
+          snoozeNonce={snoozeNonce}
+          // Phone: the reader draws its own top bar, Back at one end and
+          // Compose at the other, with the thread's actions between them.
+          mobileChrome={
+            mobileShowingReader
+              ? {
+                  leading: (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-11"
+                      onClick={() => setMobileView("list")}
+                      aria-label="Back to list"
+                    >
+                      <ArrowLeft className="h-5 w-5" />
+                    </Button>
+                  ),
+                  trailing: (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      // The narrowest phones have room for the actions or for
+                      // this, not both; compose is one Back away on those.
+                      className="size-11 max-[340px]:hidden"
+                      onClick={openCompose}
+                      aria-label="Compose"
+                    >
+                      <PenSquare className="h-5 w-5" />
+                    </Button>
+                  ),
+                }
+              : undefined
+          }
           onOpenCompose={openComposeWith}
-          onAction={(action) => {
+          onAction={(action, opts) => {
             if (!selectedThreadId) return;
             const id = selectedThreadId;
-            const inv = INVERSE_ACTION[action];
-            bulkMutate({ threadIds: [id], action });
+            // Snoozing is triage, usually from the keyboard (`b`): carry on to
+            // the next thread, as the keyboard archive does.
+            if (action === "snooze" || action === "unsnooze") {
+              const undoUntil = action === "unsnooze" ? (opts?.undoUntil ?? sharedSnoozeTime([id])) : undefined;
+              leaveThread(id);
+              threadActions.run([id], action, { ...opts, undoUntil });
+              return;
+            }
+            threadActions.run([id], action, opts);
             // Navigate away from the thread for destructive/move actions
-            const navigatesAway = ["archive", "unarchive", "trash", "restore", "delete"].includes(action);
+            const navigatesAway = ["archive", "unarchive", "trash", "restore", "delete", "spam", "unspam"].includes(action);
             if (navigatesAway) {
               setSelectedThreadId(null);
               setMobileView("list");
-            }
-            if (isReversible(action) && inv) {
-              toast(actionLabel(action), {
-                action: {
-                  label: "Undo",
-                  onClick: () => bulkMutate({ threadIds: [id], action: inv }),
-                },
-              });
-            } else {
-              toast(actionLabel(action));
             }
           }}
         />

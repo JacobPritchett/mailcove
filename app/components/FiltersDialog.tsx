@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Filter as FilterIcon, Plus, Trash2, Archive, Star, MailOpen, Trash } from "lucide-react";
+import { useId, useState } from "react";
+import { Ban, Filter as FilterIcon, Plus, Trash2, Archive, Star, MailOpen, Trash } from "lucide-react";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -12,7 +12,9 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useFilters, useFilterMutations } from "@/lib/queries";
+import { useFilters, useFilterMutations, useBlocked, useBlockedMutations } from "@/lib/queries";
+import { ApiError } from "@/lib/api";
+import { asSentence } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import {
   FILTER_FIELDS,
@@ -144,6 +146,112 @@ function AddRule() {
 }
 
 /**
+ * Blocked senders: mail from these goes straight to Junk. An entry is an
+ * address, or a whole domain written "@example.com". The Worker is the judge
+ * of what is valid (and refuses our own domains), so its message is shown
+ * under the field rather than second-guessed here.
+ */
+function BlockedSenders({ enabled }: { enabled: boolean }) {
+  const { data, isPending, isError } = useBlocked(enabled);
+  const { add, remove } = useBlockedMutations();
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const errorId = useId();
+  const headingId = useId();
+  const blocked = data?.blocked ?? [];
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const address = value.trim();
+    if (!address) return;
+    setError(null);
+    add.mutate(address, {
+      onSuccess: () => setValue(""),
+      onError: (err) =>
+        setError(
+          err instanceof ApiError && err.status === 400 && err.message
+            ? asSentence(err.message)
+            : "Couldn't block that sender. Try again.",
+        ),
+    });
+  }
+
+  return (
+    <section aria-labelledby={headingId} className="space-y-3">
+      <div>
+        <h3 id={headingId} className="flex items-center gap-2 text-sm font-semibold">
+          <Ban className="h-4 w-4" /> Blocked senders
+        </h3>
+        <p className="text-sm text-muted-foreground">
+          New mail from these senders goes straight to Junk.
+        </p>
+      </div>
+      <form onSubmit={submit} className="rounded-md border border-dashed p-3">
+        <div className="flex items-center gap-2">
+          <Input
+            value={value}
+            onChange={(e) => {
+              setValue(e.target.value);
+              setError(null);
+            }}
+            placeholder="name@example.com or @example.com"
+            aria-label="Address or domain to block"
+            aria-invalid={error ? true : undefined}
+            aria-describedby={error ? errorId : undefined}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            className="h-9 min-w-0 flex-1 max-md:h-11"
+          />
+          <Button
+            type="submit"
+            size="sm"
+            disabled={add.isPending || !value.trim()}
+            className="h-9 gap-1.5 max-md:h-11"
+          >
+            <Plus className="h-4 w-4" /> Block
+          </Button>
+        </div>
+        {error && (
+          <p id={errorId} role="alert" className="mt-2 text-xs text-destructive">
+            {error}
+          </p>
+        )}
+      </form>
+      {isPending && <p className="text-sm text-muted-foreground">Loading blocked senders…</p>}
+      {isError && <p className="text-sm text-muted-foreground">Couldn't load blocked senders.</p>}
+      {!isPending && !isError && blocked.length === 0 && (
+        <p className="text-sm text-muted-foreground">Nobody is blocked.</p>
+      )}
+      {blocked.length > 0 && (
+        <ul className="space-y-2">
+          {blocked.map((b) => (
+            <li key={b.address} className="flex items-center gap-3 rounded-md border py-1 pr-1 pl-3 text-sm">
+              <span className="min-w-0 flex-1 truncate" title={b.address}>
+                {b.address.startsWith("@") ? `Everyone at ${b.address.slice(1)}` : b.address}
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  remove.mutate(b.address, {
+                    onSuccess: () => toast(`Unblocked ${b.address}`),
+                    onError: () => toast.error(`Couldn't unblock ${b.address}`),
+                  })
+                }
+                aria-label={`Unblock ${b.address}`}
+                className="flex size-9 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive max-md:size-11"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+/**
  * Inbox rules manager: create simple "if a field matches, do an action" rules
  * that apply to new mail as it arrives.
  */
@@ -168,7 +276,7 @@ export default function FiltersDialog({ open, onOpenChange }: FiltersDialogProps
           {isPending && <p className="text-sm text-muted-foreground">Loading rules…</p>}
           {isError && <p className="text-sm text-muted-foreground">Couldn't load rules.</p>}
           {!isPending && !isError && filters.length === 0 && (
-            <p className="text-sm text-muted-foreground">No rules yet — add one above.</p>
+            <p className="text-sm text-muted-foreground">No rules yet. Add one above.</p>
           )}
           {filters.length > 0 && (
             <ul className="space-y-2">
@@ -177,6 +285,8 @@ export default function FiltersDialog({ open, onOpenChange }: FiltersDialogProps
               ))}
             </ul>
           )}
+          <Separator />
+          <BlockedSenders enabled={open} />
         </div>
 
         <Separator />

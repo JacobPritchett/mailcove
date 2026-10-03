@@ -6,6 +6,7 @@ import ComposeDialog, { type ComposeInitial } from "../components/ComposeDialog"
 vi.mock("../lib/api", () => ({
   ApiError: class ApiError extends Error {},
   send: vi.fn(),
+  getContacts: vi.fn(() => Promise.resolve({ contacts: [] })),
   putDraft: vi.fn(() => Promise.resolve({ ok: true })),
   getDraftAttachments: vi.fn(() => Promise.resolve({ attachments: [] })),
   putDraftAttachments: vi.fn(() => Promise.resolve({ ok: true })),
@@ -73,6 +74,21 @@ describe("Compose From identity picker", () => {
     expect(select).toHaveValue("example.com");
     await fillAndSend();
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ from: "hello@example.com" }));
+  });
+
+  it("drops the prefilled local part along with a domain that can't send", async () => {
+    // Mail to sales@cant-send.net: the reply cannot leave as sales@example.net.
+    renderDialog({ fromDomain: "cant-send.net", fromLocal: "sales" });
+    await waitFor(() => expect(screen.getByLabelText("From local part")).toHaveValue("hello"));
+    await fillAndSend();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ from: "hello@example.net" }));
+  });
+
+  it("keeps the prefilled local part on a domain that can send", async () => {
+    renderDialog({ fromDomain: "example.com", fromLocal: "sales" });
+    await screen.findByLabelText("From domain");
+    await fillAndSend();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ from: "sales@example.com" }));
   });
 
   it("ignores a reply-context domain that can't send", async () => {

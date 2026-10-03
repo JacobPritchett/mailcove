@@ -63,15 +63,18 @@ beforeEach(() => {
   document.documentElement.classList.remove("dark");
 });
 
-describe("Reader Rich/Chat toggle", () => {
-  it("has a Chat toggle control", async () => {
-    renderReader();
-    expect(await screen.findByRole("button", { name: /chat/i })).toBeInTheDocument();
-  });
+/** The reading mode lives in the toolbar's More menu; open it and pick one. */
+async function pickMode(name: "Rich" | "Chat") {
+  fireEvent.keyDown(await screen.findByRole("button", { name: "More actions" }), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("menuitemradio", { name }));
+}
 
-  it("has a Rich toggle control", async () => {
+describe("Reader Rich/Chat toggle", () => {
+  it("offers Rich and Chat under More, with the current one checked", async () => {
     renderReader();
-    expect(await screen.findByRole("button", { name: /rich/i })).toBeInTheDocument();
+    fireEvent.keyDown(await screen.findByRole("button", { name: "More actions" }), { key: "Enter" });
+    expect(await screen.findByRole("menuitemradio", { name: "Rich" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemradio", { name: "Chat" })).toHaveAttribute("aria-checked", "false");
   });
 
   it("defaults to rich mode — iframe or pre present, no chat bubble text in its place", async () => {
@@ -89,8 +92,7 @@ describe("Reader Rich/Chat toggle", () => {
     // Wait for rich mode to render
     await screen.findByText(/hello mode switch/i);
 
-    const chatBtn = screen.getByRole("button", { name: /chat/i });
-    fireEvent.click(chatBtn);
+    await pickMode("Chat");
 
     // After switching: the <pre>/<iframe> should be gone, text still present via SafeBlocks
     await waitFor(() => {
@@ -105,7 +107,7 @@ describe("Reader Rich/Chat toggle", () => {
   it("clicking Chat sets localStorage key reader.viewMode to 'chat'", async () => {
     renderReader();
     await screen.findByText(/hello mode switch/i);
-    fireEvent.click(screen.getByRole("button", { name: /chat/i }));
+    await pickMode("Chat");
     await waitFor(() => {
       expect(localStorage.getItem("reader.viewMode")).toBe("chat");
     });
@@ -116,11 +118,11 @@ describe("Reader Rich/Chat toggle", () => {
     await screen.findByText(/hello mode switch/i);
 
     // Switch to chat
-    fireEvent.click(screen.getByRole("button", { name: /chat/i }));
+    await pickMode("Chat");
     await waitFor(() => expect(localStorage.getItem("reader.viewMode")).toBe("chat"));
 
     // Switch back to rich
-    fireEvent.click(screen.getByRole("button", { name: /rich/i }));
+    await pickMode("Rich");
     await waitFor(() => {
       const pres = document.querySelectorAll("pre");
       const iframes = document.querySelectorAll("iframe");
@@ -135,7 +137,7 @@ describe("Reader Rich/Chat toggle", () => {
     expect(screen.getByRole("heading", { name: /Mode test subject/i })).toBeInTheDocument();
 
     // Switch to chat
-    fireEvent.click(screen.getByRole("button", { name: /chat/i }));
+    await pickMode("Chat");
     await waitFor(() => expect(localStorage.getItem("reader.viewMode")).toBe("chat"));
 
     // Subject still visible

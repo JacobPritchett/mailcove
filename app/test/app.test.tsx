@@ -90,42 +90,25 @@ describe("<App/> mail layout", () => {
     expect(screen.getByText("Sent")).toBeInTheDocument();
   });
 
+  it("puts the inbox's unread count in the tab title", async () => {
+    document.title = "Mailcove";
+    const { unmount } = renderApp();
+    await waitFor(() => expect(document.title).toBe("(1) Inbox"));
+    unmount();
+    expect(document.title).toBe("Mailcove");
+  });
+
   it("shows a message row from the mocked list", async () => {
     renderApp();
     expect(await screen.findByText("Hello from Alice")).toBeInTheDocument();
   });
 
-  it("opens the reading pane header when a row is selected", async () => {
-    renderApp();
-    const row = await screen.findByText("Hello from Alice");
-    fireEvent.click(row);
-
-    // Reader header renders subject (h1) + From metadata.
-    await waitFor(() =>
-      expect(
-        screen.getByRole("heading", { name: "Hello from Alice" }),
-      ).toBeInTheDocument(),
-    );
-    // The header shows the sender's NAME plus their address as separate text;
-    // the raw "Name <addr>" form is detail behind the disclosure. Scoped to the
-    // reading pane because the list row renders the same name.
-    const reader = within(screen.getByRole("main"));
-    expect(reader.getByText("Alice")).toBeInTheDocument();
-    expect(reader.getByText("alice@example.com")).toBeInTheDocument();
-    expect(reader.queryByText("Alice <alice@example.com>")).not.toBeInTheDocument();
-
-    // ...and the full addresses are still one click away, so nothing that was
-    // readable before became unreachable.
-    fireEvent.click(reader.getByRole("button", { expanded: false, name: /^to / }));
-    expect(await reader.findByText("Alice <alice@example.com>")).toBeInTheDocument();
-
-    expect(getThread).toHaveBeenCalledWith("t1");
-  });
-
   it("keeps the real sender address on screen when the display name fakes one", async () => {
-    // The server re-serializes the display name verbatim as `${name} <${addr}>`,
-    // so a name that already contains an address would otherwise render
-    // byte-identically to real mail from that address.
+    // postal-mime hands back the display name verbatim and the server
+    // re-serializes it as `${name} <${address}>`, so
+    //   From: "Legit Corp <billing@legit.com>" <evil@attacker.example>
+    // yields a NAME that already contains a plausible address. Showing the name
+    // alone would render this byte-identically to real mail from Legit Corp.
     vi.mocked(getThread).mockResolvedValue({
       ...THREAD,
       messages: [
@@ -145,6 +128,32 @@ describe("<App/> mail layout", () => {
 
     const reader = within(screen.getByRole("main"));
     expect(reader.getByText("evil@attacker.example")).toBeInTheDocument();
+  });
+
+  it("opens the reading pane header when a row is selected", async () => {
+    renderApp();
+    const row = await screen.findByText("Hello from Alice");
+    fireEvent.click(row);
+
+    // Reader header renders subject (h1) + From metadata.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Hello from Alice" }),
+      ).toBeInTheDocument(),
+    );
+    // The header shows the sender's NAME; the raw "Name <addr>" form is detail
+    // behind the disclosure, not the everyday reading need. Scoped to the
+    // reading pane because the list row renders the same name.
+    const reader = within(screen.getByRole("main"));
+    expect(reader.getByText("Alice")).toBeInTheDocument();
+    expect(reader.queryByText("Alice <alice@example.com>")).not.toBeInTheDocument();
+
+    // ...and the full addresses are still one click away, so nothing that was
+    // readable before became unreachable.
+    fireEvent.click(reader.getByRole("button", { expanded: false, name: /^to / }));
+    expect(await reader.findByText("Alice <alice@example.com>")).toBeInTheDocument();
+
+    expect(getThread).toHaveBeenCalledWith("t1");
   });
 });
 

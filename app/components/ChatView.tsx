@@ -71,6 +71,44 @@ function CollapsibleSection({
 }
 
 // ---------------------------------------------------------------------------
+// AttachmentChips — download links, keyed and addressed by MIME part
+// ---------------------------------------------------------------------------
+
+function AttachmentChips({ msg, className }: { msg: ThreadMessage; className?: string }) {
+  if (msg.body.attachments.length === 0) return null;
+  return (
+    <div className={cn("flex flex-wrap gap-2", className)}>
+      {msg.body.attachments.map((a, i) =>
+        a.stored === false ? (
+          // The bytes were never written, so a link would just 404. Same
+          // treatment as the rich view.
+          <span
+            key={a.partId ?? i}
+            title="This file was not stored with the message"
+            className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-3 py-1.5 text-sm text-muted-foreground"
+          >
+            <Paperclip className="h-3.5 w-3.5" />
+            {a.name}
+            <span className="text-xs">(not stored)</span>
+          </span>
+        ) : (
+          <a
+            key={a.partId ?? i}
+            href={attachmentUrl(msg.id, a.name, a.partId)}
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm text-foreground no-underline transition-colors hover:bg-accent"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <Paperclip className="h-3.5 w-3.5" />
+            {a.name}
+          </a>
+        ),
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // MessageBubble — one message in the chat view
 // ---------------------------------------------------------------------------
 
@@ -82,7 +120,9 @@ function MessageBubble({
   single: boolean;
 }) {
   const n = useMemo(
-    () => normalizeMessage({ text: msg.body.text, html: msg.body.html }),
+    // Text the Worker derived from an HTML-only message has no links, quotes
+    // or signature markers left in it, so let the HTML path do the work.
+    () => normalizeMessage({ text: msg.body.textDerived ? "" : msg.body.text, html: msg.body.html }),
     // Re-normalize if the body content changes (e.g. a refetch corrects it),
     // not just on a different message id.
     [msg.body.text, msg.body.html],
@@ -114,23 +154,7 @@ function MessageBubble({
           {n.signature && <CollapsibleSection label="signature" blocks={n.signature} />}
         </div>
 
-        {/* Attachments */}
-        {msg.body.attachments.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {msg.body.attachments.map((a, ai) => (
-              <a
-                key={`${ai}-${a.name}`}
-                href={attachmentUrl(msg.id, a.name)}
-                className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm text-foreground no-underline transition-colors hover:bg-accent"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <Paperclip className="h-3.5 w-3.5" />
-                {a.name}
-              </a>
-            ))}
-          </div>
-        )}
+        <AttachmentChips msg={msg} className="mt-3" />
       </div>
     );
   }
@@ -171,23 +195,7 @@ function MessageBubble({
         {n.signature && <CollapsibleSection label="signature" blocks={n.signature} />}
       </div>
 
-      {/* Attachments */}
-      {msg.body.attachments.length > 0 && (
-        <div className="mt-1 flex flex-wrap gap-2">
-          {msg.body.attachments.map((a, ai) => (
-            <a
-              key={`${ai}-${a.name}`}
-              href={attachmentUrl(msg.id, a.name)}
-              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm text-foreground no-underline transition-colors hover:bg-accent"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              <Paperclip className="h-3.5 w-3.5" />
-              {a.name}
-            </a>
-          ))}
-        </div>
-      )}
+      <AttachmentChips msg={msg} className="mt-1" />
     </div>
   );
 }

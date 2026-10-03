@@ -11,6 +11,17 @@ describe("MessageImageBanner", () => {
     await waitFor(() => expect(onShow).toHaveBeenCalled());
   });
 
+  it("names the sender in full on the Always button, which wraps rather than cutting it off", async () => {
+    const onAlways = vi.fn();
+    const sender = "newsletter-of-considerable-length@updates.weeklybyte.example";
+    render(<MessageImageBanner count={1} sender={sender} onShow={vi.fn()} onAlways={onAlways} />);
+    const button = screen.getByRole("button", { name: `Always show from ${sender}` });
+    expect(button.className).toContain("whitespace-normal");
+    expect(button.innerHTML).not.toContain("truncate");
+    fireEvent.click(button);
+    expect(onAlways).toHaveBeenCalled();
+  });
+
   it("does not render when count is 0", () => {
     const { container } = render(<MessageImageBanner count={0} sender="a@b.com" onShow={vi.fn()} onAlways={vi.fn()} />);
     expect(container).toBeEmptyDOMElement();

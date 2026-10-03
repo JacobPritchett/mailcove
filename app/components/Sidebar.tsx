@@ -1,4 +1,4 @@
-import { Inbox, Star, Send, Mails, Trash2, Globe, Download, Bell, BellRing, Filter, AtSign, FileText } from "lucide-react";
+import { Inbox, Star, Send, Mails, Trash2, Globe, Download, Bell, BellRing, Filter, AtSign, FileText, OctagonAlert, AlarmClock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
@@ -11,11 +11,20 @@ import type { NavView, ViewCounts } from "@/lib/types";
 const NAV: { id: NavView; label: string; icon: typeof Inbox }[] = [
   { id: "inbox",   label: "Inbox",    icon: Inbox },
   { id: "starred", label: "Starred",  icon: Star },
+  { id: "snoozed", label: "Snoozed",  icon: AlarmClock },
   { id: "drafts",  label: "Drafts",   icon: FileText },
   { id: "sent",    label: "Sent",     icon: Send },
   { id: "all",     label: "All Mail", icon: Mails },
+  { id: "spam",    label: "Junk",     icon: OctagonAlert },
   { id: "trash",   label: "Trash",    icon: Trash2 },
 ];
+
+/**
+ * The one view whose count is a filled badge: the Inbox, where the number is
+ * unread mail. A badge reads as "needs your attention"; everywhere else the
+ * number is only how much is there, and is shown as a plain figure.
+ */
+const BADGED = new Set<NavView>(["inbox"]);
 
 export interface SidebarProps {
   view: NavView;
@@ -43,6 +52,8 @@ function navBadge(id: NavView, counts: ViewCounts): number {
   if (id === "sent") return counts.sent;
   if (id === "all") return counts.all;
   if (id === "trash") return counts.trash;
+  if (id === "spam") return counts.spam ?? 0;
+  if (id === "snoozed") return counts.snoozed ?? 0;
   return 0;
 }
 
@@ -98,9 +109,12 @@ export function SidebarContent({
             >
               <Icon className="h-4 w-4" />
               <span className="flex-1 text-left">{label}</span>
-              {badge > 0 && (
-                <Badge className="h-5 min-w-5 px-1.5 tabular-nums">{badge}</Badge>
-              )}
+              {badge > 0 &&
+                (!BADGED.has(id) ? (
+                  <span className="px-1 text-xs tabular-nums text-muted-foreground">{badge}</span>
+                ) : (
+                  <Badge className="h-5 min-w-5 px-1.5 tabular-nums">{badge}</Badge>
+                ))}
             </button>
           );
         })}

@@ -4,11 +4,17 @@ import { Dialog as DialogPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { BACK_LAYER, useModalBackLayer } from "@/lib/useBackClose"
 
 function Dialog({
+  open,
+  defaultOpen,
+  onOpenChange,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Root>) {
-  return <DialogPrimitive.Root data-slot="dialog" {...props} />
+  // Mobile Back closes this dialog (and only it) instead of leaving the app.
+  const layer = useModalBackLayer(open, defaultOpen, onOpenChange, BACK_LAYER.dialog)
+  return <DialogPrimitive.Root data-slot="dialog" {...props} {...layer} />
 }
 
 function DialogTrigger({

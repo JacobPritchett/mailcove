@@ -22,7 +22,7 @@ function harness(): string {
     `</body></html>`;
   // Encode for the srcdoc attribute (escape quotes).
   const srcdoc = inner.replace(/"/g, "&quot;");
-  return `<!doctype html><html><body><iframe sandbox="allow-popups" srcdoc="${srcdoc}"></iframe></body></html>`;
+  return `<!doctype html><html><body><iframe sandbox="allow-same-origin" srcdoc="${srcdoc}"></iframe></body></html>`;
 }
 
 test.beforeEach(async ({ page }) => {

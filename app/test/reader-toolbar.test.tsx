@@ -108,20 +108,20 @@ describe("Reader toolbar — inbox view", () => {
     expect(onAction).toHaveBeenCalledWith("trash");
   });
 
-  it("Star button calls onAction('star') for unstarred thread", async () => {
+  it("Star, under More, calls onAction('star') for unstarred thread", async () => {
     const { onAction } = renderReader(INBOX_THREAD);
 
-    const btn = await screen.findByRole("button", { name: "Star" });
-    fireEvent.click(btn);
+    fireEvent.keyDown(await screen.findByRole("button", { name: "More actions" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Star" }));
 
     expect(onAction).toHaveBeenCalledWith("star");
   });
 
-  it("Star button calls onAction('unstar') for starred thread", async () => {
+  it("Star, under More, calls onAction('unstar') for starred thread", async () => {
     const { onAction } = renderReader(STARRED_THREAD);
 
-    const btn = await screen.findByRole("button", { name: "Unstar" });
-    fireEvent.click(btn);
+    fireEvent.keyDown(await screen.findByRole("button", { name: "More actions" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Unstar" }));
 
     expect(onAction).toHaveBeenCalledWith("unstar");
   });

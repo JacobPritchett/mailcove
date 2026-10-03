@@ -6,6 +6,10 @@ import {
   checkAttachmentLimits,
   fileToBase64,
   formatBytes,
+  MAX_ATTACHMENTS,
+  planForward,
+  MAX_ATTACHMENT_BYTES,
+  MAX_TOTAL_ATTACHMENT_BYTES,
   type StagedAttachment,
 } from "@/lib/attachments";
 import {
@@ -18,20 +22,26 @@ import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSend, useDraftReply, useIdentities } from "@/lib/queries";
 import {
-  ApiError,
   putDraft,
   deleteDraft,
   getContacts,
   putDraftAttachments,
   getDraftAttachments,
+  getAttachmentBase64,
 } from "@/lib/api";
 import { commitRecipients } from "@/lib/recipients";
+import { RecipientField, type RecipientFieldHandle } from "@/components/RecipientField";
 import type { Contact } from "@/lib/types";
 import { docHasVisibleContent } from "@/lib/editorDoc";
 import { bodySeedWithSignature, sameBody } from "@/lib/replyContext";
 import AnchoredListbox from "@/components/AnchoredListbox";
 import { useComposeSuggestion } from "@/lib/useComposeSuggestion";
 import { cn } from "@/lib/utils";
+import { registerDraftFlush } from "@/lib/session";
+import { useIsDesktop } from "@/lib/useMediaQuery";
+import { sanitizeLocal } from "@/lib/identity";
+import type { ForwardPart } from "@/lib/conversation";
+import { composing, keyIsSpokenFor } from "@/lib/keys";
 
 /** Default local-part for the From field. */
 const FROM_DEFAULT_LOCAL = "hello";
@@ -49,18 +59,19 @@ const IDENTITY_DOMAIN = "example.com";
 // bundle shouldn't pay for ProseMirror.
 const BodyEditor = lazy(() => import("@/components/EmailBodyEditor"));
 
-/**
- * Mirror the Worker's fromLocal sanitization (src/index.ts):
- * `String(b.fromLocal).replace(/[^a-z0-9._-]/gi, "")`. Keep it identical so what
- * the user sees is what the server will actually use.
- */
-function sanitizeLocal(value: string): string {
-  return value.replace(/[^a-z0-9._-]/gi, "");
-}
 
 /** Reply/forward/draft context used to prefill the form. */
 export interface ComposeInitial {
   to?: string;
+  /** Comma-joined, like `to`. Either one present opens its row. */
+  cc?: string;
+  bcc?: string;
+  /** Files of a forwarded message, fetched and staged when the dialog opens,
+   *  and the names of the ones that were never stored and so cannot travel. */
+  forward?: { messageId: string; parts: ForwardPart[]; notStored?: string[] };
+  /** Everything in this prefill was generated (a forward): closed without the
+   *  user changing anything, it is not worth keeping as a draft. */
+  generated?: boolean;
   subject?: string;
   text?: string;
   inReplyTo?: string;
@@ -108,11 +119,59 @@ export interface ComposeDialogProps {
 const FIELD =
   "w-full bg-transparent text-base md:text-sm text-foreground placeholder:text-muted-foreground/70 focus:outline-none";
 
+/** State owned by one opening of the dialog; see sessionRef. */
+interface Session {
+  /** The draft row this session writes to (created lazily on first save). */
+  draftId: string | null;
+  /** True once the message was sent or the draft explicitly discarded — the
+   *  close-flush must not resurrect the deleted row. */
+  skip: boolean;
+  /** Autosave queue: saves are CHAINED (each starts only after the previous
+   *  settled) and deletion joins the same chain — so no PUT, however slow, can
+   *  land after the DELETE and resurrect the row. */
+  saving: Promise<void>;
+  /** Set synchronously when a send is accepted. `send.isPending` only flips
+   *  once mutate() runs, which is after the body has been serialized (an
+   *  await), so a second Cmd+Enter or a double tap in that gap sent twice. */
+  sending: boolean;
+  /** Signature of the attachment set last written to R2, so an unchanged set
+   *  is never re-uploaded on an ordinary body autosave. */
+  syncedAtt: string;
+  /** The user chose to discard stored files that could not be loaded: the next
+   *  save writes the staged set even if it looks unchanged (or is empty). */
+  forceAttSync: boolean;
+  /** Opened from a saved draft, whose stored files must be read before the
+   *  set may be written (a forward has nothing stored to protect). */
+  resumed: boolean;
+  /** A forward's files on their way down. Resolves, never rejects, to the ones
+   *  that arrived. A draft saved before then waits on this for its files. */
+  forwardLoad: Promise<StagedAttachment[]> | null;
+  /** The user added or removed a file themselves. */
+  filesTouched: boolean;
+}
+
+function newSession(draftId: string | null): Session {
+  return {
+    draftId,
+    skip: false,
+    saving: Promise.resolve(),
+    sending: false,
+    syncedAtt: "",
+    forceAttSync: false,
+    resumed: draftId !== null,
+    forwardLoad: null,
+    filesTouched: false,
+  };
+}
+
 export default function ComposeDialog({
   open,
   onOpenChange,
   initial,
 }: ComposeDialogProps) {
+  // The slash-menu tip in the body placeholder is for a keyboard; on a phone
+  // it only crowds the line.
+  const wideEnoughForTip = useIsDesktop();
   const [fromLocal, setFromLocal] = useState(FROM_DEFAULT_LOCAL);
   // null = no explicit pick yet → defaults to the reply context's domain, then
   // the server default. Stored separately so an explicit pick survives re-renders.
@@ -124,6 +183,16 @@ export default function ComposeDialog({
   const [recipients, setRecipients] = useState<string[]>([]);
   const [toInput, setToInput] = useState("");
   const [toError, setToError] = useState<string | null>(null);
+  // Cc and Bcc stay out of the way until asked for (or until a reply-all or a
+  // resumed draft brings recipients for them).
+  const [cc, setCc] = useState<string[]>([]);
+  const [bcc, setBcc] = useState<string[]>([]);
+  const [showCc, setShowCc] = useState(false);
+  const [showBcc, setShowBcc] = useState(false);
+  const [ccPending, setCcPending] = useState("");
+  const [bccPending, setBccPending] = useState("");
+  const ccRef = useRef<RecipientFieldHandle>(null);
+  const bccRef = useRef<RecipientFieldHandle>(null);
   const [subject, setSubject] = useState("");
   // Plain-text MIRROR of the rich body (kept in sync by the editor's
   // onTextChange) — feeds Smart Compose and the AI-draft quote stacking. The
@@ -195,6 +264,98 @@ export default function ComposeDialog({
   const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // A resumed draft's files come back in a separate fetch. Until it settles the
+  // staged list is NOT the whole set, so sending would ship without them (and
+  // then delete the draft that held them) and syncing would overwrite them.
+  // "failed" stays blocking for the same reason: the stored files are still
+  // there, we just could not read them.
+  const [attLoad, setAttLoadState] = useState<"idle" | "loading" | "failed">("idle");
+  // Mirror for the async paths (autosave chain, close-flush) whose closures
+  // were created before the fetch settled.
+  const attLoadRef = useRef<"idle" | "loading" | "failed">("idle");
+  function setAttLoad(next: "idle" | "loading" | "failed") {
+    attLoadRef.current = next;
+    setAttLoadState(next);
+  }
+
+  /** Pull a resumed draft's stored files back into the staged list. Scoped to
+   *  the session that asked: a fetch from an earlier opening of this
+   *  (permanently mounted) dialog must never stage files into, or release the
+   *  loading gate of, a later one. The draft id cannot tell them apart, since
+   *  the same draft can be closed and reopened mid-fetch. */
+  function loadDraftAttachments(resumeId: string, s: Session) {
+    setAttLoad("loading");
+    getDraftAttachments(resumeId)
+      .then(({ attachments: got }) => {
+        if (sessionRef.current !== s) return; // dialog moved on
+        // Merge, never replace: anything already staged was added while this
+        // fetch was in flight and must survive it.
+        setAttachments((prev) => [...got, ...prev]);
+        // Mark only the fetched files as already stored, so an unchanged set
+        // is not re-uploaded but one the user added to still is.
+        s.syncedAtt = got.map((a) => `${a.name}:${a.size}`).join("|");
+        setAttLoad("idle");
+      })
+      .catch(() => {
+        if (sessionRef.current !== s) return;
+        setAttLoad("failed");
+      });
+  }
+
+  // What a forward could not bring along, each reason in its own words, and
+  // the files whose download failed (those can be retried).
+  const [fwdNotes, setFwdNotes] = useState<string[]>([]);
+  const [fwdFailed, setFwdFailed] = useState<ForwardPart[]>([]);
+
+  /**
+   * Fetch a forwarded message's files and stage them. Each file stands alone:
+   * one that fails to download is reported (and can be retried) while the
+   * others are attached. `only` retries just the failed ones.
+   */
+  function loadForwardAttachments(fwd: NonNullable<ComposeInitial["forward"]>, s: Session, only?: ForwardPart[]) {
+    let wanted = only;
+    if (!wanted) {
+      // Decide what fits BEFORE fetching: a file that cannot be sent is not
+      // worth downloading, and the user should be told it was left behind.
+      const plan = planForward(fwd.parts);
+      wanted = plan.fits;
+      const list = (names: string[]) => names.join(", ");
+      setFwdNotes([
+        ...(fwd.notStored?.length ? [`Not stored with the original, so not forwarded: ${list(fwd.notStored)}`] : []),
+        ...(plan.tooLarge.length
+          ? [`Too large to send (${formatBytes(MAX_ATTACHMENT_BYTES)} a file, ${formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)} in all), so not forwarded: ${list(plan.tooLarge)}`]
+          : []),
+        ...(plan.tooMany.length ? [`Over the limit of ${MAX_ATTACHMENTS} files, so not forwarded: ${list(plan.tooMany)}`] : []),
+      ]);
+    }
+    setFwdFailed([]);
+    if (!wanted.length) return setAttLoad("idle");
+    setAttLoad("loading");
+    const parts = wanted;
+    const settled = Promise.allSettled(
+      parts.map(async (part) => ({
+        name: part.name,
+        type: part.type || "application/octet-stream",
+        size: part.size,
+        data: await getAttachmentBase64(fwd.messageId, part.name, part.partId),
+      })),
+    );
+    const got = settled.then((results) =>
+      results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : [])),
+    );
+    // A draft saved while this is in flight waits on it for its files (see
+    // the close-flush). Chained, so a retry adds to what an earlier load got.
+    const before = only ? (s.forwardLoad ?? Promise.resolve([])) : Promise.resolve([]);
+    s.forwardLoad = before.then(async (earlier) => [...earlier, ...(await got)]);
+    void settled.then((results) => {
+      if (sessionRef.current !== s) return; // dialog moved on
+      const ok = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+      const failed = parts.filter((_, i) => results[i].status === "rejected");
+      if (ok.length) setAttachments((prev) => [...ok, ...prev]);
+      setFwdFailed(failed);
+      setAttLoad(failed.length ? "failed" : "idle");
+    });
+  }
 
   async function addFiles(files: FileList | null) {
     setAttachError(null);
@@ -214,6 +375,7 @@ export default function ComposeDialog({
           data: await fileToBase64(f),
         })),
       );
+      sessionRef.current.filesTouched = true;
       setAttachments((prev) => [...prev, ...staged]);
     } catch (e) {
       setAttachError(e instanceof Error ? e.message : "Could not read that file.");
@@ -221,30 +383,32 @@ export default function ComposeDialog({
   }
 
   function removeAttachment(index: number) {
+    sessionRef.current.filesTouched = true;
     setAttachError(null);
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
   // ---- Draft autosave ----
   const qc = useQueryClient();
-  // The draft row this compose session writes to (created lazily on first save).
-  const draftIdRef = useRef<string | null>(null);
-  /** Signature of the attachment set last written to R2, so an unchanged set is
-   *  never re-uploaded on an ordinary body autosave. */
-  const syncedAttachmentsRef = useRef("");
-  // True once the message was sent or the draft explicitly discarded — the
-  // close-flush must not resurrect the deleted row.
-  const skipDraftRef = useRef(false);
+  // Everything that belongs to ONE opening of the dialog lives on a session
+  // object, replaced on every open. The dialog is permanently mounted and a
+  // send, a save or a fetch can outlive the opening that started it; when
+  // these were plain refs, a send finishing after the next draft had been
+  // opened read the NEW draft's id and deleted it. Async work captures its
+  // session up front and acts on that, and touches the UI only if it is still
+  // the active one.
+  const sessionRef = useRef<Session>(newSession(null));
   // Last serialized editor document. The editor unmounts with the dialog, so
   // the close-flush can't re-serialize — it reuses the last good snapshot
   // instead of clobbering the stored rich doc with "".
   const docJsonRef = useRef("");
-  // Autosave queue: saves are CHAINED (each starts only after the previous
-  // settled) and deletion joins the same chain — so no PUT, however slow, can
-  // land after the DELETE and resurrect the row.
-  const savingRef = useRef<Promise<void>>(Promise.resolve());
 
   const send = useSend();
+  // Mirrors session.sending for rendering.
+  const [sending, setSending] = useState(false);
+  // Why this session's last send failed. Held here rather than read from the
+  // mutation, which would also report a failure of an earlier session's send.
+  const [sendError, setSendError] = useState<string | null>(null);
   const aiDraft = useDraftReply();
   // Only repliable conversations (carry a threadId) can be AI-drafted.
   const canAiDraft = !!initial?.threadId;
@@ -269,6 +433,19 @@ export default function ComposeDialog({
   const fromDomain =
     [fromDomainPick, initial?.fromDomain, identities?.defaultDomain]
       .find((d) => !!d && domainOptions.includes(d)) ?? domainOptions[0];
+  // A prefilled local part belongs to the domain it came with ("sales" on a
+  // domain that only receives). Once the identities show that domain cannot
+  // send and another stands in, the local part goes back to the default too:
+  // otherwise the message leaves as sales@<some other domain>, an address
+  // nobody wrote to. Left alone if the user has already typed their own.
+  useEffect(() => {
+    if (!open || !identities || !initial?.fromDomain || !initial.fromLocal) return;
+    if (identities.identities.some((i) => i.domain === initial.fromDomain)) return;
+    const prefilled = sanitizeLocal(initial.fromLocal) || FROM_DEFAULT_LOCAL;
+    setFromLocal((cur) => (cur === prefilled ? sanitizeLocal(identities.defaultLocal) || FROM_DEFAULT_LOCAL : cur));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, identities]);
+
   // The selected identity's saved sender name — what recipients see unless the
   // user overrides it for this message.
   const identityName =
@@ -311,6 +488,14 @@ export default function ComposeDialog({
     setRecipients(seeded.recipients);
     setToInput("");
     setToError(null);
+    const seededCc = commitRecipients([], initial?.cc ?? "").recipients;
+    const seededBcc = commitRecipients([], initial?.bcc ?? "").recipients;
+    setCc(seededCc);
+    setBcc(seededBcc);
+    setShowCc(seededCc.length > 0);
+    setShowBcc(seededBcc.length > 0);
+    setCcPending("");
+    setBccPending("");
     setSubject(initial?.subject ?? "");
     setText(initial?.text ?? "");
     textRef.current = initial?.text ?? "";
@@ -326,28 +511,23 @@ export default function ComposeDialog({
     // common close-without-sending path.
     setAttachments([]);
     setAttachError(null);
+    setFwdNotes([]);
+    setFwdFailed([]);
     clearSuggestion();
-    draftIdRef.current = initial?.draftId ?? null;
-    syncedAttachmentsRef.current = "";
+    const session = newSession(initial?.draftId ?? null);
+    sessionRef.current = session;
     // Resume: pull the bytes back so the files are really there to send, not
-    // just listed. Best-effort - a draft that cannot fetch them should still
-    // open, with the attachment row simply empty.
+    // just listed. The draft still opens if this fails, but Send and the
+    // attachment sync wait on it (see attLoad).
     const resumeId = initial?.draftId;
-    if (resumeId) {
-      void getDraftAttachments(resumeId)
-        .then(({ attachments: got }) => {
-          if (draftIdRef.current !== resumeId) return; // dialog moved on
-          setAttachments(got);
-          // Mark them as already stored, or the first autosave re-uploads
-          // everything the user just downloaded.
-          syncedAttachmentsRef.current = got.map((a) => `${a.name}:${a.size}`).join("|");
-        })
-        .catch(() => {
-          /* keep the draft usable without them */
-        });
-    }
-    skipDraftRef.current = false;
+    if (resumeId) loadDraftAttachments(resumeId, session);
+    // A forward brings the original's files. Only on a fresh forward: once it
+    // has been saved as a draft, the draft holds them.
+    else if (initial?.forward) loadForwardAttachments(initial.forward, session);
+    else setAttLoad("idle");
     docJsonRef.current = initial?.bodyJson ?? "";
+    setSending(false);
+    setSendError(null);
     send.reset();
     aiDraft.reset();
     // send is stable; initial only matters at open time.
@@ -415,8 +595,27 @@ export default function ComposeDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, identities, fromDomain, initial?.replyQuote]);
 
+  /**
+   * A generated prefill (a forward) exactly as it was opened: the original's
+   * text, its subject and its files, with nothing added by the user.
+   */
+  function untouchedPrefill() {
+    if (!initial?.generated || sessionRef.current.resumed || sessionRef.current.filesTouched) return false;
+    return (
+      sameBody(text, initial.text ?? "") &&
+      subject === (initial.subject ?? "") &&
+      recipients.join(",") === commitRecipients([], initial.to ?? "").recipients.join(",") &&
+      !toInput.trim() &&
+      cc.length + bcc.length === 0 &&
+      !ccPending.trim() &&
+      !bccPending.trim()
+    );
+  }
+
   /** Anything worth persisting as a draft? */
   function draftHasContent() {
+    // Opening a forward and closing it again is not writing a message.
+    if (untouchedPrefill()) return false;
     // A seeded signature is not content the user wrote. Counting it meant every
     // opened-and-abandoned compose saved a draft containing nothing but the
     // signature, and toasted "Draft saved" for it.
@@ -431,14 +630,25 @@ export default function ComposeDialog({
       subject.trim() ||
       recipients.length ||
       toInput.trim() ||
+      cc.length ||
+      bcc.length ||
+      ccPending.trim() ||
+      bccPending.trim() ||
       attachments.length
     );
   }
 
   /** Best-effort draft upsert (autosave path — failures stay silent). */
-  async function saveDraftNow() {
-    if (skipDraftRef.current || !draftHasContent()) return;
-    const id = (draftIdRef.current ??= crypto.randomUUID());
+  async function saveDraftNow(opts: { waitForForward?: boolean } = {}) {
+    const s = sessionRef.current;
+    // Closing while a forward's files are still downloading: the draft is
+    // written now and its files follow when they arrive, rather than a draft
+    // that has quietly lost them.
+    const lateFiles = opts.waitForForward && attLoadRef.current === "loading" ? s.forwardLoad : null;
+    // A pending "discard the stored files" still has to be written even when
+    // nothing else is left in the draft.
+    if (s.skip || (!draftHasContent() && !s.forceAttSync)) return;
+    const id = (s.draftId ??= crypto.randomUUID());
     let live = "";
     try {
       live = editorRef.current?.getDocJson() ?? "";
@@ -450,6 +660,8 @@ export default function ComposeDialog({
     // Snapshot the payload now; the chained PUT may start later.
     const payload = {
       to: [...recipients, toInput.trim()].filter(Boolean).join(", "),
+      cc: [...cc, ccPending.trim()].filter(Boolean).join(", "),
+      bcc: [...bcc, bccPending.trim()].filter(Boolean).join(", "),
       subject,
       bodyText: text,
       bodyJson,
@@ -462,10 +674,15 @@ export default function ComposeDialog({
     // Signature of the staged set. The bytes ride only when this changes, so
     // the 1.5s autosave stays a small JSON PUT no matter what is attached.
     const attSig = attachments.map((a) => `${a.name}:${a.size}`).join("|");
-    const attChanged = attSig !== syncedAttachmentsRef.current;
+    // Never while the stored set is unread: the staged list is missing those
+    // files, and this PUT replaces the whole set.
+    // (A forward whose download partly failed has nothing stored to protect:
+    // what did arrive is the set.)
+    const readable = attLoadRef.current === "idle" || (attLoadRef.current === "failed" && !s.resumed);
+    const attChanged = !lateFiles && readable && (s.forceAttSync || attSig !== s.syncedAtt);
     const attSnapshot = attachments.map((a) => ({ name: a.name, type: a.type, data: a.data }));
 
-    const save = savingRef.current.then(() =>
+    const save = s.saving.then(() =>
       putDraft(id, payload)
         .then(async () => {
           // After the row exists: a draft row with no attachments is merely
@@ -473,14 +690,22 @@ export default function ComposeDialog({
           // ever collect.
           if (attChanged) {
             await putDraftAttachments(id, attSnapshot);
-            syncedAttachmentsRef.current = attSig;
+            s.syncedAtt = attSig;
+            s.forceAttSync = false;
+          } else if (lateFiles) {
+            const late = await lateFiles;
+            // Deleted meanwhile (sent or discarded from another opening)?
+            if (s.skip) return;
+            const all = [...late.map((a) => ({ name: a.name, type: a.type, data: a.data })), ...attSnapshot];
+            if (all.length) await putDraftAttachments(id, all);
+            s.syncedAtt = [...late, ...attachments].map((a) => `${a.name}:${a.size}`).join("|");
           }
         })
         .then(() => {
           void qc.invalidateQueries({ queryKey: ["drafts"] });
         }),
     );
-    savingRef.current = save.catch(() => {});
+    s.saving = save.catch(() => {});
     try {
       await save;
     } catch {
@@ -488,14 +713,14 @@ export default function ComposeDialog({
     }
   }
 
-  /** Delete the backing draft row (sent or discarded) and refresh views. */
-  function dropDraft() {
-    skipDraftRef.current = true;
-    const id = draftIdRef.current;
-    draftIdRef.current = null;
+  /** Delete a session's backing draft row (sent or discarded) and refresh views. */
+  function dropDraft(s: Session = sessionRef.current) {
+    s.skip = true;
+    const id = s.draftId;
+    s.draftId = null;
     if (!id) return;
     // Join the autosave chain so the DELETE is ordered after EVERY queued PUT.
-    void savingRef.current
+    void s.saving
       .then(() => deleteDraft(id))
       .then(() => {
         void qc.invalidateQueries({ queryKey: ["drafts"] });
@@ -512,7 +737,16 @@ export default function ComposeDialog({
     const t = setTimeout(() => void saveDraftNow(), 1500);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, text, subject, recipients, toInput, fromLocal, fromName, fromDomain]);
+  }, [open, text, subject, recipients, toInput, cc, bcc, ccPending, bccPending, fromLocal, fromName, fromDomain, attachments, attLoad]);
+
+  // If the session expires, Reload saves what is open first (best effort).
+  // Through a ref: the registration outlives the render that made it.
+  const saveDraftRef = useRef(saveDraftNow);
+  saveDraftRef.current = saveDraftNow;
+  useEffect(() => {
+    if (!open) return;
+    return registerDraftFlush(() => saveDraftRef.current());
+  }, [open]);
 
   // Closing the dialog (any way except send/discard) keeps the draft: flush a
   // final save so nothing typed after the last debounce tick is lost.
@@ -522,8 +756,8 @@ export default function ComposeDialog({
       // Closing via X / Close / Escape keeps the draft — surface that so the
       // saved draft isn't a surprise. Not shown on send/discard (they toast
       // their own outcome) or when there's nothing worth saving.
-      const keptDraft = draftHasContent() && !skipDraftRef.current;
-      void saveDraftNow();
+      const keptDraft = draftHasContent() && !sessionRef.current.skip;
+      void saveDraftNow({ waitForForward: true });
       if (keptDraft) toast.success("Draft saved");
     }
     wasOpenRef.current = open;
@@ -554,6 +788,7 @@ export default function ComposeDialog({
   }
 
   function onToKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (keyIsSpokenFor(e)) return;
     // Let the form-level ⌘/Ctrl+Enter handler send instead of adding a chip.
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") return;
     // Suggestion navigation takes precedence while the list is open, so Enter
@@ -591,7 +826,11 @@ export default function ComposeDialog({
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (send.isPending) return;
+    const s = sessionRef.current;
+    if (s.sending || send.isPending) return;
+    // A resumed draft's files are not all here yet (or could not be read).
+    // The disabled Send button says so; this covers Cmd+Enter.
+    if (attLoadRef.current !== "idle") return;
     // Commit any trailing typed text (fully validated — a half-typed address
     // must not silently ship) before deciding whether we can send.
     const r = flushToInput(toInput, false);
@@ -601,10 +840,23 @@ export default function ComposeDialog({
       toInputRef.current?.focus();
       return;
     }
-    void submitTo(r.recipients);
+    // Same rule for the copies: a half-typed address must not silently drop.
+    const ccResult = showCc ? ccRef.current?.flush() : undefined;
+    const bccResult = showBcc ? bccRef.current?.flush() : undefined;
+    if (ccResult?.invalid.length) return void ccRef.current?.focus();
+    if (bccResult?.invalid.length) return void bccRef.current?.focus();
+    const copies = { cc: ccResult?.recipients ?? cc, bcc: bccResult?.recipients ?? bcc };
+    s.sending = true;
+    setSending(true);
+    void submitTo(s, r.recipients, copies).finally(() => {
+      s.sending = false;
+      // Only this session's own Send button: by now another message may be
+      // open, and possibly sending.
+      if (sessionRef.current === s) setSending(false);
+    });
   }
 
-  async function submitTo(recipients: string[]) {
+  async function submitTo(s: Session, recipients: string[], copies: { cc: string[]; bcc: string[] }) {
     const cleanedLocal = sanitizeLocal(fromLocal) || FROM_DEFAULT_LOCAL;
     // Only an explicit edit ships as an override. Untouched (or cleared) →
     // omit, so the Worker resolves the identity's CURRENT profile name rather
@@ -631,14 +883,17 @@ export default function ComposeDialog({
     // An actually-empty doc still serializes to a full blank template; that
     // one we drop.
     const hasVisibleBody = bodyText.trim() !== "" || docHasVisibleContent(docJson);
-    send.mutate(
-      {
+    setSendError(null);
+    try {
+      await send.mutateAsync({
         // Full identity address; the Worker resolves it against the registry.
         // fromLocal rides along for back-compat with the legacy default path.
         from: `${cleanedLocal}@${fromDomain}`,
         fromLocal: cleanedLocal,
         ...(cleanedName ? { fromName: cleanedName } : {}),
         to: recipients,
+        ...(copies.cc.length ? { cc: copies.cc } : {}),
+        ...(copies.bcc.length ? { bcc: copies.bcc } : {}),
         subject,
         text: bodyText,
         ...(bodyHtml && hasVisibleBody ? { html: bodyHtml } : {}),
@@ -653,18 +908,19 @@ export default function ComposeDialog({
               })),
             }
           : {}),
-      },
-      {
-        onSuccess: () => {
-          toast.success("Sent ✓");
-          dropDraft();
-          onOpenChange(false);
-        },
-        onError: () => {
-          toast.error("Send failed");
-        },
-      },
-    );
+      });
+    } catch (err) {
+      // The draft is kept. The reason renders in the dialog, if it is still
+      // this message's dialog.
+      if (sessionRef.current === s) setSendError(err instanceof Error ? err.message : "Send failed");
+      toast.error("Send failed");
+      return;
+    }
+    toast.success("Sent ✓");
+    // The draft of the message that was SENT, which is not necessarily the one
+    // on screen now: the dialog can have been closed and another opened.
+    dropDraft(s);
+    if (sessionRef.current === s) onOpenChange(false);
   }
 
   // Ask Workers AI to draft a reply, then place it above the quoted original —
@@ -689,31 +945,57 @@ export default function ComposeDialog({
         docJsonRef.current = "";
         editorRef.current?.setPlainText(full);
       },
-      onError: () => toast.error("Couldn't draft a reply — try again."),
+      onError: () => toast.error("Couldn't draft a reply. Try again."),
     });
   }
 
   // ⌘/Ctrl+Enter sends from anywhere in the form (including the body textarea).
   function onFormKeyDown(e: React.KeyboardEvent<HTMLFormElement>) {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    if (e.key !== "Enter") return;
+    // Committing an IME composition is typing, not a command.
+    if (composing(e)) return;
+    if (e.metaKey || e.ctrlKey) {
       e.preventDefault();
       handleSubmit(e);
+      return;
+    }
+    // Plain Enter in a single-line field would implicitly submit the form,
+    // which here means sending the mail. Swallow it; from Subject, carry on
+    // into the body the way a mail client does.
+    // (A recipient field has already handled, and prevented, its own Enter.)
+    if (e.target instanceof HTMLInputElement && !e.defaultPrevented) {
+      e.preventDefault();
+      if (e.target.id === "compose-subject") editorRef.current?.focus();
     }
   }
 
-  const errorMsg =
-    send.error instanceof ApiError
-      ? send.error.message
-      : send.error instanceof Error
-        ? send.error.message
-        : null;
+  const errorMsg = sendError;
 
   const isReply = !!initial?.inReplyTo || !!initial?.threadId;
+  // A reply or resumed draft that already has its recipients is opened to be
+  // written in; a new message starts at To.
+  const focusBody = !!initial && commitRecipients([], initial.to ?? "").recipients.length > 0;
+  const blocked = sending || send.isPending;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
+        // Radix would focus the first tabbable element, which is the header's
+        // Close button: typing went nowhere and Enter closed the dialog.
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          if (!focusBody) {
+            toInputRef.current?.focus();
+          } else if (editorRef.current) {
+            editorRef.current.focus();
+          } else {
+            // The editor chunk has not mounted yet; it takes focus itself when
+            // it does (autoFocus below). Park focus on the dialog meanwhile so
+            // it is at least inside the focus trap.
+            (e.currentTarget as HTMLElement | null)?.focus();
+          }
+        }}
         // Radix registers its Escape handler on `document` with capture, so a
         // React onKeyDown (bubble, on #root) can never preventDefault in time.
         // Escape used to close the whole compose window instead of the dropdown.
@@ -721,6 +1003,10 @@ export default function ComposeDialog({
           if (contactHits.length) {
             e.preventDefault();
             setContactHits([]);
+          } else if (document.querySelector('[role="listbox"][aria-label$=" suggestions"]')) {
+            // A Cc/Bcc suggestion list is open: Escape closes that (the field
+            // handles it), not the whole compose window.
+            e.preventDefault();
           }
         }}
         className="flex max-h-[100dvh] flex-col gap-0 overflow-hidden rounded-2xl border-border/70 p-0 shadow-2xl max-md:h-[100dvh] max-md:max-w-full max-md:rounded-none max-md:border-0 sm:max-w-xl"
@@ -776,15 +1062,18 @@ export default function ComposeDialog({
               // The suggestion list is portalled out of this subtree (two
               // clipping ancestors would cut it off), so this is its
               // measurement anchor rather than a positioning context.
-              className="flex flex-1 cursor-text flex-wrap items-center gap-1.5"
+              // min-w-0: without it one long address makes this wider than the
+              // row, which pushed the Cc and Bcc buttons off a phone's screen.
+              className="flex min-w-0 flex-1 cursor-text flex-wrap items-center gap-1.5"
               onClick={() => toInputRef.current?.focus()}
             >
               {recipients.map((addr) => (
                 <span
                   key={addr}
-                  className="inline-flex items-center gap-1 rounded-full bg-muted py-0.5 pl-2.5 pr-1 text-xs font-medium text-foreground"
+                  title={addr}
+                  className="inline-flex max-w-full items-center gap-1 rounded-full bg-muted py-0.5 pl-2.5 pr-1 text-xs font-medium text-foreground"
                 >
-                  {addr}
+                  <span className="min-w-0 truncate">{addr}</span>
                   <button
                     type="button"
                     onClick={(e) => {
@@ -792,7 +1081,9 @@ export default function ComposeDialog({
                       removeRecipient(addr);
                     }}
                     aria-label={`Remove ${addr}`}
-                    className="flex size-4 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                    // Looks 16px; on a touch screen an invisible ::after takes taps
+                    // over a 44px square around it.
+                    className="relative flex size-4 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-3.5 [@media(pointer:coarse)]:after:content-['']"
                   >
                     <X className="size-3" />
                   </button>
@@ -874,7 +1165,55 @@ export default function ComposeDialog({
                 </p>
               )}
             </div>
+            {(!showCc || !showBcc) && (
+              <div className="flex shrink-0 items-center gap-1 pt-0.5">
+                {!showCc && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowCc(true);
+                      requestAnimationFrame(() => ccRef.current?.focus());
+                    }}
+                    className="rounded px-1.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground max-md:min-h-11 max-md:px-2.5"
+                  >
+                    Cc
+                  </button>
+                )}
+                {!showBcc && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowBcc(true);
+                      requestAnimationFrame(() => bccRef.current?.focus());
+                    }}
+                    className="rounded px-1.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground max-md:min-h-11 max-md:px-2.5"
+                  >
+                    Bcc
+                  </button>
+                )}
+              </div>
+            )}
           </div>
+          {showCc && (
+            <RecipientField
+              ref={ccRef}
+              label="Cc"
+              value={cc}
+              onChange={setCc}
+              exclude={[...recipients, ...bcc]}
+              onPendingChange={setCcPending}
+            />
+          )}
+          {showBcc && (
+            <RecipientField
+              ref={bccRef}
+              label="Bcc"
+              value={bcc}
+              onChange={setBcc}
+              exclude={[...recipients, ...cc]}
+              onPendingChange={setBccPending}
+            />
+          )}
 
           {/* From — editable local part + readonly identity suffix */}
           <div className="flex items-center gap-3 border-b border-border/60 px-5 py-3">
@@ -983,7 +1322,10 @@ export default function ComposeDialog({
                 ref={editorRef}
                 initialText={bodySeed}
                 initialJson={bodyJsonSeed || undefined}
-                placeholder="Write your message… ( / for blocks, markdown works)"
+                autoFocus={focusBody ? "end" : undefined}
+                placeholder={
+                  wideEnoughForTip ? "Write your message… ( / for blocks, markdown works)" : "Write your message…"
+                }
                 onTextChange={(t) => {
                   setText(t);
                   textRef.current = t;
@@ -1050,8 +1392,72 @@ export default function ComposeDialog({
             </div>
           )}
 
-          {(attachments.length > 0 || attachError) && (
+          {(attachments.length > 0 || attachError || attLoad !== "idle" || fwdNotes.length > 0) && (
             <div className="mx-5 mb-3 space-y-2">
+              {fwdNotes.length > 0 && (
+                <ul role="status" className="space-y-1 text-xs text-muted-foreground">
+                  {fwdNotes.map((note) => (
+                    <li key={note} className="[overflow-wrap:anywhere]">
+                      {note}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {attLoad === "loading" && (
+                <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 shrink-0 animate-spin" />
+                  Loading attachments…
+                </p>
+              )}
+              {attLoad === "failed" && (
+                <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">
+                  <AlertCircle className="size-3.5 shrink-0" />
+                  <span>
+                    {initial?.draftId
+                      ? "Couldn't load the files saved with this draft."
+                      : `Couldn't load from the forwarded message: ${fwdFailed.map((p) => p.name).join(", ")}`}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs text-foreground max-md:h-11"
+                    onClick={() => {
+                      const s = sessionRef.current;
+                      if (initial?.draftId && s.draftId) loadDraftAttachments(s.draftId, s);
+                      else if (initial?.forward) loadForwardAttachments(initial.forward, s, fwdFailed);
+                    }}
+                  >
+                    Retry
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs text-muted-foreground max-md:h-11"
+                    onClick={() => {
+                      if (initial?.draftId) {
+                        // The stored files are being given up, and that is a
+                        // decision, so it is recorded and written at once:
+                        // the staged list (possibly empty) becomes the draft's
+                        // set whether or not anything else changes. Leaving it
+                        // to the next autosave made the outcome depend on
+                        // whether a new file happened to be staged.
+                        sessionRef.current.forceAttSync = true;
+                        setAttLoad("idle");
+                        void saveDraftNow();
+                      } else {
+                        // A forward has nothing stored to give up, and the
+                        // files that did download stay attached.
+                        setFwdFailed([]);
+                        setAttLoad("idle");
+                      }
+                    }}
+                  >
+                    {initial?.draftId ? "Discard saved files" : "Continue without them"}
+                  </Button>
+                </div>
+              )}
               {attachments.length > 0 && (
                 <ul className="flex flex-wrap gap-2">
                   {attachments.map((a, i) => (
@@ -1066,7 +1472,9 @@ export default function ComposeDialog({
                         type="button"
                         onClick={() => removeAttachment(i)}
                         aria-label={`Remove ${a.name}`}
-                        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        // Thumb-sized on touch: an 18px X is a miss waiting to
+                        // happen. Negative margin keeps the chip from growing.
+                        className="-my-1.5 -mr-1 flex size-8 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground max-md:-my-2.5 max-md:size-11"
                       >
                         <X className="size-3.5" />
                       </button>
@@ -1075,10 +1483,8 @@ export default function ComposeDialog({
                 </ul>
               )}
               {attachments.length > 0 && (
-                // Draft autosave persists text and recipients, not files. Say so
-                // rather than letting someone reopen a draft and find them gone.
                 <p className="text-xs text-muted-foreground/70">
-                  Files are sent with this message but are not saved in drafts.
+                  Files are saved with this draft and sent with the message.
                 </p>
               )}
               {attachError && (
@@ -1109,7 +1515,7 @@ export default function ComposeDialog({
                 variant="ghost"
                 size="sm"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={send.isPending}
+                disabled={blocked}
                 aria-label="Attach files"
                 className="gap-1.5 text-xs text-muted-foreground max-md:h-11"
               >
@@ -1121,13 +1527,13 @@ export default function ComposeDialog({
                 <Kbd>↵</Kbd>
                 <span className="ml-1">to send</span>
               </span>
-              {(draftHasContent() || draftIdRef.current) && (
+              {(draftHasContent() || sessionRef.current.draftId) && (
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
                   onClick={discardDraft}
-                  disabled={send.isPending}
+                  disabled={blocked}
                   className="gap-1.5 text-xs text-muted-foreground max-md:h-11"
                 >
                   <Trash2 className="size-3.5" />
@@ -1140,17 +1546,17 @@ export default function ComposeDialog({
                 type="button"
                 variant="ghost"
                 onClick={() => onOpenChange(false)}
-                disabled={send.isPending}
+                disabled={blocked}
                 className="max-md:h-11"
               >
                 Close
               </Button>
               <Button
                 type="submit"
-                disabled={send.isPending}
+                disabled={blocked || attLoad !== "idle"}
                 className="gap-2 bg-gradient-to-b from-primary to-primary/90 shadow-sm max-md:h-11"
               >
-                {send.isPending ? (
+                {blocked ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
                     Sending…

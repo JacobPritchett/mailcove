@@ -20,7 +20,7 @@ function roundTrip(text: string): string {
 
 const EmailBodyEditorMock = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
   function EmailBodyEditorMock(
-    { initialText, initialJson, placeholder, onTextChange, onFocusChange, onCaretAtEndChange, autoFocus },
+    { initialText, initialJson, placeholder, onTextChange, onFocusChange, onCaretAtEndChange, autoFocus, readOnly },
     ref,
   ) {
     const taRef = useRef<HTMLTextAreaElement>(null);
@@ -65,6 +65,7 @@ const EmailBodyEditorMock = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
         aria-label="Message"
         placeholder={placeholder}
         autoFocus={!!autoFocus}
+        readOnly={!!readOnly}
         defaultValue={seed}
         onChange={(e) => {
           onTextChange?.(e.target.value);

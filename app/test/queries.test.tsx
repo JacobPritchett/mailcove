@@ -120,4 +120,64 @@ describe("useMutateThreads optimistic update", () => {
       expect(data?.threads.map((t) => t.thread_id)).toContain("tb");
     });
   });
+
+  it("while searching, applies All Mail rules whatever view is selected", async () => {
+    const qc = makeQc();
+    const key = ["threads", "trash", "hello", "", ""];
+    qc.setQueryData(key, INITIAL_DATA);
+    vi.mocked(apiMutateThread).mockImplementation(() => new Promise(() => {}));
+
+    const { result } = renderHook(() => useMutateThreads("trash", "hello"), {
+      wrapper: makeWrapper(qc),
+    });
+
+    // Search results are live mail: archiving one leaves it in the results...
+    act(() => {
+      result.current.mutate({ threadIds: ["ta"], action: "archive" });
+    });
+    await waitFor(() => expect(apiMutateThread).toHaveBeenCalledWith("ta", "archive"));
+    expect(qc.getQueryData<ThreadsResponse>(key)?.threads.map((t) => t.thread_id)).toEqual(["ta", "tb"]);
+
+    // ...and trashing one removes it (search excludes trash).
+    act(() => {
+      result.current.mutate({ threadIds: ["ta"], action: "trash" });
+    });
+    await waitFor(() => {
+      expect(qc.getQueryData<ThreadsResponse>(key)?.threads.map((t) => t.thread_id)).toEqual(["tb"]);
+    });
+  });
+
+  it("rolls back into the list it changed, even if the view changed mid-flight", async () => {
+    const qc = makeQc();
+    const inboxKey = ["threads", "inbox", "", "", ""];
+    const sentKey = ["threads", "sent", "", "", ""];
+    const SENT: ThreadsResponse = { threads: [THREAD_B], unread: 0, user: "me@test.com" };
+    qc.setQueryData(inboxKey, INITIAL_DATA);
+    qc.setQueryData(sentKey, SENT);
+
+    let reject!: (e: Error) => void;
+    vi.mocked(apiMutateThread).mockImplementation(() => new Promise((_r, rej) => { reject = rej; }));
+
+    const { result, rerender } = renderHook(({ view }: { view: "inbox" | "sent" }) => useMutateThreads(view), {
+      wrapper: makeWrapper(qc),
+      initialProps: { view: "inbox" as "inbox" | "sent" },
+    });
+
+    act(() => {
+      result.current.mutate({ threadIds: ["ta"], action: "archive" });
+    });
+    await waitFor(() => expect(apiMutateThread).toHaveBeenCalled());
+
+    // The user moves to another view before the server answers.
+    rerender({ view: "sent" });
+    await act(async () => {
+      reject(new Error("server error"));
+    });
+
+    await waitFor(() => {
+      expect(qc.getQueryData<ThreadsResponse>(inboxKey)?.threads.map((t) => t.thread_id)).toEqual(["ta", "tb"]);
+    });
+    // The other view's list was not overwritten with the inbox.
+    expect(qc.getQueryData<ThreadsResponse>(sentKey)?.threads.map((t) => t.thread_id)).toEqual(["tb"]);
+  });
 });
