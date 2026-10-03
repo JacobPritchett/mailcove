@@ -30,19 +30,18 @@ const ADDRESS_RE =
   /^[^\s@<>,;"()]+@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 
 /**
- * Split a stored address list ("A <a@x>, b@y") into individual entries.
- * Stored values come from headers, so they are comma-joined and may carry
- * display names, quotes and angle brackets.
+ * Split an address list ("A <a@x>, b@y") into its raw entries, trimmed, with
+ * empty ones dropped. A comma or semicolon inside a quoted display name or an
+ * angle-addr is not a separator: `"Doe, John" <j@x>` is ONE entry. Single pass.
  */
-export function parseAddressList(raw: unknown): Contact[] {
-  // Bound the input. Header values are attacker-controlled (msg_from is built
-  // from parsed.from.name), and a 40 KB run of "<" is a real inbound message.
-  const value = String(raw ?? "").slice(0, MAX_ADDRESS_LIST_CHARS);
-  if (!value) return [];
-  const out: Contact[] = [];
-  // Split on commas outside a quoted display name or an angle-addr. `quoted`
-  // gates the depth counter: a "<" inside a quoted name is text, not a bracket,
-  // and letting it move depth swallowed every address after it.
+export function splitAddressList(value: string): string[] {
+  const out: string[] = [];
+  const push = (entry: string) => {
+    const t = entry.trim();
+    if (t) out.push(t);
+  };
+  // `quoted` gates the depth counter: a "<" inside a quoted name is text, not a
+  // bracket, and letting it move depth swallowed every address after it.
   let depth = 0;
   let quoted = false;
   let escaped = false;
@@ -63,30 +62,117 @@ export function parseAddressList(raw: unknown): Contact[] {
     else if (!quoted && ch === ">") depth = Math.max(0, depth - 1);
     // Semicolons separate addresses too, and terminate RFC 5322 group syntax.
     if ((ch === "," || ch === ";") && !quoted && depth === 0) {
-      out.push(...parseOne(current));
+      push(current);
       current = "";
       continue;
     }
     current += ch;
   }
-  out.push(...parseOne(current));
+  push(current);
   return out;
 }
 
+/**
+ * Parse a stored address list ("A <a@x>, b@y") into individual contacts.
+ * Stored values come from headers, so they are comma-joined and may carry
+ * display names, quotes and angle brackets.
+ */
+export function parseAddressList(raw: unknown): Contact[] {
+  // Bound the input. Header values are attacker-controlled (msg_from is built
+  // from parsed.from.name), and a 40 KB run of "<" is a real inbound message.
+  const value = String(raw ?? "").slice(0, MAX_ADDRESS_LIST_CHARS);
+  if (!value) return [];
+  return splitAddressList(value).flatMap(parseOne);
+}
+
+// Control characters and whitespace runs in a display name. Written with
+// escapes so no literal control character sits in this file.
+const NAME_NOISE = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\s]+", "g");
+// RFC 5322 "specials" that force a display name into a quoted-string. The dot
+// is special too, but obs-phrase permits it bare and every parser accepts it,
+// so "Amazon.com" is not wrapped in quotes for nothing.
+const NAME_NEEDS_QUOTING = /[()<>[\]:;@\\,"]/;
+
+/** A display name as one line of text: controls and whitespace runs → one space. */
+export function cleanDisplayName(name: string | null | undefined): string {
+  return (name ?? "").replace(NAME_NOISE, " ").trim();
+}
+
+/**
+ * Render a mailbox for storage and display: `Name <addr>`, with the name as an
+ * RFC 5322 quoted-string (backslash and quote escaped) when it contains a
+ * character that would otherwise change how the string parses. Unquoted,
+ * `Doe, John <j@x>` reads as two entries and the sender becomes "John"; a name
+ * holding "<...>" reads as a second address. No name → `<addr>`.
+ */
+export function formatMailbox(name: string | null | undefined, address: string): string {
+  const clean = cleanDisplayName(name);
+  if (!clean) return `<${address}>`;
+  const shown = NAME_NEEDS_QUOTING.test(clean) ? `"${clean.replace(/[\\"]/g, "\\$&")}"` : clean;
+  return `${shown} <${address}>`;
+}
+
+/**
+ * Strip the RFC 5322 decoration from one entry: comments ("a@x.com (Alice)")
+ * and a leading group label ("Team: ..."). Both are recognised only OUTSIDE a
+ * quoted string. A display name like "Sales: Support" or "Acme (Billing)" is
+ * rendered quoted by formatMailbox, and treating its colon or parentheses as
+ * syntax cut the name to `Support"` or dropped part of it.
+ * Also reports where the last unquoted "<" is, i.e. where the angle-addr starts.
+ */
+function undecorate(entry: string): { text: string; angle: number } {
+  let text = "";
+  let quoted = false;
+  let colon = -1;
+  let noMoreClosers = false;
+  for (let i = 0; i < entry.length; i++) {
+    const ch = entry[i];
+    if (quoted) {
+      text += ch;
+      // A backslash escapes the next character only inside a quoted string.
+      if (ch === "\\" && i + 1 < entry.length) text += entry[++i];
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === "(" && !noMoreClosers) {
+      const close = entry.indexOf(")", i + 1);
+      if (close !== -1) {
+        text += " ";
+        i = close;
+        continue;
+      }
+      noMoreClosers = true; // unbalanced: an ordinary character, and stop looking
+    } else if (ch === ":" && colon === -1) colon = text.length;
+    text += ch;
+  }
+  if (colon !== -1 && !text.slice(0, colon).includes("@")) text = text.slice(colon + 1);
+  text = text.trim();
+
+  let angle = -1;
+  quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === "\\") i++;
+      else if (ch === '"') quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === "<") angle = i;
+  }
+  // An unterminated quote swallowed the address: fall back to the plain last "<".
+  if (angle === -1 || quoted) angle = text.lastIndexOf("<");
+  return { text, angle };
+}
+
 function parseOne(entry: string): Contact[] {
-  let s = entry.trim();
+  const { text: s, angle: lt } = undecorate(entry.trim());
   if (!s) return [];
-  // Drop an RFC 5322 comment ("a@x.com (Alice)") and a group label ("Team: ...").
-  s = s.replace(/\([^)]*\)/g, " ").trim();
-  const colon = s.indexOf(":");
-  if (colon !== -1 && !s.slice(0, colon).includes("@")) s = s.slice(colon + 1).trim();
 
   // Index scan rather than /^(.*)<([^>]+)>$/: that regex backtracks quadratically
   // when it FAILS on a string with many "<", which one inbound message can
   // trigger. Measured 4x per doubling; 40k "<" cost ~570 ms per call.
   let email: string;
   let name = "";
-  const lt = s.lastIndexOf("<");
   const gt = lt >= 0 ? s.indexOf(">", lt + 1) : -1;
   if (lt >= 0 && gt > lt) {
     email = s.slice(lt + 1, gt).trim();
@@ -99,8 +185,11 @@ function parseOne(entry: string): Contact[] {
   // "a@x.com>" through, and it survived the client validator too, so the user
   // could send to a broken address from a suggestion that looked fine.
   if (!ADDRESS_RE.test(email)) return [];
-  name = name.replace(/^"(.*)"$/, "$1").replace(/\\(.)/g, "$1").trim();
-  return [{ email, name }];
+  // Only a quoted-string is unescaped: bare, a backslash is just a character.
+  if (name.length >= 2 && name.startsWith('"') && name.endsWith('"')) {
+    name = name.slice(1, -1).replace(/\\(.)/g, "$1");
+  }
+  return [{ email, name: name.trim() }];
 }
 
 /** True when `c` matches what the user has typed so far. */

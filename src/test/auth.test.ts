@@ -45,6 +45,20 @@ describe("verifyAccess", () => {
     const req = new Request("https://x/api/me", { headers: { Authorization: "Bearer secret" } });
     expect(await verifyAccess(req, env)).toBe("api-token");
   });
+  it("falls through to the bearer when the JWT has a foreign audience", async () => {
+    const { env, sign } = await setup();
+    const jwt = await sign({ aud: ["OTHER"] });
+    const req = new Request("https://x/api/me", {
+      headers: { "Cf-Access-Jwt-Assertion": jwt, Authorization: "Bearer secret" },
+    });
+    expect(await verifyAccess(req, env)).toBe("api-token");
+  });
+  it("still rejects a foreign-audience JWT without a bearer", async () => {
+    const { env, sign } = await setup();
+    const jwt = await sign({ email: "x@y.com", aud: ["OTHER"] });
+    const req = new Request("https://x/api/me", { headers: { "Cf-Access-Jwt-Assertion": jwt } });
+    expect(await verifyAccess(req, env)).toBeNull();
+  });
   it("rejects when nothing is provided", async () => {
     const { env } = await setup();
     expect(await verifyAccess(new Request("https://x/api/me"), env)).toBeNull();

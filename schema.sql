@@ -19,10 +19,14 @@ CREATE TABLE IF NOT EXISTS messages (
   starred         INTEGER NOT NULL DEFAULT 0,
   trashed_at      INTEGER,
   domain          TEXT,
+  envelope_to     TEXT,                         -- normalized SMTP envelope recipient (RCPT TO): the address the mail was delivered to (migrations/0019-envelope-to.sql)
   pre_trash_state TEXT,                         -- state before trash, for restore
   category        TEXT,                         -- AI auto-label (primary|promotions|updates|social); NULL = uncategorized
   dmarc_pass      INTEGER NOT NULL DEFAULT 0,  -- 1 = DMARC passed on ingest; gates remote image auto-load
-  from_addr       TEXT                          -- authenticated sender mailbox (parsed.from.address); image-allowlist key
+  from_addr       TEXT,                         -- authenticated sender mailbox (parsed.from.address); image-allowlist key
+  spam            INTEGER NOT NULL DEFAULT 0,   -- 1 = junk: a trashed message listed under Junk (migrations/0017-junk.sql)
+  snoozed_until   INTEGER,                      -- hidden from the inbox until this time (migrations/0018-snooze.sql)
+  woke_at         INTEGER                       -- when a snooze ended; sorts the thread back to the top
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_date ON messages(folder, date DESC);
@@ -33,6 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_state_trashed ON messages(state, trashed
 CREATE INDEX IF NOT EXISTS idx_messages_starred       ON messages(starred);
 CREATE INDEX IF NOT EXISTS idx_messages_domain        ON messages(domain);
 CREATE INDEX IF NOT EXISTS idx_messages_category      ON messages(category);
+CREATE INDEX IF NOT EXISTS idx_messages_message_id    ON messages(message_id);
 
 -- Multi-domain registry: one row per connected domain. See migrations/0007.
 CREATE TABLE IF NOT EXISTS domains (
@@ -41,8 +46,8 @@ CREATE TABLE IF NOT EXISTS domains (
   sending_domain  TEXT,               -- onboarded Email Sending domain (transport From), NULL = no sending
   receive_mode    TEXT,               -- 'inbox' | 'forward' | 'external' | 'off' (informational cache)
   forward_copy_to TEXT,               -- per-domain forward-copy override; NULL = global FORWARD_COPY_TO
-  display_name    TEXT,
-  signature       TEXT,               -- From display name default for this identity
+  display_name    TEXT,               -- From display name default for this identity
+  signature       TEXT,               -- plain-text signature appended to new messages
   created         INTEGER NOT NULL
 );
 
@@ -85,6 +90,16 @@ CREATE TABLE IF NOT EXISTS image_senders (
   created_at INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_messages_from_addr ON messages(from_addr);
+CREATE INDEX IF NOT EXISTS idx_messages_snoozed ON messages(snoozed_until) WHERE snoozed_until IS NOT NULL;
+
+-- Senders whose mail goes straight to Junk: a lowercased mailbox, or a whole
+-- domain written "@b.example". See migrations/0017-junk.sql.
+CREATE TABLE IF NOT EXISTS blocked_senders (
+  address TEXT PRIMARY KEY,
+  created INTEGER NOT NULL
+);
+
 -- Drafts: autosaved compose state (dialog + inline reply). body_json holds the
 -- rich editor document (TipTap JSON, stringified); body_text is the plain
 -- mirror for list snippets. Client-generated ids; PUT upserts. See
@@ -102,7 +117,10 @@ CREATE TABLE IF NOT EXISTS drafts (
   from_name   TEXT,
   -- JSON manifest of {name,type,size}; the bytes live in R2 (draftatt/<id>.json).
   attachments TEXT,
-  updated     INTEGER NOT NULL
+  updated     INTEGER NOT NULL,
+  -- Cc and Bcc, comma-joined like msg_to (migrations/0016-draft-cc.sql).
+  msg_cc      TEXT,
+  msg_bcc     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated DESC);
 
@@ -115,4 +133,13 @@ CREATE TABLE IF NOT EXISTS managed_routing_rules (
   rule_id  TEXT NOT NULL,
   created  INTEGER NOT NULL,
   PRIMARY KEY (zone_id, rule_id)
+);
+
+-- Tombstones for permanently deleted mail whose search entry and R2 objects
+-- still have to be removed. Written in the same transaction as the row delete,
+-- cleared by drainPendingDeletes. See migrations/0015.
+CREATE TABLE IF NOT EXISTS pending_deletes (
+  id         TEXT PRIMARY KEY,
+  r2_raw_key TEXT,
+  created    INTEGER NOT NULL
 );

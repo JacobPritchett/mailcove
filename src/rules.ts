@@ -3,7 +3,8 @@
 // action (archive/trash/star/read). Applied best-effort at ingest — never
 // blocks delivery, never throws into the mail path.
 
-import { mutateThread } from "./store_mutations";
+import { parseAddressList } from "./contacts";
+import { mutateMessage } from "./store_mutations";
 
 export const FILTER_FIELDS = ["from", "to", "subject"] as const;
 export type FilterField = (typeof FILTER_FIELDS)[number];
@@ -35,10 +36,34 @@ export interface Filter {
 /** The message fields a filter can match against. */
 export interface MatchTarget { from: string; to: string; subject: string }
 
+/**
+ * The forms of a stored From a rule may be written against, lowercased:
+ * the string as stored, the bare address, and the DECODED form (display name
+ * unquoted and unescaped, then ` <addr>`).
+ *
+ * msg_from is a display serialization: a name with a comma or a quote in it is
+ * stored as an RFC 5322 quoted-string. A rule is typed from what the user sees
+ * (`Doe, John <a@x.com>`, `John "Johnny" Doe`), so matching only the stored
+ * string would make it depend on a storage detail.
+ */
+function fromForms(stored: string): { stored: string; decoded: string; address: string } {
+  const raw = stored.toLowerCase();
+  const parsed = parseAddressList(stored);
+  if (parsed.length !== 1) return { stored: raw, decoded: raw, address: "" };
+  const { name, email } = parsed[0];
+  return { stored: raw, decoded: (name ? `${name} <${email}>` : `<${email}>`).toLowerCase(), address: email };
+}
+
 /** Does `filter` match `target`? Case-insensitive; empty value never matches. */
 export function matchFilter(filter: Pick<Filter, "field" | "op" | "value">, target: MatchTarget): boolean {
   const needle = filter.value.trim().toLowerCase();
   if (!needle) return false;
+  if (filter.field === "from") {
+    const f = fromForms(target.from || "");
+    return filter.op === "equals"
+      ? needle === f.decoded.trim() || needle === f.stored.trim() || needle === f.address
+      : f.decoded.includes(needle) || f.stored.includes(needle);
+  }
   const hay = (target[filter.field] || "").toLowerCase();
   return filter.op === "equals" ? hay.trim() === needle : hay.includes(needle);
 }
@@ -51,15 +76,21 @@ const FILES_AWAY = new Set<FilterAction>(["archive", "trash"]);
 export interface ApplyResult { applied: FilterAction[]; leftInbox: boolean }
 
 /**
- * Apply all enabled, matching filters to a just-received message's THREAD,
- * reusing the app's own mutateThread so behavior (thread-level state,
- * pre_trash_state, etc.) is identical to a manual archive/trash/star/read.
- * Returns which actions fired and whether the thread left the inbox (so the
+ * Apply all enabled, matching filters to a just-received MESSAGE (by internal
+ * id), with the same state transitions as a manual archive/trash/star/read
+ * (pre_trash_state, trashed_at, etc.).
+ *
+ * Deliberately not thread-wide. The thread a message lands in is decided by its
+ * References header, which the sender controls: acting on the whole thread let
+ * an out-of-office reply (or anyone who knew a Message-ID) trash or archive a
+ * real conversation through a rule that only ever matched their own message.
+ *
+ * Returns which actions fired and whether THIS message left the inbox (so the
  * caller can suppress a new-mail push for auto-filed mail). Best-effort.
  */
 export async function applyFilters(
   env: RulesEnv,
-  threadId: string,
+  messageId: string,
   target: MatchTarget,
   now: number,
 ): Promise<ApplyResult> {
@@ -74,11 +105,11 @@ export async function applyFilters(
     for (const f of results ?? []) {
       if (!isFilterField(f.field) || !isFilterOp(f.op) || !isFilterAction(f.action)) continue;
       if (!matchFilter(f, target)) continue;
-      // Once a rule has filed the thread away, don't also apply a later move;
+      // Once a rule has filed the message away, don't also apply a later move;
       // star/read can still stack.
       if (leftInbox && FILES_AWAY.has(f.action)) continue;
       try {
-        await mutateThread(env, threadId, f.action, now);
+        await mutateMessage(env, messageId, f.action, now);
         applied.push(f.action);
         if (FILES_AWAY.has(f.action)) leftInbox = true;
       } catch (e) {

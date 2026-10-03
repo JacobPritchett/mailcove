@@ -26,7 +26,7 @@ interface AiEnv {
 }
 
 /** Same affordable instruct model used elsewhere (see src/ai.ts). */
-export const CATEGORIZE_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+export const CATEGORIZE_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 
 const SYSTEM =
   "You are an email classifier. Classify the email into EXACTLY ONE category and reply with ONLY that single lowercase word, nothing else:\n" +
@@ -35,6 +35,14 @@ const SYSTEM =
   "- updates: automated notifications, receipts, confirmations, statements, alerts, system mail\n" +
   "- social: notifications from social networks or community platforms\n" +
   "When unsure, choose primary.";
+
+/** The same task with one extra label for junk. See classifyWithJunk. */
+const SYSTEM_WITH_JUNK =
+  SYSTEM.replace(
+    "When unsure, choose primary.",
+    "- spam: unsolicited bulk mail, scams, phishing, fake invoices or prizes, anything a person would report as junk\n" +
+      "Marketing from a real company the reader may have signed up for is promotions, not spam. When unsure, choose primary.",
+  );
 
 export interface ClassifyInput { from: string; subject: string; snippet: string; }
 
@@ -55,4 +63,26 @@ export async function classifyMessage(env: AiEnv, input: ClassifyInput): Promise
     ],
   });
   return parseCategory(res.response) ?? "primary";
+}
+
+/**
+ * Classify and also ask whether the message is junk. The junk answer is only a
+ * hint: the caller decides what to do with it (see src/junk.ts), and a model
+ * that says "spam" still leaves the stored category at the "primary" default.
+ * THROWS only if the AI call itself rejects.
+ */
+export async function classifyWithJunk(env: AiEnv, input: ClassifyInput): Promise<{ category: Category; junk: boolean }> {
+  const user =
+    `From: ${input.from || "(unknown)"}\n` +
+    `Subject: ${input.subject || "(no subject)"}\n` +
+    `Preview: ${(input.snippet || "").slice(0, 300)}`;
+  const res = await env.AI.run(CATEGORIZE_MODEL, {
+    messages: [
+      { role: "system", content: SYSTEM_WITH_JUNK },
+      { role: "user", content: user },
+    ],
+  });
+  const raw = typeof res.response === "string" ? res.response.trim().toLowerCase().replace(/[.!]+$/, "").trim() : "";
+  if (raw === "spam") return { category: "primary", junk: true };
+  return { category: parseCategory(res.response) ?? "primary", junk: false };
 }

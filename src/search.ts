@@ -10,7 +10,9 @@
 //   FTS5 MATCH (only `"token"*` atoms), so nothing a user types can be parsed
 //   as FTS5 syntax/operators (no injection, no "no such column" errors).
 
+import { htmlToText } from "./htmlText";
 import type { ThreadListRow } from "./store_views";
+import { buildSearchSql, parseSearchQuery } from "./searchQuery";
 
 interface SearchEnv { DB: D1Database; }
 interface ReindexEnv { DB: D1Database; MAILSTORE: R2Bucket; }
@@ -29,9 +31,10 @@ export function toFtsMatch(q: string): string | null {
   return tokens.slice(0, MAX_TOKENS).map((t) => `"${t}"*`).join(" ");
 }
 
-/** Flatten a message body for indexing: prefer plain text, else strip HTML. */
+/** Flatten a message body for indexing: prefer plain text, else the text of
+ *  the HTML (htmlToText: linear, and without stylesheet or script contents). */
 export function bodyForIndex(text: string, html: string): string {
-  const raw = text && text.trim() ? text : html.replace(/<[^>]+>/g, " ");
+  const raw = text && text.trim() ? text : htmlToText(html);
   return raw.replace(/\s+/g, " ").trim();
 }
 
@@ -90,55 +93,27 @@ export async function ftsDelete(env: SearchEnv, ids: string[]): Promise<void> {
 }
 
 /**
- * Full-text search → thread-collapsed list rows, ordered by relevance (best
- * bm25 match per thread). Trashed messages are excluded. Mirrors the
- * ThreadListRow shape produced by listThreadsByView so the client renders
- * results with the same list component.
+ * Search → thread-collapsed list rows. Free text is bm25-ranked through FTS5;
+ * operators (from:, has:attachment, before:, ...) narrow by message columns.
+ * Trash is excluded unless the query says `in:trash`. Mirrors the ThreadListRow
+ * shape produced by listThreadsByView so the client renders results with the
+ * same list component. See searchQuery.ts for the grammar and the SQL shape.
  */
-export async function searchThreads(env: SearchEnv, q: string, limit = 200): Promise<ThreadListRow[]> {
-  const match = toFtsMatch(q);
-  if (!match) return [];
-  // FTS5 gotcha: bm25() is an auxiliary function that may ONLY be evaluated where
-  // the FTS table is the sole, UNALIASED source of the query with the MATCH in
-  // its WHERE — never aliased, never inside an aggregate over a JOIN. So compute
-  // the per-message rank in a MATERIALIZED `ranked` CTE first (materialization is
-  // required: an inlined CTE would push bm25 back into the join and fail), then
-  // aggregate the plain rank per thread in `hits`. The outer SELECT rebuilds each
-  // thread's display row from its latest non-trash message (same collapse as the
-  // normal views), ordered by relevance (lowest bm25 = best match).
-  const live = "x.thread_id=h.thread_id AND x.state!='trash'";
-  const latest = (f: string) => `(SELECT ${f} FROM messages x WHERE ${live} ORDER BY x.date DESC LIMIT 1)`;
-  const sql = `
-    WITH ranked AS MATERIALIZED (
-      SELECT messages_fts.message_id AS message_id, bm25(messages_fts) AS rank
-      FROM messages_fts
-      WHERE messages_fts MATCH ?1
-    ),
-    hits AS (
-      SELECT m.thread_id AS thread_id, MIN(ranked.rank) AS rank
-      FROM ranked
-      JOIN messages m ON m.id = ranked.message_id
-      WHERE m.state != 'trash'
-      GROUP BY m.thread_id
-    )
-    SELECT
-      h.thread_id AS thread_id,
-      ${latest("id")} AS id,
-      ${latest("msg_from")} AS msg_from,
-      ${latest("msg_to")} AS msg_to,
-      ${latest("subject")} AS subject,
-      ${latest("snippet")} AS snippet,
-      ${latest("category")} AS category,
-      ${latest("domain")} AS domain,
-      (SELECT MAX(date) FROM messages x WHERE ${live}) AS date,
-      (SELECT COUNT(*) FROM messages x WHERE ${live}) AS count,
-      (SELECT MAX(unread) FROM messages x WHERE ${live}) AS anyUnread,
-      (SELECT MAX(has_attachments) FROM messages x WHERE ${live}) AS hasAttachments,
-      (SELECT MAX(starred) FROM messages x WHERE ${live}) AS starred
-    FROM hits h
-    ORDER BY h.rank
-    LIMIT ?2`;
-  const { results } = await env.DB.prepare(sql).bind(match, limit).all<ThreadListRow>();
+export async function searchThreads(
+  env: SearchEnv,
+  q: string,
+  limit = 200,
+  opts: { offset?: number; domain?: string; domainIncludesNull?: boolean; now?: number; tzOffsetMin?: number } = {},
+): Promise<ThreadListRow[]> {
+  const parsed = parseSearchQuery(q, opts.now, opts.tzOffsetMin);
+  if (parsed.empty) return [];
+  const { sql, binds } = buildSearchSql(parsed, {
+    limit,
+    offset: opts.offset,
+    domain: opts.domain,
+    domainIncludesNull: opts.domainIncludesNull,
+  });
+  const { results } = await env.DB.prepare(sql).bind(...binds).all<ThreadListRow>();
   return results ?? [];
 }
 

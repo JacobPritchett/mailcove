@@ -42,4 +42,20 @@ describe("serveAttachment", () => {
     expect(res.headers.get("Content-Disposition")).toContain("attachment");
     expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
+
+  // A header value must be ASCII. A raw non-ASCII filename is an invalid header:
+  // some proxies reject the response outright and browsers guess at the bytes.
+  it("keeps the header ASCII and carries a non-ASCII filename in filename*", () => {
+    const res = serveAttachment(new Uint8Array([1]), "application/zip", "\u0444\u043e\u0442\u043e \u0438 docs.zip");
+    const cd = res.headers.get("Content-Disposition")!;
+    expect(/^[\x20-\x7e]+$/.test(cd)).toBe(true);
+    expect(cd).toContain('filename="____ _ docs.zip"');
+    expect(cd).toContain("filename*=UTF-8''%D1%84%D0%BE%D1%82%D0%BE%20%D0%B8%20docs.zip");
+  });
+
+  it("does not add filename* for a plain ASCII name, and neutralises header breakers", () => {
+    const res = serveAttachment(new Uint8Array([1]), "application/zip", 'a"b\\c\r\nX: y.zip');
+    const cd = res.headers.get("Content-Disposition")!;
+    expect(cd).toBe('attachment; filename="a_b_c__X: y.zip"');
+  });
 });

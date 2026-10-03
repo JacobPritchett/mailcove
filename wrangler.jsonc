@@ -20,7 +20,8 @@
   // Replace with the hostname you want the inbox served from.
   "routes": [{ "pattern": "inbox.example.com", "custom_domain": true }],
   "workers_dev": false,
-  "triggers": { "crons": ["0 4 * * *"] },
+  // Daily housekeeping at 04:00 UTC, and a frequent tick that wakes snoozed mail.
+  "triggers": { "crons": ["0 4 * * *", "*/5 * * * *"] },
 
   // Outbound: send from the onboarded sending subdomain (no API keys needed).
   "send_email": [{ "name": "EMAIL" }],

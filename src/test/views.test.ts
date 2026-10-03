@@ -4,12 +4,17 @@ describe("view predicates", () => {
   it("maps each view to its WHERE", () => {
     expect(isView("inbox")).toBe(true);
     expect(isView("bogus")).toBe(false);
-    expect([...VIEWS].sort()).toEqual(["all", "inbox", "sent", "starred", "trash"]);
+    expect([...VIEWS].sort()).toEqual(["all", "inbox", "sent", "snoozed", "spam", "starred", "trash"]);
+    // The inbox and Snoozed split on the clock.
+    expect(viewWhere("inbox", 1234.9)).toBe("direction='in' AND state='inbox' AND (snoozed_until IS NULL OR snoozed_until <= 1234)");
+    expect(viewWhere("snoozed", 1234)).toBe("state='inbox' AND snoozed_until > 1234");
     expect(viewWhere("inbox")).toMatch(/direction='in' AND state='inbox'/);
     expect(viewWhere("starred")).toMatch(/starred=1 AND state!='trash'/);
     expect(viewWhere("sent")).toMatch(/direction='out' AND state!='trash'/);
     expect(viewWhere("all")).toMatch(/state!='trash'/);
-    expect(viewWhere("trash")).toMatch(/state='trash'/);
+    // Trash and Junk split the trash state between them.
+    expect(viewWhere("trash")).toBe("state='trash' AND spam=0");
+    expect(viewWhere("spam")).toBe("state='trash' AND spam=1");
   });
 });
 

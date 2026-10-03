@@ -70,11 +70,29 @@ export function validSubscriptionKeys(p256dh: string, auth: string): boolean {
   }
 }
 
-/** Truncate a string to at most `maxBytes` UTF-8 bytes (notification payloads are capped). */
+/**
+ * Truncate a string to at most `maxBytes` UTF-8 bytes (notification payloads
+ * are capped), never splitting a character.
+ *
+ * One pass over at most `maxBytes` code points, counting the bytes each would
+ * encode to. The previous form re-encoded the WHOLE string once per character
+ * it removed, which is quadratic in a field the sender controls: an 80 KB
+ * subject cost half a second of CPU per notification.
+ */
 export function clampUtf8(s: string, maxBytes: number): string {
-  let out = s ?? "";
-  while (enc.encode(out).length > maxBytes) out = out.slice(0, -1);
-  return out;
+  const str = s ?? "";
+  let bytes = 0;
+  let i = 0;
+  while (i < str.length) {
+    const cp = str.codePointAt(i) as number;
+    // A lone surrogate encodes as U+FFFD, which is three bytes like any other
+    // BMP character above U+07FF.
+    const size = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return i === str.length ? str : str.slice(0, i);
 }
 
 /** Max subscriptions we keep / fan out to (personal-scale; bounds per-email work). */

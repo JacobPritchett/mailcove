@@ -23,10 +23,10 @@ describe("normalizeFromAddress (anti display-name spoofing)", () => {
 
 describe("parseAuthResults", () => {
   it("returns 1 when dmarc=pass present", () => {
-    expect(parseAuthResults("mx.cf.net; spf=pass; dkim=pass; dmarc=pass header.from=x.com")).toBe(1);
+    expect(parseAuthResults("mx.cloudflare.net; spf=pass; dkim=pass; dmarc=pass header.from=x.com")).toBe(1);
   });
   it("returns 0 when dmarc fails or absent", () => {
-    expect(parseAuthResults("mx; dmarc=fail")).toBe(0);
+    expect(parseAuthResults("mx.cloudflare.net; dmarc=fail")).toBe(0);
     expect(parseAuthResults(null)).toBe(0);
   });
 });
@@ -37,7 +37,7 @@ describe("dmarcPassFromHeaders (anti-spoofing)", () => {
     // message claims dmarc=pass. The forged one must be ignored.
     expect(
       dmarcPassFromHeaders([
-        { key: "Authentication-Results", value: "mx.cf.net; spf=fail; dmarc=fail" },
+        { key: "Authentication-Results", value: "mx.cloudflare.net; spf=fail; dmarc=fail" },
         { key: "Authentication-Results", value: "spoofed.invalid; dmarc=pass" },
         { key: "From", value: "trusted@allowlisted.com" },
       ]),
@@ -46,7 +46,7 @@ describe("dmarcPassFromHeaders (anti-spoofing)", () => {
   it("returns 1 when the first (trusted) result is dmarc=pass", () => {
     expect(
       dmarcPassFromHeaders([
-        { key: "authentication-results", value: "mx.cf.net; dmarc=pass header.from=x.com" },
+        { key: "authentication-results", value: "mx.cloudflare.net; dmarc=pass header.from=x.com" },
         { key: "authentication-results", value: "whatever; dmarc=fail" },
       ]),
     ).toBe(1);

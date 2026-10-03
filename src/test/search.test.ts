@@ -128,8 +128,8 @@ describe("searchThreads", () => {
     expect(sql).toMatch(/state\s*!=\s*'trash'/i);
     expect(sql).toMatch(/GROUP BY m\.thread_id/i);
     expect(sql).toMatch(/ORDER BY h\.rank/i);
-    // Binds: the sanitized match expression, then the limit.
-    expect(params).toEqual(['"spice"*', 50]);
+    // Binds: the sanitized match expression, then the limit and offset.
+    expect(params).toEqual(['"spice"*', 50, 0]);
   });
 });
 

@@ -61,12 +61,20 @@ function makeCtx() {
   return { ctx, tail };
 }
 
-function domainOfInsert(insert: { sql: string; params: any[] }): string {
+function insertValue(insert: { sql: string; params: any[] }, column: string): string {
   const cols = insert.sql
     .slice(insert.sql.indexOf("(") + 1, insert.sql.indexOf(")"))
     .split(",")
     .map((s) => s.trim());
-  return insert.params[cols.indexOf("domain")];
+  return insert.params[cols.indexOf(column)];
+}
+
+function domainOfInsert(insert: { sql: string; params: any[] }): string {
+  return insertValue(insert, "domain");
+}
+
+function envelopeToOfInsert(insert: { sql: string; params: any[] }): string {
+  return insertValue(insert, "envelope_to");
 }
 
 describe("inbound domain attribution", () => {
@@ -77,6 +85,14 @@ describe("inbound domain attribution", () => {
     await Promise.all(tail);
     expect(inserts).toHaveLength(1);
     expect(domainOfInsert(inserts[0])).toBe("example.org");
+  });
+
+  it("stores the normalized envelope recipient (the address the mail was delivered to)", async () => {
+    const { env, inserts } = makeEnv();
+    const { ctx, tail } = makeCtx();
+    await worker.email(makeMessage("<Shop@Example.ORG>"), env, ctx);
+    await Promise.all(tail);
+    expect(envelopeToOfInsert(inserts[0])).toBe("shop@example.org");
   });
 
   it("normalizes the envelope domain to lowercase", async () => {

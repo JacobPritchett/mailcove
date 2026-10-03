@@ -24,9 +24,9 @@ function makeDb() {
 const env = (db: unknown) => ({ DB: db, MAILSTORE: { delete: async () => {}, list: async () => ({ objects: [], truncated: false }) } } as never);
 
 describe("MAIL_ACTIONS / isMailAction", () => {
-  it("allow-lists exactly the 9 actions", () => {
+  it("allow-lists exactly the 13 actions", () => {
     expect([...MAIL_ACTIONS].sort()).toEqual(
-      ["archive", "delete", "read", "restore", "star", "trash", "unarchive", "unread", "unstar"],
+      ["archive", "delete", "read", "restore", "snooze", "spam", "star", "trash", "unarchive", "unread", "unsnooze", "unspam", "unstar"],
     );
     expect(isMailAction("archive")).toBe(true);
     expect(isMailAction("nuke")).toBe(false);
@@ -39,7 +39,9 @@ describe("mutateThread", () => {
     await mutateThread(env(db), "t1", "trash", 1000);
     const upd = calls.find((c) => /state='trash', trashed_at=\?/.test(c.sql));
     expect(upd).toBeTruthy();
-    expect(upd!.sql).toMatch(/pre_trash_state = CASE WHEN state!='trash'/);
+    // Only live messages move, so the pre-trash state is simply the current one.
+    expect(upd!.sql).toMatch(/pre_trash_state = state,/);
+    expect(upd!.sql).toMatch(/AND state!='trash'$/);
     expect(upd!.params).toContain(1000);
     expect(upd!.params).toContain("t1");
   });

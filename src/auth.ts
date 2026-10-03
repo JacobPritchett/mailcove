@@ -6,6 +6,9 @@ export interface AuthEnv {
   AUTH_TOKEN?: string;
 }
 
+/** The automation credential's principal (the AUTH_TOKEN bearer). */
+export const API_TOKEN_PRINCIPAL = "api-token";
+
 let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 
 function getJwks(env: AuthEnv) {
@@ -41,9 +44,16 @@ export async function verifyAccess(req: Request, env: AuthEnv): Promise<string |
         audience: env.ACCESS_AUD,
       });
       const email = (payload as any).email;
-      return typeof email === "string" ? email : null;
+      if (typeof email === "string") return email;
+      // Valid assertion but no email claim (e.g. an Access service token that
+      // cleared the edge under a different app). Not a principal by itself —
+      // fall through to the bearer check, which is an independent
+      // full-strength credential. This grants nothing a bearer-only request
+      // could not already get.
     } catch {
-      return null;
+      // Unverifiable or foreign-audience assertion — same reasoning: fall
+      // through rather than hard-fail, so service-token-fronted automation
+      // can present the bearer credential.
     }
   }
   // AUTH_TOKEN is an intentional automation credential, secondary to the Access
@@ -52,7 +62,7 @@ export async function verifyAccess(req: Request, env: AuthEnv): Promise<string |
   const auth = req.headers.get("Authorization");
   if (env.AUTH_TOKEN && auth?.startsWith("Bearer ")) {
     const presented = auth.slice("Bearer ".length);
-    if (timingSafeEqual(presented, env.AUTH_TOKEN)) return "api-token";
+    if (timingSafeEqual(presented, env.AUTH_TOKEN)) return API_TOKEN_PRINCIPAL;
   }
   return null;
 }

@@ -10,6 +10,9 @@ export interface DraftRow {
   thread_id: string | null;
   in_reply_to: string | null;
   msg_to: string | null;
+  /** Added by migration 0016; absent on a database that predates it. */
+  msg_cc?: string | null;
+  msg_bcc?: string | null;
   subject: string | null;
   body_text: string | null;
   body_json: string | null;
@@ -33,7 +36,9 @@ export const DRAFTS_DDL = `CREATE TABLE IF NOT EXISTS drafts (
   from_domain TEXT,
   from_name   TEXT,
   attachments TEXT,
-  updated     INTEGER NOT NULL
+  updated     INTEGER NOT NULL,
+  msg_cc      TEXT,
+  msg_bcc     TEXT
 )`;
 
 export async function ensureDraftsTable(env: { DB: D1Database }): Promise<void> {
@@ -49,6 +54,8 @@ export function isDraftId(id: unknown): id is string {
 // runaway client (or a paste bomb) can't bloat D1 rows.
 export const DRAFT_LIMITS = {
   to: 2_000,
+  cc: 2_000,
+  bcc: 2_000,
   subject: 1_000,
   bodyText: 100_000,
   bodyJson: 400_000,
@@ -64,6 +71,8 @@ export interface DraftUpsert {
   threadId?: string;
   inReplyTo?: string;
   to?: string;
+  cc?: string;
+  bcc?: string;
   subject?: string;
   bodyText?: string;
   bodyJson?: string;
@@ -81,6 +90,8 @@ export function validateDraft(b: Record<string, unknown>): { draft: DraftUpsert 
     threadId: str(b.threadId),
     inReplyTo: str(b.inReplyTo),
     to: str(b.to),
+    cc: str(b.cc),
+    bcc: str(b.bcc),
     subject: str(b.subject),
     bodyText: str(b.bodyText),
     bodyJson: str(b.bodyJson),
@@ -108,36 +119,47 @@ export function validateDraft(b: Record<string, unknown>): { draft: DraftUpsert 
 
 export async function putDraft(env: { DB: D1Database }, d: DraftUpsert, now: number): Promise<void> {
   await ensureDraftsTable(env);
-  await env.DB.prepare(
-    `INSERT INTO drafts (id, thread_id, in_reply_to, msg_to, subject, body_text, body_json,
-                         from_local, from_domain, from_name, updated)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)
-     ON CONFLICT(id) DO UPDATE SET
-       thread_id   = excluded.thread_id,
-       in_reply_to = excluded.in_reply_to,
-       msg_to      = excluded.msg_to,
-       subject     = excluded.subject,
-       body_text   = excluded.body_text,
-       body_json   = excluded.body_json,
-       from_local  = excluded.from_local,
-       from_domain = excluded.from_domain,
-       from_name   = excluded.from_name,
-       updated     = excluded.updated`,
-  )
-    .bind(
-      d.id,
-      d.threadId ?? null,
-      d.inReplyTo ?? null,
-      d.to ?? null,
-      d.subject ?? null,
-      d.bodyText ?? null,
-      d.bodyJson ?? null,
-      d.fromLocal ?? null,
-      d.fromDomain ?? null,
-      d.fromName ?? null,
-      now,
+  const base = [
+    d.id,
+    d.threadId ?? null,
+    d.inReplyTo ?? null,
+    d.to ?? null,
+    d.subject ?? null,
+    d.bodyText ?? null,
+    d.bodyJson ?? null,
+    d.fromLocal ?? null,
+    d.fromDomain ?? null,
+    d.fromName ?? null,
+    now,
+  ];
+  const upsert = (withCopies: boolean) =>
+    env.DB.prepare(
+      `INSERT INTO drafts (id, thread_id, in_reply_to, msg_to, subject, body_text, body_json,
+                           from_local, from_domain, from_name, updated${withCopies ? ", msg_cc, msg_bcc" : ""})
+       VALUES (?,?,?,?,?,?,?,?,?,?,?${withCopies ? ",?,?" : ""})
+       ON CONFLICT(id) DO UPDATE SET
+         thread_id   = excluded.thread_id,
+         in_reply_to = excluded.in_reply_to,
+         msg_to      = excluded.msg_to,
+         subject     = excluded.subject,
+         body_text   = excluded.body_text,
+         body_json   = excluded.body_json,
+         from_local  = excluded.from_local,
+         from_domain = excluded.from_domain,
+         from_name   = excluded.from_name,
+         updated     = excluded.updated${withCopies ? ",\n         msg_cc      = excluded.msg_cc,\n         msg_bcc     = excluded.msg_bcc" : ""}`,
     )
-    .run();
+      .bind(...base, ...(withCopies ? [d.cc ?? null, d.bcc ?? null] : []))
+      .run();
+  try {
+    await upsert(true);
+  } catch (e) {
+    // The Cc/Bcc columns arrive in migration 0016. On a database that has not
+    // taken it yet, losing the copies is far better than losing the autosave:
+    // save what the old shape can hold. Any other failure is real.
+    if (!/no (such )?column( named)?:? *msg_b?cc/i.test(e instanceof Error ? e.message : String(e))) throw e;
+    await upsert(false);
+  }
 }
 
 /** Newest-first draft summaries (snippet derived from the plain mirror). */

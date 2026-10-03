@@ -1,19 +1,24 @@
 import PostalMime from "postal-mime";
-import {
-  storeInboundAttachments,
-  parseOutboundAttachments,
-  AttachmentError,
-  type InboundPart,
-  type OutboundAttachment,
-} from "./attachments";
-import { verifyAccess } from "./auth";
-import { suggestContacts } from "./contacts";
+import { verifyAccess, API_TOKEN_PRINCIPAL } from "./auth";
+import { suggestContacts, splitAddressList, parseAddressList, formatMailbox, cleanDisplayName } from "./contacts";
 import { deriveThreadId, sanitizeMessageId } from "./threading";
-import { getThread, findThreadIdByMessageIds } from "./store";
-import { isMailAction, mutateThread, mutateThreads, purgeOldTrash } from "./store_mutations";
-import { isView, isCategory, isDomainName, listThreadsByView, countsByView, countsByDomain } from "./store_views";
+import { parseRecipients, recipientText, RecipientError, type Recipient } from "./recipients";
+import { storedHeadersFrom, referencesForReply, type StoredHeaders } from "./mailHeaders";
+import { getThread, findThreadIdByMessageIds, findSentByMessageId } from "./store";
+import { isMailAction, isSnoozeTime, mutateMessage, mutateThread, mutateThreads, purgeOldTrash, drainPendingDeletes, wakeSnoozed } from "./store_mutations";
+import {
+  isView, isCategory, isDomainName, listThreadsByView, countsByView, countsByDomain,
+  parsePageSize, parseCursor, encodeDateCursor, encodeOffsetCursor,
+} from "./store_views";
 import { ftsUpsert, ftsRowFrom, bodyForIndex, searchThreads, reindexAll } from "./search";
 import { summarizeThread, draftReply, suggestCompletion } from "./ai";
+import {
+  parseOutboundAttachments,
+  AttachmentError,
+  storeInboundAttachments,
+  type OutboundAttachment,
+  type InboundPart,
+} from "./attachments";
 import { takeToken, type Bucket } from "./ratelimit";
 import { applyFilters, isFilterField, isFilterOp, isFilterAction, MAX_FILTERS } from "./rules";
 import {
@@ -50,7 +55,8 @@ import {
   setDomainSignature,
   sanitizeSignature,
 } from "./domains";
-import { classifyMessage } from "./categorize";
+import { classifyWithJunk } from "./categorize";
+import { addBlocked, blockEntryDomain, countBlocked, isBlocked, shouldAutoJunk, listBlocked, normalizeBlockEntry, isOwnDomain, ownDomains, removeBlocked, MAX_BLOCKED } from "./junk";
 import { validateDraft, putDraft, listDrafts, getDraft, deleteDraft, countDrafts } from "./drafts";
 import {
   parseDraftAttachments,
@@ -63,7 +69,10 @@ import {
 } from "./draftAttachments";
 import { sendPushToAll, isAllowedPushEndpoint, validSubscriptionKeys, clampUtf8, MAX_SUBSCRIPTIONS } from "./push";
 import { normalizeCid, rewriteEmailImages } from "./imageRewrite";
-import { verifyMediaToken, proxyRemoteImage, RASTER_TYPES, MEDIA_TTL_SECONDS, mintMediaToken, MEDIA_KID } from "./media";
+import { htmlToText } from "./htmlText";
+import { boundAddressHeaders, rawHeader } from "./rawGuard";
+import { trustedAuthVerdicts } from "./authResults";
+import { verifyMediaToken, proxyRemoteImage, RASTER_TYPES, MEDIA_TTL_SECONDS, mintMediaToken, MEDIA_KID, validateRemoteUrl } from "./media";
 
 export interface Env {
   DB: D1Database;
@@ -75,7 +84,7 @@ export interface Env {
   FROM_DOMAIN: string;
   DEFAULT_FROM_LOCAL: string;
   FORWARD_COPY_TO?: string;
-  AUTH_TOKEN?: string; // secret — fallback auth for API/automation
+  AUTH_TOKEN?: string; // secret — fallback auth for API/automation (FULL access)
   ACCESS_TEAM_DOMAIN: string; // Cloudflare Access team domain (JWT issuer)
   ACCESS_AUD: string; // Access application AUD tag (JWT audience)
   CF_API_TOKEN?: string; // secret — CF API token for the Domains admin dashboard + onboarding
@@ -99,7 +108,6 @@ const suggestBuckets = new Map<string, Bucket>();
 const destinationBuckets = new Map<string, Bucket>();
 // …and for recipient suggestions (one query pair per keystroke).
 const contactBuckets = new Map<string, Bucket>();
-
 // …and for outbound send. The bearer automation credential drives /api/send
 // unattended, so blunt the burst a leaked or looping caller can produce: 20 at
 // once, refilling 12/min, keyed per caller and sized well above human compose
@@ -108,50 +116,13 @@ const contactBuckets = new Map<string, Bucket>();
 // so treat it as damage limiting, not a guaranteed global send rate. A hard
 // ceiling needs durable state (a Durable Object or the rate-limiting binding).
 const sendBuckets = new Map<string, Bucket>();
+/** Upper bound on recipients per send, so one call cannot fan out to a list. */
+const MAX_RECIPIENTS = 50;
 
 /** Test-only: clear the send limiter so each test starts with a full bucket. */
 export function resetSendBucketsForTest() {
   sendBuckets.clear();
 }
-/** Conservative address count: string entries may hold a comma-separated list. */
-function countAddresses(list: Recipient[]): number {
-  return list.reduce(
-    (n, r) => n + (typeof r === "string" ? r.split(",").filter((s) => s.includes("@")).length : 1),
-    0,
-  );
-}
-
-/** Render recipients for storage/display ("Name <addr>"), never "[object Object]". */
-function recipientText(r: Recipient): string {
-  if (typeof r === "string") return r;
-  return r.name ? `${r.name} <${r.email}>` : r.email;
-}
-
-/** Upper bound on recipients per send, so one call cannot fan out to a list. */
-const MAX_RECIPIENTS = 50;
-
-/** A recipient as the send binding accepts it: a bare address or {name, email}. */
-type Recipient = string | { name?: string; email: string };
-
-function isRecipientObject(r: unknown): r is { name?: string; email: string } {
-  return typeof r === "object" && r !== null
-    && typeof (r as { email?: unknown }).email === "string"
-    && looksLikeRecipient((r as { email: string }).email);
-}
-
-/** A usable recipient must carry an address and no header-breaking control chars.
- *  Deliberately looser than isEmailAddress: "Name <a@b.com>" is a valid recipient
- *  and contains spaces, so a strict address regex would reject legitimate input.
- *  This only rejects obvious junk ("12345", null, {}) that would otherwise be
- *  stringified into a plausible-looking address and stored as one. */
-function looksLikeRecipient(value: string): boolean {
-  return value.includes("@") && !/[\r\n]/.test(value);
-}
-
-function isUsableRecipient(r: unknown): r is Recipient {
-  return typeof r === "string" ? looksLikeRecipient(r) : isRecipientObject(r);
-}
-
 
 // Inert types we trust to render inline. Everything else is forced to download
 // with a generic content-type so a stored text/html (or SVG, etc.) attachment
@@ -162,6 +133,26 @@ const INLINE_TYPES = new Set([
   "image/gif",
   "image/webp",
 ]);
+
+/**
+ * Content-Disposition for a download. The quoted `filename` is an ASCII
+ * fallback with anything that could break out of the quotes replaced; a name
+ * with non-ASCII characters also gets RFC 5987 `filename*`, which every current
+ * browser prefers. A raw non-ASCII byte in a header is invalid and gets the
+ * response rejected by some intermediaries.
+ */
+export function attachmentDisposition(name: string): string {
+  const ascii = name.replace(/["\\\r\n]/g, "_").replace(/[^\x20-\x7e]/g, "_");
+  if (ascii === name.replace(/["\\\r\n]/g, "_")) return `attachment; filename="${ascii}"`;
+  // encodeURIComponent leaves a few characters RFC 5987 does not allow bare.
+  // A lone surrogate makes encodeURIComponent throw, so replace those first.
+  const wellFormed = name.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
+  const encoded = encodeURIComponent(wellFormed.replace(/[\r\n]/g, "_")).replace(
+    /['()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
 
 /**
  * Build a safe Response for a stored attachment. Allowlisted inert types are
@@ -184,29 +175,34 @@ export function serveAttachment(
       },
     });
   }
-  // Strip characters that could break out of the quoted filename.
-  const safeName = name.replace(/["\\\r\n]/g, "_");
   return new Response(body, {
     headers: {
       "Content-Type": "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${safeName}"`,
+      "Content-Disposition": attachmentDisposition(name),
       "X-Content-Type-Options": "nosniff",
     },
   });
 }
-/** DMARC verdict from a SINGLE Authentication-Results value: 1 only if dmarc=pass. */
+/** DMARC verdict from a SINGLE Authentication-Results value: 1 only if it was
+ *  written by our boundary MX and its own dmarc result is "pass". Parsed
+ *  structurally (see authResults.ts); the value also carries sender-chosen text
+ *  such as the envelope address, so a search for "dmarc=pass" can be satisfied
+ *  by the sender. */
 export function parseAuthResults(header: string | null | undefined): 0 | 1 {
-  return header && /\bdmarc=pass\b/i.test(header) ? 1 : 0;
+  return trustedAuthVerdicts(header).dmarc === "pass" ? 1 : 0;
 }
 
 /**
  * Trustworthy DMARC verdict from the message's ordered headers. ONLY the first
- * Authentication-Results header is honored — that is the one our boundary MX
- * (Cloudflare Email Routing) prepends on receipt. A spoofer can embed their own
- * `Authentication-Results: ...; dmarc=pass` lower in the message; those untrusted
- * copies must be ignored (reading the comma-joined Headers.get() value would let a
- * forged pass override a genuine fail). postal-mime returns headers top-to-bottom
- * with lowercased keys, so headers[0]-of-kind is the boundary-MX result.
+ * Authentication-Results header is honored, and only if its authserv-id is our
+ * boundary MX (Cloudflare Email Routing), which prepends its result on receipt.
+ * A spoofer can embed their own `Authentication-Results: ...; dmarc=pass`, and
+ * forwarded mail carries older ones from other hosts lower down; those must be
+ * ignored (reading the comma-joined Headers.get() value would let a forged pass
+ * override a genuine fail). And if the boundary header is ever absent, the
+ * topmost one is the sender's, so the authserv-id check is what keeps it from
+ * being believed. postal-mime returns headers top-to-bottom with lowercased
+ * keys, so headers[0]-of-kind is the boundary-MX result.
  */
 export function dmarcPassFromHeaders(
   headers: { key: string; value: string }[] | undefined,
@@ -242,6 +238,16 @@ export function attachmentRecord(
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+
+function normalizeEnvelopeRecipient(raw: string | null | undefined): string {
+  const addr = (raw || "").match(/<([^>]*)>/)?.[1] ?? (raw || "");
+  const normalized = addr.trim().toLowerCase();
+  return isEmailAddress(normalized) ? normalized : "";
+}
+
+function isEmailAddress(value: string): boolean {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value);
+}
 
 /** Normalize a From value to a comparable mailbox: unwrap <...>, lowercase.
  *  WARNING: this parses a rendered display string and is therefore spoofable —
@@ -322,34 +328,313 @@ function isSameOrigin(request: Request, url: URL): boolean {
   return false;
 }
 
+/** How far ahead of our clock a Date header may be before we stop believing it. */
+const DATE_SKEW_MS = 5 * 60 * 1000;
+/** Characters of body text examined to build the 200-character list snippet. */
+const SNIPPET_SCAN_CHARS = 4000;
+
+/**
+ * The timestamp to store for an inbound message. The Date header is the
+ * sender's claim and every view sorts on this value, so a message dated 2099
+ * would sit at the top of the mailbox forever. A date in the future (beyond
+ * ordinary clock skew) is replaced by the receipt time. Past dates are kept as
+ * sent: late delivery of old mail is normal. Missing or unparseable → receipt.
+ */
+export function clampInboundDate(headerDate: string | null | undefined, receivedAt: number): number {
+  const sent = headerDate ? Date.parse(headerDate) : NaN;
+  if (!sent) return receivedAt; // NaN, or the epoch itself
+  return sent > receivedAt + DATE_SKEW_MS ? receivedAt : sent;
+}
+
+/**
+ * Vet a sender-supplied one-click unsubscribe URL before the Worker POSTs to
+ * it: https on the default port, a public host (same guard as the image
+ * proxy), and never this app itself, so mail cannot make the inbox call its
+ * own API.
+ */
+export function unsubscribeTarget(raw: string, ownHost: string): URL | null {
+  const target = validateRemoteUrl(raw);
+  if (!target || target.protocol !== "https:" || target.port !== "") return null;
+  const host = target.hostname.toLowerCase().replace(/\.+$/, "");
+  if (!host.includes(".") || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal")) return null;
+  const own = ownHost.toLowerCase();
+  if (host === own || host.endsWith(`.${own}`)) return null;
+  return target;
+}
+
+/**
+ * The References header for a reply to `parentId`: the parent's stored ancestor
+ * chain plus the parent. Best-effort: any failure degrades to the parent alone,
+ * which is what every reply carried before the chain was stored.
+ *
+ * A Message-ID is chosen by whoever sends the mail, so a stranger can send a
+ * message that reuses a real one. The lookup therefore stays inside the thread
+ * being replied to, skips trashed mail, and prefers our own sent copy, then a
+ * DMARC-passing message, then the newest: a duplicate cannot outrank the
+ * message the user is actually answering just by claiming an old date.
+ */
+async function replyReferences(env: Env, parentId: string, threadId: string): Promise<string> {
+  if (!threadId) return parentId;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT id FROM messages
+        WHERE message_id=? AND thread_id=? AND state!='trash'
+        ORDER BY (direction='out') DESC, dmarc_pass DESC, date DESC LIMIT 1`,
+    )
+      .bind(parentId, threadId)
+      .first<{ id: string }>();
+    if (!row) return parentId;
+    const obj = await env.MAILSTORE.get(`parsed/${row.id}.json`);
+    const body = obj ? ((await obj.json()) as { headers?: StoredHeaders }) : null;
+    return referencesForReply(body?.headers?.references, parentId) || parentId;
+  } catch {
+    return parentId;
+  }
+}
+
 // ---------------------------------------------------------------- inbound
+/** Domain of an envelope or header address. Angle-bracket paths are unwrapped
+ *  and the result must look like a hostname — junk never lands in the domain
+ *  column (it would poison counts/filters). "" when there is none. */
+function domainOfAddress(raw: string): string {
+  const addr = raw.match(/<([^>]*)>/)?.[1] ?? raw;
+  const at = addr.lastIndexOf("@");
+  const d = at >= 0 ? addr.slice(at + 1).trim().toLowerCase() : "";
+  return isDomainName(d) ? d : "";
+}
+
+/**
+ * Non-destructive safety net: keep delivering a copy to a real mailbox.
+ * Per-domain override from the registry (NULL = global default, "" = off).
+ * Best-effort and never throws — a failed copy must not affect storage, and
+ * this runs in a `finally`, where a throw would mask the real error.
+ */
+/** Pause before the one forward retry. */
+const FORWARD_RETRY_DELAY_MS = 400;
+
+async function forwardCopy(message: ForwardableEmailMessage, env: Env, domain: string): Promise<void> {
+  try {
+    const copyTo = await forwardCopyFor(env, domain, env.FORWARD_COPY_TO);
+    if (!copyTo) return;
+    // One retry: the copy is the safety net, and the platform sometimes answers
+    // a forward with a transient 4xx ("421 ... transient error") that succeeds
+    // a moment later.
+    try {
+      await message.forward(copyTo);
+    } catch (e) {
+      console.error("forward failed, retrying once:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+      await new Promise((r) => setTimeout(r, FORWARD_RETRY_DELAY_MS));
+      await message.forward(copyTo);
+    }
+    console.log(`forwarded copy to ${copyTo}`);
+  } catch (e) {
+    console.error("forward failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+  }
+}
+
+/** What the deferred (post-delivery) work needs to know about a stored message. */
+interface StoredInbound {
+  threadId: string;
+  from: string;
+  fromLabel: string;
+  /** The From mailbox from the structured parse; "" when unparseable. It is
+   *  what the message CLAIMS, not a verified identity. */
+  fromAddr: string;
+  /** SPF, DKIM or DMARC passed at the boundary MX (and DMARC did not fail). */
+  vouchedFor: boolean;
+  to: string;
+  subject: string;
+  snippet: string;
+  inboundDomain: string;
+}
+
+/** Pause before the one insert retry: long enough for a D1 blip to pass. */
+const INSERT_RETRY_DELAY_MS = 50;
+
 async function handleEmail(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
   const id = uuid();
   const rawBuf = await new Response(message.raw).arrayBuffer();
+
+  // The forward copy exists for the case where THIS inbox fails to keep the
+  // mail, so it must not sit behind the storage it backs up: it used to run
+  // after the D1 insert, and a failed insert lost the message AND the copy.
+  // Once the raw message is in hand the copy is always attempted, whatever
+  // storeInbound does; a throw from it still propagates afterwards.
+  let domain = domainOfAddress(message.to || "") || env.INBOX_DOMAIN;
+  let stored: StoredInbound;
+  try {
+    stored = await storeInbound(message, env, id, rawBuf);
+    domain = stored.inboundDomain;
+  } finally {
+    await forwardCopy(message, env, domain);
+  }
+  const { threadId, from, fromLabel, fromAddr, vouchedFor, to, subject, snippet } = stored;
+
+  // Everything below is off the critical path: the message is stored and the
+  // forward copy sent. Best-effort; none of it can affect delivery.
+  ctx.waitUntil(
+    (async () => {
+      const now = Date.now();
+      // AI auto-label and junk hint. Started first so it runs alongside the
+      // lookups below; any failure (incl. a missing AI binding) leaves the
+      // stored default and no hint.
+      const verdict = classifyWithJunk(env, { from, subject, snippet }).catch((e: unknown) => {
+        console.error("classify failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+        return null;
+      });
+      const logged = (what: string) => (e: unknown) => {
+        console.error(`${what} failed:`, e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+        return null;
+      };
+      try {
+        // Each step fails on its own. A lookup error here must not take the
+        // user's rules or the notification for real mail down with it.
+        // 1. A blocked sender goes to Junk, no questions asked.
+        let filed = false;
+        if (fromAddr && (await isBlocked(env, fromAddr).catch(logged("block lookup")))) {
+          await mutateMessage(env, id, "spam", now);
+          filed = true;
+        }
+        // 2. The user's own rules. A rule that matched is the user's decision
+        //    about this mail, so the automatic verdict below stands aside.
+        let ruled = false;
+        if (!filed) {
+          const { applied, leftInbox } = await applyFilters(env, id, { from, to, subject }, now);
+          ruled = applied.length > 0;
+          filed = leftInbox;
+        }
+        // 3. The label, and the junk hint (see src/junk.ts for why acting on
+        //    it is this conservative).
+        const v = await verdict;
+        if (v && v.category !== "primary") {
+          await env.DB.prepare(`UPDATE messages SET category=? WHERE id=?`).bind(v.category, id).run().catch(logged("category update"));
+        }
+        if (!filed && !ruled && v?.junk && (await shouldAutoJunk(env, { vouchedFor, threadId }))) {
+          await mutateMessage(env, id, "spam", now);
+          filed = true;
+        }
+        // Auto-filed mail (junk, or archived/trashed by a rule) is silent, and
+        // it does not disturb a snooze: only mail that stays in the inbox is a
+        // reason to bring the conversation back early.
+        if (filed) return;
+        await env.DB.prepare(`UPDATE messages SET snoozed_until=NULL, woke_at=? WHERE thread_id=? AND snoozed_until IS NOT NULL`)
+          .bind(now, threadId)
+          .run()
+          .catch(logged("unsnooze on new mail"));
+        // Clamp attacker-controlled fields so the encrypted payload stays well
+        // under push-service size limits (a single aes128gcm record).
+        const payload: Record<string, string> = {
+          title: clampUtf8(fromLabel || "New mail", 100),
+          body: clampUtf8(subject, 300),
+          url: "/",
+          tag: clampUtf8(threadId, MAX_PUSH_THREAD_ID_BYTES),
+        };
+        // The deep-link target. A truncated id opens nothing, so an oversized
+        // one (only possible for threads stored before ids were capped) is
+        // left out and the notification falls back to opening the inbox.
+        if (clampUtf8(threadId, MAX_PUSH_THREAD_ID_BYTES) === threadId) payload.threadId = threadId;
+        await sendPushToAll(env, payload);
+      } catch (e) {
+        console.error("filters/push failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+      }
+    })(),
+  );
+}
+
+/**
+ * The thread of the SENT copy of an inbound message, when that message is our
+ * own mail coming back: something sent from here to one of our own addresses
+ * arrives carrying the Message-ID the platform assigned on the way out, which
+ * is stored on the sent row. Without this the inbound copy starts a second
+ * thread beside the sent one.
+ *
+ * A Message-ID is not a secret (every recipient of that mail has it), so the
+ * id alone must not admit a message to the thread. The caller requires a DMARC
+ * pass, and here the authenticated From has to be the address that sent the
+ * stored row: its identity, or that identity's transport address (send.*
+ * setups put the transport address in From and the identity in Reply-To).
+ * Only OUTBOUND rows are considered.
+ */
+async function ownSentThreadId(env: Env, messageId: string | null, fromAddr: string): Promise<string | null> {
+  if (!messageId || !fromAddr) return null;
+  for (const row of await findSentByMessageId(env.DB, messageId)) {
+    const identity = normalizeAddress(row.msg_from || "");
+    if (!identity) continue;
+    if (identity === fromAddr) return row.thread_id;
+    try {
+      const sender = await resolveSender(env, identity, undefined);
+      if (sender.fromAddr.toLowerCase() === fromAddr) return row.thread_id;
+    } catch {
+      // identity no longer registered for sending: not a match
+    }
+  }
+  return null;
+}
+
+/**
+ * The delivery-critical half of ingest: store the raw message, parse it, store
+ * body and attachments, insert the row, index it. A raw-write or parse failure
+ * throws (the caller still sends the forward copy).
+ */
+async function storeInbound(
+  message: ForwardableEmailMessage,
+  env: Env,
+  id: string,
+  rawBuf: ArrayBuffer,
+): Promise<StoredInbound> {
   await env.MAILSTORE.put(`raw/${id}.eml`, rawBuf);
 
-  const parsed = await PostalMime.parse(rawBuf);
-  const subject = parsed.subject || "(no subject)";
-  const from = parsed.from
-    ? `${parsed.from.name || ""} <${parsed.from.address}>`.trim()
+  // Parse a copy whose address headers are bounded (rawGuard.ts): the parser
+  // is quadratic in them. And if it still cannot read the message, file it
+  // anyway. The original is stored above and can be downloaded, which beats a
+  // message that exists in R2 and nowhere the user can see.
+  let parsed: Awaited<ReturnType<typeof PostalMime.parse>>;
+  let unreadable = false;
+  try {
+    parsed = await PostalMime.parse(boundAddressHeaders(rawBuf));
+  } catch (e) {
+    console.error(`inbound ${id}: could not parse, filing as unreadable:`, e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+    unreadable = true;
+    parsed = {
+      subject: rawHeader(rawBuf, "subject"),
+      text: "This message could not be read. Download the original to see it.",
+      headers: [],
+      attachments: [],
+    } as unknown as Awaited<ReturnType<typeof PostalMime.parse>>;
+  }
+  const subject = parsed.subject || (unreadable ? "(unreadable message)" : "(no subject)");
+  // A display name carrying a comma or other RFC 5322 special is stored quoted
+  // (see formatMailbox); bare, `Doe, John <addr>` parses downstream as two
+  // entries and the sender shows up as "John".
+  const from = parsed.from?.address
+    ? formatMailbox(parsed.from.name, parsed.from.address)
     : message.from;
+  // The notification title, taken from the structured parse rather than
+  // re-parsed out of the rendered string above.
+  const fromLabel = cleanDisplayName(parsed.from?.name) || parsed.from?.address || message.from;
   const to = (parsed.to || []).map((a) => a.address).join(", ") || message.to;
   const cc = (parsed.cc || []).map((a) => a.address).join(", ");
-  const text = parsed.text || "";
   const html = parsed.html || "";
-  const snippet = (text || html.replace(/<[^>]+>/g, " "))
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 200);
-  const dateMs = parsed.date ? Date.parse(parsed.date) || Date.now() : Date.now();
+  // postal-mime yields no text for a message whose only body is text/html, and
+  // most commercial mail is exactly that. Derive it (linear and bounded, see
+  // htmlToText) so the snippet, the search index, the AI transcript and reply
+  // quoting all see the words rather than nothing or the stylesheet.
+  const hasTextPart = !!(parsed.text && parsed.text.trim());
+  const text = hasTextPart ? (parsed.text as string) : htmlToText(html);
+  // Flag text we derived. It carries link TEXT but not link destinations, so a
+  // client choosing between `text` and `html` must not mistake it for a text
+  // part the sender wrote.
+  const textDerived = !hasTextPart && text !== "";
+  const snippet = text.trimStart().slice(0, SNIPPET_SCAN_CHARS).replace(/\s+/g, " ").trim().slice(0, 200);
+  const dateMs = clampInboundDate(parsed.date, Date.now());
   const messageId = parsed.messageId || "";
   const inReplyTo = parsed.inReplyTo || "";
   // postal-mime exposes References as a single space-separated string.
   const references = parsed.references;
 
   // Bounded and best-effort: the message row is inserted BELOW, so anything that
-  // throws here would leave the mail in R2 but invisible in the inbox. A message
-  // with thousands of MIME parts previously meant that many sequential object
+  // throws here would leave the mail in R2 but invisible in the inbox. A crafted
+  // message with thousands of parts previously meant that many sequential object
   // writes on the delivery path.
   const stored = await storeInboundAttachments(
     (key, body, opts) => env.MAILSTORE.put(key, body as ArrayBuffer, opts),
@@ -373,12 +658,14 @@ async function handleEmail(message: ForwardableEmailMessage, env: Env, ctx: Exec
   }
 
   // Same reasoning as the attachments above: the row is inserted below, so a
-  // failure here must not abort ingest. The message still lists with subject,
+  // failure here must not abort ingest. The message still shows up with subject,
   // sender and date; only the body is unavailable until it is re-fetched.
   try {
     await env.MAILSTORE.put(
       `parsed/${id}.json`,
-      JSON.stringify({ text, html, attachments, headers: { messageId, inReplyTo } }),
+      // Reply-To, the References chain, List-Unsubscribe and the auth verdicts
+      // ride along with the body so the reader can act on them (mailHeaders.ts).
+      JSON.stringify({ text, html, attachments, headers: storedHeadersFrom(parsed), ...(textDerived ? { textDerived: true } : {}) }),
     );
   } catch (e) {
     console.error(`inbound ${id}: storing parsed body failed:`, e instanceof Error ? `${e.name}: ${e.message}` : String(e));
@@ -397,9 +684,25 @@ async function handleEmail(message: ForwardableEmailMessage, env: Env, ctx: Exec
   const candidates = [...refTokens, inReplyTo]
     .map((v) => sanitizeMessageId(v))
     .filter((v): v is string => v !== null);
+  // Trust ONLY the first (boundary-MX) Authentication-Results — not the
+  // comma-joined Headers.get() value, which a spoofer could poison with a forged
+  // dmarc=pass embedded lower in the message.
+  const dmarcPass = dmarcPassFromHeaders(parsed.headers);
+  // Did ANY mechanism vouch for this mail at the boundary? Used only to decide
+  // whether a junk verdict may act (see shouldAutoJunk): plenty of honest
+  // domains publish no DMARC record, so "no DMARC pass" alone proves nothing.
+  const auth = trustedAuthVerdicts((parsed.headers || []).find((h) => h.key.toLowerCase() === "authentication-results")?.value);
+  const vouchedFor = auth.dmarc === "pass" || (auth.dmarc !== "fail" && (auth.spf === "pass" || auth.dkim === "pass"));
+  // Authenticated sender mailbox — the image-allowlist key. Derived from the
+  // structured parse (not the spoofable rendered `from` string).
+  const fromAddr = normalizeFromAddress(parsed.from);
   // Threading is a nicety; delivery is not. A transient read failure should cost
   // this message its thread link, not its place in the inbox.
-  const linked = await findThreadIdByMessageIds(env.DB, candidates).catch((e: unknown) => {
+  const linked = await (async () => {
+    const parent = await findThreadIdByMessageIds(env.DB, candidates);
+    if (parent) return parent;
+    return dmarcPass === 1 ? await ownSentThreadId(env, sanitizeMessageId(messageId), fromAddr) : null;
+  })().catch((e: unknown) => {
     console.error(`inbound ${id}: thread lookup failed:`, e instanceof Error ? `${e.name}: ${e.message}` : String(e));
     return null;
   });
@@ -408,98 +711,68 @@ async function handleEmail(message: ForwardableEmailMessage, env: Env, ctx: Exec
   // Derive the domain from the ENVELOPE recipient (RCPT TO) first — it's the
   // address Email Routing actually delivered to, and stays correct for BCC and
   // catch-all mail where the To header points elsewhere. Header To is the
-  // fallback, then the default inbox domain. Angle-bracket paths are unwrapped
-  // and the result must look like a hostname — junk never lands in the domain
-  // column (it would poison counts/filters).
-  const domainOf = (raw: string) => {
-    const addr = raw.match(/<([^>]*)>/)?.[1] ?? raw;
-    const at = addr.lastIndexOf("@");
-    const d = at >= 0 ? addr.slice(at + 1).trim().toLowerCase() : "";
-    return isDomainName(d) ? d : "";
-  };
-  const inboundDomain = domainOf(message.to || "") || domainOf(to || "") || env.INBOX_DOMAIN;
-  // Trust ONLY the first (boundary-MX) Authentication-Results — not the
-  // comma-joined Headers.get() value, which a spoofer could poison with a forged
-  // dmarc=pass embedded lower in the message.
-  const dmarcPass = dmarcPassFromHeaders(parsed.headers);
-  // Authenticated sender mailbox — the image-allowlist key. Derived from the
-  // structured parse (not the spoofable rendered `from` string).
-  const fromAddr = normalizeFromAddress(parsed.from);
+  // fallback, then the default inbox domain.
+  const inboundDomain = domainOfAddress(message.to || "") || domainOfAddress(to || "") || env.INBOX_DOMAIN;
+  const envelopeTo = normalizeEnvelopeRecipient(message.to);
 
   // Store with the default category ("primary"); the AI auto-label is computed
-  // AFTER delivery (see ctx.waitUntil below) so a slow/failed inference can never
-  // delay or block mail storage + the forward-copy.
-  await env.DB.prepare(
-    `INSERT INTO messages
-       (id, thread_id, direction, folder, msg_from, msg_to, msg_cc, subject, snippet, date, unread, has_attachments, message_id, in_reply_to, r2_raw_key, state, starred, domain, category, dmarc_pass, from_addr)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-  )
-    .bind(id, threadId, "in", "inbox", from, to, cc, subject, snippet, dateMs, 1, attachments.length ? 1 : 0, messageId, inReplyTo, `raw/${id}.eml`, "inbox", 0, inboundDomain, "primary", dmarcPass, fromAddr)
-    .run();
+  // AFTER delivery (see handleEmail) so a slow/failed inference can never delay
+  // or block mail storage + the forward-copy.
+  // `envelope_to` arrives in migrations/0019-envelope-to.sql. A Worker deployed
+  // ahead of that migration must still file the mail: losing the delivery
+  // address is far better than losing the message, so on that one error the
+  // row is stored in the older shape (apply the migration to get the column).
+  let withEnvelope = true;
+  const insertRow = () =>
+    env.DB.prepare(
+      withEnvelope
+        ? `INSERT INTO messages
+     (id, thread_id, direction, folder, msg_from, msg_to, msg_cc, subject, snippet, date, unread, has_attachments, message_id, in_reply_to, r2_raw_key, state, starred, domain, envelope_to, category, dmarc_pass, from_addr)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        : `INSERT INTO messages
+     (id, thread_id, direction, folder, msg_from, msg_to, msg_cc, subject, snippet, date, unread, has_attachments, message_id, in_reply_to, r2_raw_key, state, starred, domain, category, dmarc_pass, from_addr)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+      .bind(id, threadId, "in", "inbox", from, to, cc, subject, snippet, dateMs, 1, attachments.length ? 1 : 0, messageId, inReplyTo, `raw/${id}.eml`, "inbox", 0, inboundDomain, ...(withEnvelope ? [envelopeTo] : []), "primary", dmarcPass, fromAddr)
+      .run();
+  const insert = async () => {
+    try {
+      return await insertRow();
+    } catch (e) {
+      if (!withEnvelope || !/no (such )?column( named)?:? *envelope_to/i.test(e instanceof Error ? e.message : String(e))) throw e;
+      console.error(`inbound ${id}: messages.envelope_to is missing (migration 0019 not applied); storing without it`);
+      withEnvelope = false;
+      return await insertRow();
+    }
+  };
+  // This row is the only thing that makes the mail visible, and D1 does drop
+  // the odd request. Retry once; a second failure is a real outage and throws.
+  try {
+    await insert();
+  } catch (first) {
+    console.error(`inbound ${id}: message insert failed, retrying once:`, first instanceof Error ? `${first.name}: ${first.message}` : String(first));
+    await new Promise((resolve) => setTimeout(resolve, INSERT_RETRY_DELAY_MS));
+    try {
+      await insert();
+    } catch (second) {
+      // The first attempt may have committed before its response was lost; the
+      // retry then collides with the row it wrote, which means it IS stored.
+      const reason = second instanceof Error ? second.message : String(second);
+      if (!/UNIQUE constraint failed: messages\.id/i.test(reason)) throw second;
+    }
+  }
 
   // Index for full-text search (best-effort — never block delivery on this).
   await ftsUpsert(env, ftsRowFrom({ id, subject, from, to, cc, bodyText: bodyForIndex(text, html) }));
 
-  // Non-destructive: keep delivering a copy to a real mailbox. Per-domain
-  // override from the registry (NULL = global default, "" = off); best-effort.
-  const copyTo = await forwardCopyFor(env, inboundDomain, env.FORWARD_COPY_TO);
-  if (copyTo) {
-    try {
-      await message.forward(copyTo);
-      console.log(`forwarded copy to ${copyTo}`);
-    } catch (e) {
-      console.error("forward failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
-    }
-  }
-
-  // AI auto-label, OFF the critical path: classify after delivery and update the
-  // row only if it isn't the already-stored default. Best-effort — any failure
-  // (incl. a missing AI binding) is swallowed so it never affects delivery.
-  ctx.waitUntil(
-    (async () => {
-      try {
-        const category = await classifyMessage(env, { from, subject, snippet });
-        if (category !== "primary") {
-          await env.DB.prepare(`UPDATE messages SET category=? WHERE id=?`).bind(category, id).run();
-        }
-      } catch (e) {
-        console.error("classify failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
-      }
-    })(),
-  );
-
-  // Off the critical path: apply inbox filters, then notify — but skip the push
-  // for mail a filter auto-filed (archived/trashed) so auto-sorted clutter is
-  // silent. Best-effort; never affects delivery.
-  ctx.waitUntil(
-    (async () => {
-      try {
-        const { leftInbox } = await applyFilters(env, threadId, { from, to, subject }, Date.now());
-        if (leftInbox) return;
-        await sendPushToAll(env, {
-          // Clamp attacker-controlled fields so the encrypted payload stays well
-          // under push-service size limits (a single aes128gcm record).
-          title: clampUtf8(senderName(from) || "New mail", 100),
-          body: clampUtf8(subject, 300),
-          url: "/",
-          tag: threadId,
-        });
-      } catch (e) {
-        console.error("filters/push failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
-      }
-    })(),
-  );
+  return { threadId, from, fromLabel, fromAddr, vouchedFor, to, subject, snippet, inboundDomain };
 }
 
-/** Display name for a "Name <addr>" sender, falling back to the bare address. */
-function senderName(from: string): string {
-  const s = (from || "").trim();
-  const m = s.match(/^(.*?)<[^>]*>\s*$/);
-  const name = m?.[1].trim();
-  if (name) return name;
-  const addr = s.match(/<([^>]*)>/)?.[1];
-  return addr || s;
-}
+/** The frequent cron (wrangler.jsonc): wakes snoozed mail, nothing else. */
+const SNOOZE_CRON = "*/5 * * * *";
+
+/** Longest thread id (UTF-8 bytes) carried in a push payload; see handleEmail. */
+const MAX_PUSH_THREAD_ID_BYTES = 512;
 
 // ---------------------------------------------------------------- HTTP API
 export async function handleFetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -543,30 +816,33 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
   const who = await verifyAccess(request, env);
   if (!who) return json({ error: "unauthorized" }, 401);
 
+  const isBearer = who === API_TOKEN_PRINCIPAL;
+
   // CSRF defense for cookie/Access-authenticated mutations. Access cookies are
   // SameSite=None, so a cross-origin form/fetch could otherwise ride the user's
   // session. Require a same-origin Origin/Referer on state-changing methods.
-  // Bearer ("api-token") automation is exempt — it carries no ambient cookie, so
-  // it isn't a CSRF vector, and non-browser clients send no Origin.
-  if (who !== "api-token" && request.method !== "GET" && request.method !== "HEAD") {
+  // Bearer automation is exempt — it carries no ambient cookie, so it isn't a
+  // CSRF vector, and non-browser clients send no Origin.
+  if (!isBearer && request.method !== "GET" && request.method !== "HEAD") {
     if (!isSameOrigin(request, url)) return json({ error: "bad origin" }, 403);
   }
 
-  // GET /api/me — validated identity from the Access JWT (or "api-token" bearer).
+  // GET /api/me — validated identity from the Access JWT (or the bearer principal).
   if (path === "/api/me" && request.method === "GET") {
-    return json({ email: who === "api-token" ? null : who });
+    return json({ email: isBearer ? null : who });
   }
 
   // POST /api/messages/mutate (bulk) — must be BEFORE the /api/messages/:id regex
   if (path === "/api/messages/mutate" && request.method === "POST") {
-    const b = (await request.json().catch(() => ({}))) as { threadIds?: unknown; action?: unknown };
+    const b = (await request.json().catch(() => ({}))) as { threadIds?: unknown; action?: unknown; until?: unknown };
     if (!isMailAction(b.action)) return json({ error: "invalid action" }, 400);
+    if (b.action === "snooze" && !isSnoozeTime(b.until, Date.now())) return json({ error: "snooze needs a time in the future" }, 400);
     if (!Array.isArray(b.threadIds) || b.threadIds.some((x) => typeof x !== "string")) {
       return json({ error: "threadIds must be string[]" }, 400);
     }
     if (b.threadIds.length > 200) return json({ error: "too many threadIds (max 200)" }, 400);
     try {
-      const r = await mutateThreads(env, b.threadIds as string[], b.action, Date.now());
+      const r = await mutateThreads(env, b.threadIds as string[], b.action, Date.now(), b.action === "snooze" ? (b.until as number) : undefined);
       return json({ ok: true, count: r.count });
     } catch (e) { return json({ error: e instanceof Error ? e.message : "mutate failed" }, 400); }
   }
@@ -581,25 +857,39 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     const q = url.searchParams.get("q")?.trim() || undefined;
     const categoryParam = url.searchParams.get("category") || undefined;
     const category = isCategory(categoryParam) ? categoryParam : undefined;
-    // Optional per-domain narrowing (ignored while searching, like category).
+    // Optional per-domain narrowing. Search honours it too (the view and the
+    // category are ignored while searching; `in:` covers the view).
     // A present-but-invalid domain is a 400, not a silent unfiltered list.
     const domainParam = url.searchParams.get("domain");
     if (domainParam !== null && !isDomainName(domainParam)) return json({ error: "invalid domain" }, 400);
     const domain = domainParam ?? undefined;
+    // Legacy rows predate the domain column; they belong to the default inbox
+    // domain, so filtering by it must include NULL.
+    const domainIncludesNull = !!domain && domain.toLowerCase() === (env.INBOX_DOMAIN || "").toLowerCase();
+    // Paging. `limit` sizes the page; `cursor` is whatever the previous page
+    // returned as nextCursor. Without either this is the first page at the
+    // default size, exactly as before paging existed.
+    const limit = parsePageSize(url.searchParams.get("limit"));
+    const cursorParam = url.searchParams.get("cursor");
+    const cursor = cursorParam ? parseCursor(cursorParam) : null;
+    if (cursorParam && (!cursor || (q ? cursor.kind !== "offset" : cursor.kind !== "date"))) {
+      return json({ error: "invalid cursor" }, 400);
+    }
+    const offset = cursor?.kind === "offset" ? cursor.offset : 0;
+    // The browser's timezone offset, so before:/after: mean the user's days.
+    // Bounded to real offsets (UTC-14..UTC+14); anything else is ignored.
+    const tzRaw = url.searchParams.get("tz");
+    const tzOffsetMin = tzRaw !== null && /^-?\d{1,3}$/.test(tzRaw) && Math.abs(Number(tzRaw)) <= 840 ? Number(tzRaw) : 0;
     const threads = q
-      ? await searchThreads(env, q)
-      : await listThreadsByView(
-          env,
-          viewParam,
-          200,
-          category,
-          domain,
-          // Legacy rows predate the domain column; they belong to the default
-          // inbox domain, so filtering by it must include NULL.
-          !!domain && domain.toLowerCase() === (env.INBOX_DOMAIN || "").toLowerCase(),
-        );
+      ? await searchThreads(env, q, limit, { domain, domainIncludesNull, offset, tzOffsetMin })
+      : await listThreadsByView(env, viewParam, limit, category, domain, domainIncludesNull, cursor?.kind === "date" ? cursor.after : undefined);
+    // A full page means there may be more. An empty next page is the cheap,
+    // honest way to find out there was not, rather than a COUNT per request.
+    const last = threads[threads.length - 1];
+    const nextCursor =
+      threads.length < limit || !last ? null : q ? encodeOffsetCursor(offset + threads.length) : encodeDateCursor(last);
     const counts = await countsByView(env);
-    return json({ threads, user: who, unread: counts.inboxUnread });
+    return json({ threads, user: who, unread: counts.inboxUnread, nextCursor });
   }
 
   // POST /api/admin/reindex — rebuild the full-text index from R2 bodies. Behind
@@ -623,6 +913,103 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     return new Response(JSON.stringify({ html, remoteShown: show, remoteImageCount: blockedRemoteCount }), {
       headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
+  }
+
+  // GET /api/messages/:id/raw: the original message as received, for "show
+  // original" and for keeping a copy. Always a download: raw mail is hostile
+  // markup, and rendering it same-origin would be an XSS. Sent mail has no raw
+  // copy (the platform assembles it), so that is a 404.
+  const mr = path.match(/^\/api\/messages\/([^/]+)\/raw$/);
+  if (mr && request.method === "GET") {
+    const row = await env.DB.prepare(`SELECT id, r2_raw_key FROM messages WHERE id=?`).bind(mr[1]).first<{ id: string; r2_raw_key: string | null }>();
+    if (!row?.r2_raw_key) return json({ error: "not found" }, 404);
+    const obj = await env.MAILSTORE.get(row.r2_raw_key);
+    if (!obj) return json({ error: "not found" }, 404);
+    return new Response(obj.body, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": `attachment; filename="${String(row.id).replace(/[^A-Za-z0-9-]/g, "")}.eml"`,
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  // POST /api/messages/:id/unsubscribe: act on the message's List-Unsubscribe.
+  // One-click (RFC 8058) is POSTed from here, so the list never sees the
+  // reader's IP or browser. A mailto target gets a mail from the address the
+  // list wrote to. Otherwise the link is handed back for the user to open.
+  //
+  // The header is the sender's own text, so the two automatic paths are only
+  // taken for mail that passed DMARC (RFC 8058 asks for as much): without it
+  // anyone could make this inbox POST to, or send mail to, a target of their
+  // choosing under a forged sender's name. Unauthenticated mail still gets the
+  // link, which the user opens knowingly.
+  const mu = path.match(/^\/api\/messages\/([^/]+)\/unsubscribe$/);
+  if (mu && request.method === "POST") {
+    if (!takeToken(sendBuckets, who, Date.now(), 20, 0.2)) return json({ error: "rate limited" }, 429);
+    const row = await env.DB.prepare(`SELECT id, envelope_to, domain, dmarc_pass FROM messages WHERE id=? AND direction='in'`)
+      .bind(mu[1])
+      .first<{ id: string; envelope_to: string | null; domain: string | null; dmarc_pass: number | null }>();
+    if (!row) return json({ error: "not found" }, 404);
+    const obj = await env.MAILSTORE.get(`parsed/${row.id}.json`);
+    const info = obj ? ((await obj.json()) as { headers?: StoredHeaders }).headers?.unsubscribe : undefined;
+    if (!info) return json({ error: "this message has no unsubscribe option" }, 404);
+    const authenticated = row.dmarc_pass === 1;
+    const open = () => (info.url ? json({ ok: true, method: "open", url: info.url }) : null);
+
+    if (authenticated && info.url && info.oneClick) {
+      const target = unsubscribeTarget(info.url, url.hostname);
+      if (!target) return json({ error: "unsafe unsubscribe address" }, 400);
+      try {
+        const res = await fetch(target.toString(), {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "List-Unsubscribe=One-Click",
+          // Never follow: the guard above only vetted this one URL.
+          redirect: "manual",
+          signal: AbortSignal.timeout(10_000),
+        });
+        void res.body?.cancel();
+        if (res.status >= 200 && res.status < 300) return json({ ok: true, method: "one-click" });
+        // A redirect is a page to visit (a login, a confirmation), not a done
+        // deal. Say so rather than claim the address was removed.
+        if (res.status >= 300 && res.status < 400) return open()!;
+        return json({ error: `the list refused the request (${res.status})` }, 502);
+      } catch (e) {
+        console.error("unsubscribe failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+        return json({ error: "could not reach the list" }, 502);
+      }
+    }
+    if (authenticated && info.mailto) {
+      // Unsubscribe as the address the list actually wrote to; a request from
+      // any other address is one the list has no reason to honour. If that
+      // address cannot send, do not quietly use a different identity (it would
+      // both fail to unsubscribe and tie the two addresses together).
+      let sender;
+      try {
+        if (!row.envelope_to) throw new SenderError("no delivery address on record");
+        sender = await resolveSender(env, row.envelope_to, undefined);
+      } catch (e) {
+        if (!(e instanceof SenderError)) throw e;
+        return open() ?? json({ error: "this address cannot send mail, so the unsubscribe request was not sent" }, 409);
+      }
+      try {
+        await env.EMAIL.send({
+          from: { email: sender.fromAddr, name: sender.displayName },
+          to: info.mailto.address,
+          subject: info.mailto.subject,
+          text: "unsubscribe",
+          ...(sender.replyTo ? { replyTo: sender.replyTo } : {}),
+        });
+        console.log(`UNSUBSCRIBE MAIL: ${sender.identityAddr} -> ${info.mailto.address}`);
+        return json({ ok: true, method: "mailto" });
+      } catch (e) {
+        console.error("unsubscribe mail failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+        return json({ error: "could not send the unsubscribe request" }, 502);
+      }
+    }
+    return open() ?? json({ error: "this message could not be verified, so it was not unsubscribed automatically" }, 409);
   }
 
   // GET /api/messages/:id
@@ -665,7 +1052,7 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
       const { html: rewritten, blockedRemoteCount } = await rewriteMessageHtml(env, String(msg.id), html, msg.body?.attachments || [], show);
       return { ...msg, body: { ...msg.body, html: rewritten }, remoteImageCount: blockedRemoteCount, remoteShown: show };
     }));
-    return json({ thread_id: thread.thread_id, messages });
+    return json({ thread_id: thread.thread_id, messages, total: thread.total, truncated: thread.truncated });
   }
 
   // POST /api/threads/:id/mutate
@@ -673,9 +1060,10 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
   if (m && request.method === "POST") {
     let threadId: string;
     try { threadId = decodeURIComponent(m[1]); } catch { return json({ error: "bad request" }, 400); }
-    const b = (await request.json().catch(() => ({}))) as { action?: unknown };
+    const b = (await request.json().catch(() => ({}))) as { action?: unknown; until?: unknown };
     if (!isMailAction(b.action)) return json({ error: "invalid action" }, 400);
-    try { await mutateThread(env, threadId, b.action, Date.now()); }
+    if (b.action === "snooze" && !isSnoozeTime(b.until, Date.now())) return json({ error: "snooze needs a time in the future" }, 400);
+    try { await mutateThread(env, threadId, b.action, Date.now(), b.action === "snooze" ? (b.until as number) : undefined); }
     catch (e) { return json({ error: e instanceof Error ? e.message : "mutate failed" }, 400); }
     return json({ ok: true });
   }
@@ -1179,6 +1567,8 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
       threadId: d.thread_id,
       inReplyTo: d.in_reply_to,
       to: d.msg_to ?? "",
+      cc: d.msg_cc ?? "",
+      bcc: d.msg_bcc ?? "",
       subject: d.subject ?? "",
       bodyText: d.body_text ?? "",
       bodyJson: d.body_json ?? "",
@@ -1251,6 +1641,36 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     return json({ ok: true });
   }
 
+  // ---- Blocked senders: mail from these goes straight to Junk ----
+  if (path === "/api/blocked" && request.method === "GET") {
+    return json({ blocked: await listBlocked(env) });
+  }
+  if (path === "/api/blocked" && request.method === "POST") {
+    const b = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+    const entry = normalizeBlockEntry(b.address);
+    if (!entry) return json({ error: "enter an email address, or a domain written as @example.com" }, 400);
+    // Blocking one of our own domains would junk every message we send
+    // ourselves, and every self-addressed note.
+    if (isOwnDomain(blockEntryDomain(entry), await ownDomains(env))) {
+      return json({ error: "that is one of your own domains" }, 400);
+    }
+    if ((await countBlocked(env)) >= MAX_BLOCKED) return json({ error: `block list is full (max ${MAX_BLOCKED})` }, 400);
+    await addBlocked(env, entry, Date.now());
+    return json({ ok: true, address: entry });
+  }
+  m = path.match(/^\/api\/blocked\/([^/]{1,400})$/);
+  if (m && request.method === "DELETE") {
+    let entry: string | null = null;
+    try {
+      entry = normalizeBlockEntry(decodeURIComponent(m[1]));
+    } catch {
+      entry = null;
+    }
+    if (!entry) return json({ error: "bad request" }, 400);
+    await removeBlocked(env, entry);
+    return json({ ok: true });
+  }
+
   // ---- Inbox filters/rules ----
   // GET /api/filters — list rules (ordered, bounded).
   if (path === "/api/filters" && request.method === "GET") {
@@ -1296,7 +1716,11 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     return json({ ok: true });
   }
 
-  // GET /api/attachments/:id/:name
+  // GET /api/attachments/:id/:name[?part=<partId>]
+  // Without `part` the attachment is resolved by filename. Filenames are not
+  // unique within a message ("image.png" twice is routine), and then every
+  // link returns the first match, so a client that knows the partId passes it
+  // and gets exactly that part.
   m = path.match(/^\/api\/attachments\/([^/]+)\/(.+)$/);
   if (m && request.method === "GET") {
     let name: string;
@@ -1305,8 +1729,20 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     } catch {
       return json({ error: "bad request" }, 400);
     }
+    // partId becomes part of an R2 key, so accept only the shape attachmentRecord
+    // mints (p<index>) — never a caller-chosen path segment.
+    const part = url.searchParams.get("part");
+    if (part !== null && !/^p\d{1,4}$/.test(part)) return json({ error: "invalid part" }, 400);
     const parsedObj = await env.MAILSTORE.get(`parsed/${m[1]}.json`);
     const meta = parsedObj ? ((await parsedObj.json()) as { attachments?: { partId?: string; name: string }[] }) : null;
+    if (part !== null) {
+      const obj = await env.MAILSTORE.get(`att/${m[1]}/${part}`);
+      if (!obj) return new Response("not found", { status: 404 });
+      // Prefer the stored filename; the path's name is only a fallback for a
+      // message whose parsed body never made it to R2.
+      const stored = meta?.attachments?.find((a) => a.partId === part);
+      return serveAttachment(obj.body, obj.httpMetadata?.contentType, stored?.name || name);
+    }
     const rec = meta?.attachments?.find((a) => a.name === name);
     const key = rec?.partId ? `att/${m[1]}/${rec.partId}` : `att/${m[1]}/${name}`; // legacy fallback
     const obj = await env.MAILSTORE.get(key);
@@ -1352,16 +1788,20 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     }
     const b = (await request.json().catch(() => ({}))) as Record<string, any>;
     if (!b.to) return json({ error: "missing 'to'" }, 400);
-    // The send binding accepts a bare address OR a structured {name, email}, so
-    // only trim the string form and pass structured entries through intact.
-    const toList: Recipient[] = (Array.isArray(b.to) ? b.to : String(b.to).split(","))
-      .map((r: unknown) => (typeof r === "string" ? r.trim() : r))
-      .filter(isUsableRecipient);
+    // Every field is normalized to one address per entry (see recipients.ts),
+    // so the cap below counts people, however the caller packed them.
+    let toList: Recipient[], ccList: Recipient[], bccList: Recipient[];
+    try {
+      toList = parseRecipients(b.to);
+      ccList = parseRecipients(b.cc);
+      bccList = parseRecipients(b.bcc);
+    } catch (e) {
+      if (e instanceof RecipientError) return json({ error: e.message }, 400);
+      throw e;
+    }
     if (!toList.length) return json({ error: "missing 'to'" }, 400);
-    // Count ADDRESSES, not elements: a single array element may itself hold a
-    // comma-separated list, which would otherwise slip a large fan-out past a
-    // cap that only counted array length.
-    if (countAddresses(toList) > MAX_RECIPIENTS) {
+    // The cap covers every recipient field together, or Cc would be a second 50.
+    if (toList.length + ccList.length + bccList.length > MAX_RECIPIENTS) {
       return json({ error: `too many recipients (max ${MAX_RECIPIENTS})` }, 400);
     }
     // Resolve the sender identity. The send_email binding only authorizes
@@ -1390,11 +1830,15 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     // real Message-ID from send()'s return value and store THAT (below) so a
     // recipient's reply — which references the real id — links back to this thread.
     const headers: Record<string, string> = {};
+    let references = "";
     if (irt) {
-      // References mirrors In-Reply-To (we don't track the full ancestor chain
-      // client-side; the root id is enough to thread). Use the sanitized value.
+      // References carries the parent's own ancestor chain plus the parent, so
+      // a recipient's client can thread the reply even when it never saw the
+      // messages in between. Falls back to the parent alone when the chain is
+      // unknown (mail stored before it was captured, or a lookup failure).
+      references = await replyReferences(env, irt, typeof b.threadId === "string" ? b.threadId : "");
       headers["In-Reply-To"] = irt;
-      headers["References"] = irt;
+      headers["References"] = references;
     }
     // Decode and validate BEFORE sending: an oversized or corrupt attachment has
     // to fail the whole request rather than deliver a message the sender believes
@@ -1411,6 +1855,8 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
       // Sanitized: a raw b.fromName must never carry CR/LF into a header.
       from: { email: fromAddr, name: sanitizeFromName(b.fromName) || sender.displayName },
       to: toList,
+      ...(ccList.length ? { cc: ccList } : {}),
+      ...(bccList.length ? { bcc: bccList } : {}),
       subject: b.subject || "(no subject)",
       text: b.text || "",
       // The Workers send_email binding's structured builder overload accepts
@@ -1434,7 +1880,8 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     try {
       // send() resolves to an object carrying the platform-assigned messageId.
       sendResult = await env.EMAIL.send(msg);
-      console.log(`SEND OK: ${fromAddr} -> ${toList.map(recipientText).join(",")}`);
+      // Bcc stays out of the logs: it is the one field meant to be seen by nobody.
+      console.log(`SEND OK: ${fromAddr} -> ${[...toList, ...ccList].map(recipientText).join(",")}${bccList.length ? ` (+${bccList.length} bcc)` : ""}`);
     } catch (e) {
       console.error("EMAIL.send failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
       return json({ error: "send failed", detail: e instanceof Error ? e.message : String(e) }, 502);
@@ -1445,11 +1892,9 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     const sentMessageId = sendResult?.messageId ?? "";
     const id = uuid();
     const snippet = String(b.text || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    // Store attachments the way inbound mail does (att/<id>/p<n> in R2 plus a
-    // record in the parsed body), so the Sent view, the download route and the
-    // reader all work on sent mail with no special-casing. The message is
-    // already delivered here, so a storage failure must not report "Send
-    // failed" and invite a duplicate send.
+    // Store attachments the same way inbound mail does (att/<id>/p<n> in R2 plus
+    // a record in the parsed body), so the Sent view, the download route and the
+    // reader all work on sent mail with no special-casing.
     const attachmentRecords = attachments.map((a, i) => ({
       partId: `p${i}`,
       name: a.filename,
@@ -1458,31 +1903,60 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
       disposition: "attachment",
       contentId: null,
     }));
+    const ccText = ccList.map(recipientText).join(", ");
+    // Bcc is recorded on OUR copy only (it is never a header on the wire), so
+    // the Sent view can show who was blind-copied.
+    const mailboxRefs = (list: Recipient[]) =>
+      parseAddressList(list.map(recipientText).join(", ")).map((c) => ({ name: c.name, address: c.email }));
+    const sentHeaders: StoredHeaders = {
+      messageId: sentMessageId,
+      inReplyTo: irt ?? "",
+      ...(references ? { references: references.split(" ") } : {}),
+      ...(bccList.length ? { bcc: mailboxRefs(bccList) } : {}),
+    };
+    // The mail is already delivered by this point, so persistence must not be
+    // able to report failure: a thrown error here shows the user "Send failed"
+    // for a message the recipient HAS, and the natural response is to send it
+    // again. Log and continue instead — a missing Sent row is recoverable, a
+    // duplicate delivery is not.
     try {
       await Promise.all(
         attachments.map((a, i) =>
-          env.MAILSTORE.put(`att/${id}/p${i}`, a.content, { httpMetadata: { contentType: a.type } }),
+          env.MAILSTORE.put(`att/${id}/p${i}`, a.content, {
+            httpMetadata: { contentType: a.type },
+          }),
         ),
       );
       await env.MAILSTORE.put(
         `parsed/${id}.json`,
-        JSON.stringify({ text: b.text || "", html: b.html || "", attachments: attachmentRecords }),
+        JSON.stringify({
+          text: b.text || "",
+          html: b.html || "",
+          attachments: attachmentRecords,
+          headers: sentHeaders,
+        }),
       );
     } catch (e) {
       console.error("send: storing body/attachments failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
     }
     await env.DB.prepare(
-      `INSERT INTO messages (id, thread_id, direction, folder, msg_from, msg_to, subject, snippet, date, unread, has_attachments, message_id, in_reply_to, state, starred, domain)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO messages (id, thread_id, direction, folder, msg_from, msg_to, subject, snippet, date, unread, has_attachments, message_id, in_reply_to, state, starred, domain, msg_cc)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
-      .bind(id, b.threadId || id, "out", "sent", identityAddr, toList.map(recipientText).join(", "), b.subject || "", snippet, Date.now(), 0, attachments.length ? 1 : 0, sentMessageId, irt ?? "", "inbox", 0, sender.domain)
-      .run();
+      .bind(id, b.threadId || id, "out", "sent", identityAddr, toList.map(recipientText).join(", "), b.subject || "", snippet, Date.now(), 0, attachments.length ? 1 : 0, sentMessageId, irt ?? "", "inbox", 0, sender.domain, ccText || null)
+      .run()
+      .catch((e: unknown) => {
+        console.error("send: sent-row insert failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+      });
     // Index the sent message for full-text search (best-effort).
     await ftsUpsert(env, ftsRowFrom({
       id,
       subject: b.subject || "",
       from: identityAddr,
       to: toList.map(recipientText).join(", "),
+      // Not Bcc: a reindex rebuilds from the row, which has no Bcc, so indexing
+      // it here would only make search results change after one.
+      cc: ccText,
       bodyText: bodyForIndex(b.text || "", b.html || ""),
     }));
     return json({ ok: true, id });
@@ -1494,17 +1968,53 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
 export default {
   fetch: handleFetch,
   email: handleEmail,
-  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
+  async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext) {
     const now = Date.now();
-    const r = await purgeOldTrash(env, now);
-    console.log(`purge: removed ${r.purged} trashed message(s)`);
-    // Independent of the purge above: a failure there must not skip this, and
-    // vice versa. Both are best-effort housekeeping.
+    // Every tick: end snoozes that are due. The inbox already shows them (its
+    // predicate reads the clock); this marks them unread and says so.
+    try {
+      const woken = await wakeSnoozed(env, now);
+      // A notification per thread, capped: a pile of snoozes ending together
+      // should not become a pile of buzzes.
+      for (const w of woken.slice(0, 5)) {
+        const payload: Record<string, string> = {
+          title: "Snoozed mail is back",
+          body: clampUtf8(w.subject || "(no subject)", 300),
+          url: "/",
+          tag: clampUtf8(w.thread_id, MAX_PUSH_THREAD_ID_BYTES),
+        };
+        if (clampUtf8(w.thread_id, MAX_PUSH_THREAD_ID_BYTES) === w.thread_id) payload.threadId = w.thread_id;
+        await sendPushToAll(env, payload).catch((e: unknown) => {
+          console.error(`snooze: push failed: ${e instanceof Error ? e.message : e}`);
+        });
+      }
+    } catch (e) {
+      console.error(`snooze: wake failed: ${e instanceof Error ? e.message : e}`);
+    }
+    // The frequent tick stops here. Housekeeping runs once a day (and whenever
+    // the trigger is not identified, so a manual run still does everything).
+    if (event?.cron === SNOOZE_CRON) return;
+    // The sweeps are independent best-effort housekeeping: a failure in one
+    // must not skip the others, so each has its own try/catch.
+    try {
+      const r = await purgeOldTrash(env, now);
+      console.log(`purge: removed ${r.purged} trashed message(s)${r.pending ? `, ${r.pending} with cleanup still pending` : ""}`);
+    } catch (e) {
+      console.error(`purge: trash purge failed: ${e instanceof Error ? e.message : e}`);
+    }
+    // Finish any permanent deletes an earlier run (or a delete-forever) left
+    // half-done: their rows are gone, their tombstones say what remains.
+    try {
+      const d = await drainPendingDeletes(env, now);
+      if (d.drained || d.failed) console.log(`purge: finished ${d.drained} pending delete(s), ${d.failed} still failing`);
+    } catch (e) {
+      console.error(`purge: pending-delete drain failed: ${e instanceof Error ? e.message : e}`);
+    }
     try {
       const a = await purgeOrphanedDraftAttachments(env, now);
       if (a.purged) console.log(`purge: removed ${a.purged} orphaned draft attachment blob(s)`);
     } catch (e) {
-      console.log(`purge: draft-attachment sweep failed: ${e instanceof Error ? e.message : e}`);
+      console.error(`purge: draft-attachment sweep failed: ${e instanceof Error ? e.message : e}`);
     }
   },
 };

@@ -108,3 +108,58 @@ describe("deriveThreadId", () => {
     ).toBe("root@a.com");
   });
 });
+
+// A thread id becomes a path segment (/api/threads/:id) and a push tag, and it
+// comes straight from headers the sender wrote.
+describe("deriveThreadId rejects ids that cannot be addressed", () => {
+  it("skips a dot-only References root (URL normalization would eat it)", () => {
+    expect(deriveThreadId({ references: "<.> <real@a.com>" }, "fallback")).toBe("real@a.com");
+    expect(deriveThreadId({ references: "<..>", inReplyTo: "<parent@a.com>" }, "fallback")).toBe("parent@a.com");
+    expect(deriveThreadId({ messageId: "<..>" }, "fallback-uuid")).toBe("fallback-uuid");
+    expect(deriveThreadId({ messageId: "..." }, "fallback-uuid")).toBe("fallback-uuid");
+  });
+
+  it("keeps ids containing a slash or backslash (real Message-IDs have them)", () => {
+    // Rejecting these would split every later reply off threads already stored
+    // under such an id; percent-encoding carries them through the route intact.
+    expect(deriveThreadId({ references: "<a/b@x.com> <ok@x.com>" }, "fallback")).toBe("a/b@x.com");
+    expect(deriveThreadId({ messageId: "<a\\b@x.com>" }, "fallback-uuid")).toBe("a\\b@x.com");
+    expect(deriveThreadId({ inReplyTo: "<../../api/me>", messageId: "<self@x.com>" }, "fallback")).toBe("../../api/me");
+  });
+
+  it("skips ids containing control characters or whitespace", () => {
+    expect(deriveThreadId({ inReplyTo: "<a\u0000b@x.com>", messageId: "<self@x.com>" }, "fallback")).toBe("self@x.com");
+    expect(deriveThreadId({ inReplyTo: "<a b@x.com>", messageId: "<self@x.com>" }, "fallback")).toBe("self@x.com");
+    expect(deriveThreadId({ messageId: "<a\u007fb@x.com>" }, "fallback-uuid")).toBe("fallback-uuid");
+    expect(deriveThreadId({ messageId: "<a\u0085b@x.com>" }, "fallback-uuid")).toBe("fallback-uuid");
+  });
+
+  it("skips an id that is too long to be a real Message-ID", () => {
+    const long = `<${"a".repeat(2000)}@x.com>`;
+    expect(deriveThreadId({ references: `${long} <ok@x.com>` }, "fallback")).toBe("ok@x.com");
+    expect(deriveThreadId({ messageId: long }, "fallback-uuid")).toBe("fallback-uuid");
+  });
+
+  it("skips an id that cannot survive encodeURIComponent (lone surrogate)", () => {
+    expect(deriveThreadId({ messageId: "<a\ud800b@x.com>" }, "fallback-uuid")).toBe("fallback-uuid");
+  });
+
+  it("every id it returns round-trips through a URL path segment", () => {
+    for (const messageId of ["<simple@a.com>", "<we?ird#id%2F+x=@a.com>", "<é中@a.com>", "<a.b..c@a.com>"]) {
+      const id = deriveThreadId({ messageId }, "fallback");
+      expect(id).not.toBe("fallback");
+      const url = new URL(`https://inbox.example/api/threads/${encodeURIComponent(id)}`);
+      const segment = url.pathname.match(/^\/api\/threads\/([^/]+)$/)?.[1];
+      expect(segment && decodeURIComponent(segment)).toBe(id);
+    }
+  });
+
+  it("stays fast on a hostile header", () => {
+    const hostile = [">".repeat(200_000) + "x", "<".repeat(200_000), " ".repeat(200_000), "<a@b> ".repeat(40_000)];
+    const start = performance.now();
+    for (const h of hostile) {
+      deriveThreadId({ references: h, inReplyTo: h, messageId: h }, "fallback");
+    }
+    expect(performance.now() - start).toBeLessThan(500);
+  });
+});

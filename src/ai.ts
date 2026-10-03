@@ -5,8 +5,16 @@
 // is NOT a Workers AI model — it would need an external API + key; swap
 // SUMMARY_MODEL or point at an external endpoint if that's ever wanted.)
 
+import { htmlToText } from "./htmlText";
+
 /** Workers AI text-generation model used for summaries. */
-export const SUMMARY_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+// The plain "llama-3.1-8b-instruct" id was retired by Cloudflare on 2026-05-30
+// and every call to it has failed since ("AiError 5028 ... was deprecated").
+// The "-fast" variant is the same model family, stays active, and takes the
+// same messages input and { response } output. When this one is retired too,
+// check https://developers.cloudflare.com/workers-ai/models/ and change it here
+// and in categorize.ts.
+export const SUMMARY_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 
 interface AiEnv {
   AI: { run: (model: string, input: Record<string, unknown>) => Promise<{ response?: string }> };
@@ -22,7 +30,7 @@ interface TranscriptMessage {
 }
 
 function plainBody(body: { text?: string; html?: string }): string {
-  const raw = body.text && body.text.trim() ? body.text : (body.html || "").replace(/<[^>]+>/g, " ");
+  const raw = body.text && body.text.trim() ? body.text : htmlToText(body.html);
   return raw.replace(/\s+/g, " ").trim();
 }
 
