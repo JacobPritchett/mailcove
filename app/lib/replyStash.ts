@@ -12,6 +12,7 @@ export interface StashedReply {
   json: string;
   /** The server draft this reply already has (a reply put back by Undo send). */
   draftId?: string;
+  fromName?: string;
 }
 
 /** Returns false when the copy could not be kept (storage full or unavailable). */
@@ -32,6 +33,7 @@ export function stashedReply(threadId: string): StashedReply | null {
     if (typeof parsed?.text !== "string" || !parsed.text.trim()) return null;
     return {
       text: parsed.text,
+      ...(typeof parsed.fromName === "string" ? { fromName: parsed.fromName } : {}),
       json: typeof parsed.json === "string" ? parsed.json : "",
       ...(typeof parsed.draftId === "string" && parsed.draftId ? { draftId: parsed.draftId } : {}),
     };

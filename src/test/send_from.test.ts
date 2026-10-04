@@ -126,6 +126,13 @@ describe("/api/send with a `from` identity", () => {
     expect(msg.replyTo).toBe("team@example.net");
   });
 
+  it("stores the actual sender name with the sent body for future replies", async () => {
+    const { env } = makeEnv(ROWS);
+    await handleFetch(post({ to: "x@y.com", text: "hi", from: "team@example.com", fromName: "Chosen Name" }), env, ctx);
+    const put = vi.mocked(env.MAILSTORE.put).mock.calls.find(([key]) => String(key).startsWith("parsed/"));
+    expect(JSON.parse(String(put?.[1])).headers.fromName).toBe("Chosen Name");
+  });
+
   it("explicit fromName still overrides the identity display name", async () => {
     const { env, sendFn } = makeEnv(ROWS);
     await handleFetch(post({ to: "x@y.com", text: "hi", from: "team@example.com", fromName: "Custom" }), env, ctx);

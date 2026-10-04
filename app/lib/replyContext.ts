@@ -97,7 +97,21 @@ export function replyInitialForThread(
 ): ComposeInitial | null {
   const target = (targetId && messages.find((m) => m.id === targetId)) || defaultReplyTarget(messages);
   if (!target) return null;
-  return buildReplyInitial({ message: { ...target, thread_id: threadRootId }, body: target.body }, mode, mine);
+  const initial = buildReplyInitial({ message: { ...target, thread_id: threadRootId }, body: target.body }, mode, mine);
+  // The first message we sent establishes the conversation's display name.
+  // Never inherit a correspondent's name, even when replying to their message.
+  for (const sent of messages.filter((m) => m.direction === "out").sort((a, b) => a.date - b.date)) {
+    const storedName = sent.body.headers?.fromName;
+    const label = senderLabel(sent.msg_from);
+    const name = storedName || (label !== addressOf(sent.msg_from) ? label : "");
+    // Older sent copies saved only the address. Use the earliest known name
+    // so choosing one on a reply also repairs continuity in existing threads.
+    if (name) {
+      initial.fromName = name;
+      break;
+    }
+  }
+  return initial;
 }
 
 /**

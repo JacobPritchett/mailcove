@@ -131,6 +131,8 @@ export type AuthVerdict = "pass" | "fail" | "none";
 /** Header details stored beside the body (src/mailHeaders.ts). All optional:
  *  mail stored before they were captured simply lacks them. */
 export interface StoredHeaders {
+  /** Display name actually used for an outbound message. */
+  fromName?: string;
   messageId?: string;
   inReplyTo?: string;
   references?: string[];

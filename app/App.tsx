@@ -248,7 +248,7 @@ export default function App() {
       here.readerShowing &&
       !here.replyOpen &&
       // The inline composer picks a reply up from this local copy as it opens.
-      stashReply(threadId, { text, json: u.initial.bodyJson ?? "", draftId: u.initial.draftId })
+      stashReply(threadId, { text, json: u.initial.bodyJson ?? "", draftId: u.initial.draftId, fromName: u.initial.fromName })
     ) {
       setReplyRequest((r) => ({ mode: u.mode, messageId: u.messageId, nonce: r.nonce + 1 }));
       return;
