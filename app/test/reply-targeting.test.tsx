@@ -8,7 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import Reader from "../components/Reader";
 import type { ComposeInitial } from "../components/ComposeDialog";
 import type { ReplyMode } from "../lib/conversation";
-import { buildReplyInitial } from "../lib/replyContext";
+import { buildReplyInitial, replyInitialForThread } from "../lib/replyContext";
 import { baseLocal, sanitizeLocal } from "../lib/identity";
 import type { ThreadMessage } from "../lib/types";
 
@@ -30,7 +30,7 @@ vi.mock("sonner", () => ({
   Toaster: () => null,
 }));
 
-import { getIdentities, getThread, send } from "../lib/api";
+import { getIdentities, getThread, send, putDraft } from "../lib/api";
 
 function message(over: Partial<ThreadMessage> = {}): ThreadMessage {
   return {
@@ -342,5 +342,54 @@ describe("the From shown is the From used", () => {
     fireEvent.click(within(box()).getByRole("button", { name: /Send/ }));
     await waitFor(() => expect(send).toHaveBeenCalled());
     expect(lastSend()).toMatchObject({ from: "hello@example.com", fromLocal: "hello" });
+  });
+});
+
+
+describe("reply sender display name", () => {
+  const sent = (name: string, date: number) => message({
+    id: `sent-${date}`, direction: "out", date,
+    msg_from: `${name} <shop@example.com>`,
+  });
+
+  it("uses the earliest outbound name even when answering inbound mail or a later send", () => {
+    const messages = [sent("Later Name", 20), message(), sent('"Original, Name"', 10)];
+    expect(replyInitialForThread("t1", messages)?.fromName).toBe("Original, Name");
+    expect(replyInitialForThread("t1", messages, "reply-all", "sent-20")?.fromName).toBe("Original, Name");
+  });
+
+  it("uses the stored outbound name and skips legacy sends with no saved name", () => {
+    const legacy = message({ direction: "out", date: 1, msg_from: "shop@example.com" });
+    const named = message({ direction: "out", date: 2, msg_from: "shop@example.com", body: {
+      text: "hi", html: "", attachments: [], headers: { fromName: "Saved Name" },
+    } });
+    expect(replyInitialForThread("t1", [legacy, named, message()])?.fromName).toBe("Saved Name");
+  });
+
+  it("does not borrow an inbound name or turn a bare sender address into a name", () => {
+    expect(replyInitialForThread("t1", [message()])?.fromName).toBeUndefined();
+    expect(replyInitialForThread("t1", [message({ direction: "out", msg_from: "shop@example.com" })])?.fromName).toBeUndefined();
+  });
+
+  it("sends the inherited name from the inline composer", async () => {
+    setup([sent("Chosen Name", 1), message()]);
+    await ready();
+    fireEvent.click(box());
+    expect(await screen.findByRole("textbox", { name: "From name" })).toHaveValue("Chosen Name");
+    fireEvent.change(body(), { target: { value: "reply" } });
+    fireEvent.click(within(box()).getByRole("button", { name: /Send/ }));
+    await waitFor(() => expect(send).toHaveBeenCalled());
+    expect(lastSend().fromName).toBe("Chosen Name");
+  });
+
+  it("preserves an edited name in the draft and expanded composer", async () => {
+    const { onOpenCompose } = setup([sent("Chosen Name", 1), message()]);
+    await ready();
+    fireEvent.click(box());
+    fireEvent.change(await screen.findByRole("textbox", { name: "From name" }), { target: { value: "New Name" } });
+    fireEvent.change(body(), { target: { value: "reply" } });
+    await waitFor(() => expect(putDraft).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ fromName: "New Name" })), { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Open in full composer" }));
+    expect(onOpenCompose).toHaveBeenCalledWith(expect.objectContaining({ fromName: "New Name" }));
   });
 });

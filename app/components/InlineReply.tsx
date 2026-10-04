@@ -81,6 +81,7 @@ export default function InlineReply({
   const qc = useQueryClient();
   // Plain-text mirror of the editor (open-full handoff, AI-draft quote keep).
   const [text, setText] = useState("");
+  const [fromName, setFromName] = useState<string | null>(initial.fromName ?? null);
   // What the editor mounts with — replaced when an AI draft lands before the
   // lazy editor chunk has mounted (the imperative setPlainText would no-op).
   const [bodySeed, setBodySeed] = useState(initial.text ?? "");
@@ -136,7 +137,8 @@ export default function InlineReply({
   /** Typed anything beyond what we seeded? Compared through sameBody: the
    *  editor hands a seeded reply back WITHOUT its "> " markers, so raw equality
    *  reads every untouched reply as edited and autosaves a junk draft. */
-  const replyDirty = text.trim() !== "" && !sameBody(text, seededRef.current);
+  const replyDirty = (text.trim() !== "" && !sameBody(text, seededRef.current)) ||
+    (fromName !== null && fromName !== (initial.fromName ?? ""));
   // The owner needs to know before it points this box at someone else: an
   // edited reply must not have its recipients changed under it.
   const dirtyNow = open && replyDirty;
@@ -161,6 +163,7 @@ export default function InlineReply({
   useEffect(() => {
     if (open && !wasOpenRef.current) {
       skipDraftRef.current = false;
+      setFromName(initial.fromName ?? null);
       // The previous row is either deleted or now owned by the dialog; a new
       // reply gets a new id rather than writing over either.
       draftIdRef.current = null;
@@ -182,6 +185,7 @@ export default function InlineReply({
       // is the user's own text, so seeding must not write over it.
       const kept = initial.threadId ? stashedReply(initial.threadId) : null;
       if (kept) {
+        setFromName(kept.fromName ?? initial.fromName ?? null);
         userEditedRef.current = true;
         hasSeededRef.current = true;
         docJsonRef.current = kept.json;
@@ -202,7 +206,7 @@ export default function InlineReply({
       setBodyJsonSeed("");
     }
     wasOpenRef.current = open;
-  }, [open, initial.text, initial.threadId]);
+  }, [open, initial.text, initial.threadId, initial.fromName]);
 
   // Autosave queue: saves chain (each starts after the previous settled) and
   // deletion joins the chain — no PUT can land after the DELETE.
@@ -224,6 +228,7 @@ export default function InlineReply({
       // Persist the actual sending local-part so a dialog resume doesn't
       // silently fall back to "hello" on deployments with another default.
       fromLocal,
+      ...(fromName !== null ? { fromName: fromName.trim() } : {}),
     };
     const save = savingRef.current.then(() =>
       putDraft(id, payload).then(() => {
@@ -267,12 +272,12 @@ export default function InlineReply({
     }, 1500);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, text]);
+  }, [open, text, fromName]);
 
   /** Save the reply if the user wrote one and it is not already on its way out. */
   function flushReplyDraft() {
-    const { text: t, quote } = latestRef.current;
-    if (!skipDraftRef.current && !sendingRef.current && t.trim() && !sameBody(t, quote)) {
+    const { text: t } = latestRef.current;
+    if (!skipDraftRef.current && !sendingRef.current && replyDirty) {
       return saveReplyDraft(t, docJsonRef.current);
     }
   }
@@ -319,6 +324,8 @@ export default function InlineReply({
   const domainSwapped = !!initial.fromDomain && fromDomain !== initial.fromDomain;
   const fromLocal =
     (!domainSwapped && sanitizeLocal(initial.fromLocal ?? "")) || identities?.defaultLocal || "hello";
+
+  const fromNameValue = fromName ?? identities?.identities.find((i) => i.domain === fromDomain)?.displayName ?? "";
 
   // Seed the signature only once identities resolve WHICH domain is sending.
   // The reply domain and the sending domain are not always the same — the
@@ -388,6 +395,7 @@ export default function InlineReply({
     const payload: SendPayload = {
       from: `${fromLocal}@${fromDomain}`,
       fromLocal,
+      ...(fromName?.trim() ? { fromName: fromName.trim() } : {}),
       to: initial.to ?? "",
       ...(ccList.length ? { cc: ccList } : {}),
       subject: initial.subject ?? "",
@@ -412,6 +420,7 @@ export default function InlineReply({
         draftId,
         fromLocal,
         fromDomain,
+        ...(fromName !== null ? { fromName } : {}),
       };
       // The held send owns the draft row now (the Worker deletes it when it
       // accepts the message); nothing here may write or delete it again.
@@ -449,7 +458,7 @@ export default function InlineReply({
         // (the unmount flush skipped it while the send was in flight). Say it
         // was saved only once it was: a send that failed for being offline
         // will usually fail to save for the same reason.
-        const kept = { text: latestRef.current.text, json: docJsonRef.current };
+        const kept = { text: latestRef.current.text, json: docJsonRef.current, ...(fromName !== null ? { fromName } : {}) };
         if (await saveReplyDraft(kept.text, kept.json)) {
           toast.error("Send failed. Your reply was saved to Drafts.");
         } else if (initial.threadId && stashReply(initial.threadId, kept)) {
@@ -551,6 +560,9 @@ export default function InlineReply({
                 skipDraftRef.current = true;
                 onOpenFull({
                   ...initial,
+                  fromLocal,
+                  fromDomain,
+                  ...(fromName !== null ? { fromName } : {}),
                   text: text || initial.text,
                   // The quote always travels; whether a signature may still be
                   // seeded is a separate fact. Dropping the quote to say "do
@@ -583,6 +595,18 @@ export default function InlineReply({
           </Button>
         </span>
       </div>
+
+      <label className="flex items-center gap-2 border-b border-border/60 px-4 py-2 text-xs text-muted-foreground">
+        <span className="shrink-0">From name</span>
+        <input
+          aria-label="From name"
+          value={fromNameValue}
+          onChange={(e) => setFromName(e.target.value)}
+          disabled={busy}
+          placeholder="Default profile name"
+          className="min-w-0 flex-1 rounded border border-input bg-background px-2 py-1.5 text-base text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
+        />
+      </label>
 
       {/* Body — quoted history is part of the document (trimmable blockquote). */}
       <Suspense

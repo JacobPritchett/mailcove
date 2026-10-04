@@ -25,6 +25,8 @@ export interface UnsubscribeInfo {
 }
 
 export interface StoredHeaders {
+  /** Display name actually used for an outbound message. */
+  fromName?: string;
   messageId: string;
   inReplyTo: string;
   /** Ancestor chain, oldest first, sanitized. Lets a reply send full References. */

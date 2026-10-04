@@ -1981,6 +1981,7 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     const mailboxRefs = (list: Recipient[]) =>
       parseAddressList(list.map(recipientText).join(", ")).map((c) => ({ name: c.name, address: c.email }));
     const sentHeaders: StoredHeaders = {
+      fromName: sanitizeFromName(b.fromName) || sender.displayName,
       messageId: sentMessageId,
       inReplyTo: irt ?? "",
       ...(references ? { references: references.split(" ") } : {}),

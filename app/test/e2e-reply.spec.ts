@@ -71,3 +71,21 @@ test("a typed reply is not turned into a reply all by a stray key", async ({ pag
   await expect.poll(() => mail.sends.length).toBe(1);
   expect(mail.sends[0].cc).toBeUndefined();
 });
+
+for (const width of [1440, 390]) {
+  test(`reply sender name can be edited at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const mail = await stubMailbox(page, makeThreads(1));
+    await page.goto("/", { waitUntil: "networkidle" });
+    await open(page, "Thread 1");
+    await box(page).click();
+    const name = box(page).getByRole("textbox", { name: "From name" });
+    await expect(name).toBeVisible();
+    await name.fill("Chosen Reply Name");
+    await page.locator(".ProseMirror").fill("Reply using this name");
+    await page.screenshot({ path: `/tmp/reply-name-${width}.png`, fullPage: true });
+    await box(page).getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(() => mail.sends.length).toBe(1);
+    expect(mail.sends[0].fromName).toBe("Chosen Reply Name");
+  });
+}
