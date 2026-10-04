@@ -216,7 +216,12 @@ describe("while a reply is being sent", () => {
 });
 
 describe("a send that fails after the composer is gone", () => {
-  beforeEach(() => localStorage.clear());
+  beforeEach(() => {
+    localStorage.clear();
+    // These are about a send that goes out at once (see undo-send.test.tsx
+    // for one that is held first).
+    localStorage.setItem("mailcove.undo-send", "0");
+  });
 
   async function failAfterSwitch() {
     let rejectSend!: (e: Error) => void;

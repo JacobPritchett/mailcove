@@ -38,6 +38,11 @@ import type { MailAction, View } from "@/lib/types";
 
 export interface BulkActionBarProps {
   count: number;
+  /**
+   * The whole view is selected, not only the loaded rows (see lib/selectAll).
+   * `count` is then its size where that is known, else 0.
+   */
+  wholeView?: boolean;
   view: View;
   onAction: (action: MailAction, opts?: ActionOptions) => void;
   onClear: () => void;
@@ -75,7 +80,7 @@ function BarButton({
  * Actions for the selected threads. Leads with the way out (Clear selection)
  * and the count, then the actions that fit; the rest are under More.
  */
-export default function BulkActionBar({ count, view, onAction, onClear, className }: BulkActionBarProps) {
+export default function BulkActionBar({ count, wholeView, view, onAction, onClear, className }: BulkActionBarProps) {
   const isTrash = view === "trash";
   const isJunk = view === "spam";
   const isSnoozed = view === "snoozed";
@@ -89,7 +94,7 @@ export default function BulkActionBar({ count, view, onAction, onClear, classNam
     >
       <BarButton icon={X} name="Clear selection" onClick={onClear} />
       <span className="mr-auto min-w-0 truncate pl-1 text-sm font-medium text-foreground" aria-live="polite">
-        {count} selected
+        {wholeView ? (count ? `All ${count.toLocaleString()} selected` : "All selected") : `${count} selected`}
       </span>
 
       {isTrash || isJunk ? (
@@ -108,11 +113,17 @@ export default function BulkActionBar({ count, view, onAction, onClear, classNam
           <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
             <AlertDialogContent>
               <AlertDialogHeader>
-                <AlertDialogTitle>Delete {count} message{count !== 1 ? "s" : ""} forever?</AlertDialogTitle>
+                <AlertDialogTitle>
+                  {wholeView
+                    ? "Delete everything in this view forever?"
+                    : `Delete ${count} message${count !== 1 ? "s" : ""} forever?`}
+                </AlertDialogTitle>
                 <AlertDialogDescription>
-                  {count === 1
-                    ? "This message will be permanently deleted and cannot be recovered."
-                    : `These ${count} messages will be permanently deleted and cannot be recovered.`}
+                  {wholeView
+                    ? `${count ? `All ${count.toLocaleString()} conversations` : "Every conversation"} in this view, including the ones not loaded yet, will be permanently deleted and cannot be recovered.`
+                    : count === 1
+                      ? "This message will be permanently deleted and cannot be recovered."
+                      : `These ${count} messages will be permanently deleted and cannot be recovered.`}
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>

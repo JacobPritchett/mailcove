@@ -5,6 +5,7 @@ import { FileText, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useDrafts, useDeleteDraft } from "@/lib/queries";
+import { cancelHeldDraft } from "@/lib/outbox";
 import { getDraft } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import type { ComposeInitial } from "@/components/ComposeDialog";
@@ -50,9 +51,17 @@ export default function DraftsList({ onOpen }: DraftsListProps) {
   const { data, isPending, isError } = useDrafts(true);
   const del = useDeleteDraft();
 
+  function available(id: string): boolean {
+    if (cancelHeldDraft(id)) return true;
+    toast.error("This draft has a send in progress. Wait for it to finish before editing or deleting it.");
+    return false;
+  }
+
   async function openDraft(row: DraftSummary) {
+    if (!available(row.id)) return;
     try {
       const full = await getDraft(row.id);
+      if (!available(row.id)) return;
       onOpen(draftToComposeInitial(full));
     } catch {
       toast.error("Couldn't open this draft");
@@ -107,7 +116,7 @@ export default function DraftsList({ onOpen }: DraftsListProps) {
             aria-label={`Delete draft ${d.subject || d.id}`}
             disabled={del.isPending}
             onClick={() =>
-              del.mutate(d.id, {
+              available(d.id) && del.mutate(d.id, {
                 onSuccess: () => toast.success("Draft deleted"),
                 onError: () => toast.error("Couldn't delete draft"),
               })

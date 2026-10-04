@@ -142,6 +142,27 @@ export function listThreads({ view, q, category, domain, limit, cursor }: ListTh
   return request<ThreadsResponse>(`/api/messages?${params.toString()}`);
 }
 
+/**
+ * GET /api/messages/ids — one page (up to 500) of the thread ids of a view or
+ * a search, in list order, with the list route's parameters and cursors. For
+ * acting on a whole view without loading it (see lib/selectAll).
+ */
+export function listThreadIds({ view, q, category, domain, cursor }: Omit<ListThreadsArgs, "limit">): Promise<{
+  ids: string[];
+  nextCursor: string | null;
+}> {
+  const params = new URLSearchParams({ view });
+  const trimmed = q?.trim();
+  if (trimmed) {
+    params.set("q", trimmed);
+    params.set("tz", String(new Date().getTimezoneOffset()));
+  }
+  if (category && !trimmed) params.set("category", category);
+  if (domain) params.set("domain", domain);
+  if (cursor) params.set("cursor", cursor);
+  return request(`/api/messages/ids?${params.toString()}`);
+}
+
 /** GET /api/counts — per-view thread/unread counts. */
 export function getCounts(): Promise<ViewCounts> {
   return request<ViewCounts>(`/api/counts`);
@@ -195,9 +216,21 @@ export function getMessage(id: string): Promise<MessageDetail> {
   return request<MessageDetail>(`/api/messages/${encodeURIComponent(id)}`);
 }
 
-/** POST /api/send */
-export function send(payload: SendPayload): Promise<{ ok: true; id: string }> {
-  return postJson<{ ok: true; id: string }>(`/api/send`, payload);
+/**
+ * POST /api/send. `keepalive` is for a send made as the page goes away (see
+ * lib/outbox): the browser finishes the request after the page is gone, at
+ * the price of a body limited to about 64 KB.
+ */
+export function send(
+  payload: SendPayload & { draftId?: string },
+  opts: { keepalive?: boolean } = {},
+): Promise<{ ok: true; id: string }> {
+  return request<{ ok: true; id: string }>(`/api/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    ...(opts.keepalive ? { keepalive: true } : {}),
+  });
 }
 
 /** GET /api/identities — the From identities compose can send as. */
@@ -327,7 +360,7 @@ export function listDomains(): Promise<DomainsResponse> {
 export function getDomainDetail(zoneId: string, name: string): Promise<DomainDetailResponse> {
   const params = new URLSearchParams({ name });
   return request<DomainDetailResponse>(
-    `/api/domains/${encodeURIComponent(zoneId)}?${params.toString()}`,
+    `/api/domain-routing/${encodeURIComponent(zoneId)}?${params.toString()}`,
   );
 }
 
@@ -337,7 +370,7 @@ export function setDomainCatchAll(
   action: "forward" | "drop",
   forwardTo?: string,
 ): Promise<{ ok: true }> {
-  return request<{ ok: true }>(`/api/domains/${encodeURIComponent(zoneId)}/catch-all`, {
+  return request<{ ok: true }>(`/api/domain-routing/${encodeURIComponent(zoneId)}/catch-all`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, forwardTo }),
@@ -350,7 +383,7 @@ export function connectReceiving(
   mode: ReceivingMode,
   forwardTo?: string,
 ): Promise<{ ok: true }> {
-  return postJson<{ ok: true }>(`/api/domains/${encodeURIComponent(zoneId)}/receiving`, {
+  return postJson<{ ok: true }>(`/api/domain-routing/${encodeURIComponent(zoneId)}/receiving`, {
     mode,
     forwardTo,
   });
@@ -361,7 +394,7 @@ export function connectSending(
   zoneId: string,
   variant: "apex" | "subdomain" = "apex",
 ): Promise<ConnectSendingResponse> {
-  return postJson<ConnectSendingResponse>(`/api/domains/${encodeURIComponent(zoneId)}/sending`, {
+  return postJson<ConnectSendingResponse>(`/api/domain-routing/${encodeURIComponent(zoneId)}/sending`, {
     variant,
   });
 }
@@ -371,13 +404,13 @@ export function createDomainRule(
   zoneId: string,
   rule: { local: string; action: RuleActionKind; forwardTo?: string },
 ): Promise<{ ok: true; id: string }> {
-  return postJson<{ ok: true; id: string }>(`/api/domains/${encodeURIComponent(zoneId)}/rules`, rule);
+  return postJson<{ ok: true; id: string }>(`/api/domain-routing/${encodeURIComponent(zoneId)}/rules`, rule);
 }
 
 /** PATCH /api/domains/:zoneId/rules/:ruleId — enable/disable a rule. */
 export function toggleDomainRule(zoneId: string, ruleId: string, enabled: boolean): Promise<{ ok: true }> {
   return request<{ ok: true }>(
-    `/api/domains/${encodeURIComponent(zoneId)}/rules/${encodeURIComponent(ruleId)}`,
+    `/api/domain-routing/${encodeURIComponent(zoneId)}/rules/${encodeURIComponent(ruleId)}`,
     {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -389,7 +422,7 @@ export function toggleDomainRule(zoneId: string, ruleId: string, enabled: boolea
 /** DELETE /api/domains/:zoneId/rules/:ruleId — remove a rule. */
 export function deleteDomainRule(zoneId: string, ruleId: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(
-    `/api/domains/${encodeURIComponent(zoneId)}/rules/${encodeURIComponent(ruleId)}`,
+    `/api/domain-routing/${encodeURIComponent(zoneId)}/rules/${encodeURIComponent(ruleId)}`,
     { method: "DELETE" },
   );
 }
@@ -401,12 +434,12 @@ export function addDestination(email: string): Promise<{ ok: true }> {
 
 /** GET /api/domains/:zoneId/settings — per-domain inbox settings. */
 export function getDomainSettings(zoneId: string): Promise<DomainSettings> {
-  return request<DomainSettings>(`/api/domains/${encodeURIComponent(zoneId)}/settings`);
+  return request<DomainSettings>(`/api/domain-routing/${encodeURIComponent(zoneId)}/settings`);
 }
 
 /** PATCH /api/domains/:zoneId/settings — partial update (forward copy and/or sender name). */
 export function setDomainSettings(zoneId: string, patch: DomainSettingsPatch): Promise<{ ok: true }> {
-  return request<{ ok: true }>(`/api/domains/${encodeURIComponent(zoneId)}/settings`, {
+  return request<{ ok: true }>(`/api/domain-routing/${encodeURIComponent(zoneId)}/settings`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
@@ -501,3 +534,22 @@ export type UnsubscribeResult =
 /** Act on a message's List-Unsubscribe header (see the Worker route). */
 export const unsubscribeFrom = (id: string) =>
   request<UnsubscribeResult>(`/api/messages/${encodeURIComponent(id)}/unsubscribe`, { method: "POST" });
+
+/**
+ * Fetch one stored attachment as text, for a file the client reads itself (a
+ * calendar invite). `maxBytes` bounds what is decoded: the caller is about to
+ * parse something a stranger sent.
+ */
+export async function getAttachmentText(id: string, name: string, partId: string | undefined, maxBytes: number): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(attachmentUrl(id, name, partId), { credentials: "same-origin" });
+  } catch {
+    throw new ApiError(0, "network error");
+  }
+  if (!res.ok) throw new ApiError(res.status, `Could not fetch ${name}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  // Not fatal: a calendar file in another encoding still has ASCII property
+  // names, and a mangled title is better than no card.
+  return new TextDecoder("utf-8").decode(bytes.subarray(0, maxBytes));
+}

@@ -10,6 +10,8 @@ export interface StashedReply {
   text: string;
   /** Stringified editor document, "" when there was none. */
   json: string;
+  /** The server draft this reply already has (a reply put back by Undo send). */
+  draftId?: string;
 }
 
 /** Returns false when the copy could not be kept (storage full or unavailable). */
@@ -28,7 +30,11 @@ export function stashedReply(threadId: string): StashedReply | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<StashedReply> | null;
     if (typeof parsed?.text !== "string" || !parsed.text.trim()) return null;
-    return { text: parsed.text, json: typeof parsed.json === "string" ? parsed.json : "" };
+    return {
+      text: parsed.text,
+      json: typeof parsed.json === "string" ? parsed.json : "",
+      ...(typeof parsed.draftId === "string" && parsed.draftId ? { draftId: parsed.draftId } : {}),
+    };
   } catch {
     return null;
   }

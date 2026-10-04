@@ -84,7 +84,8 @@ export default function ShortcutHelpDialog({
             <Row keys={["a"]} label="Reply all" />
             <Row keys={["f"]} label="Forward" />
             <Row keys={["c"]} label="Compose" />
-            <Row keys={["z"]} label="Undo last action" />
+            <Row keys={["z"]} label="Undo last action, or a send still waiting" />
+            <Row keys={["\u2318", "P"]} label="Print the open conversation" />
           </Group>
 
           <Group title="Selection">

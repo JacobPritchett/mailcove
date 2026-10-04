@@ -9,7 +9,7 @@
 // message body is a sandboxed iframe, and re-rendering that once a minute would
 // be a real cost for a line of text.
 import { useEffect, useState } from "react";
-import { formatFullDate } from "@/lib/format";
+import { formatDate, formatFullDate } from "@/lib/format";
 
 /**
  * A minute is comfortably finer than anything the format distinguishes — the
@@ -22,9 +22,11 @@ export interface RelativeTimeProps {
   /** Epoch milliseconds. */
   date: number;
   className?: string;
+  /** The list-row form ("9:41 AM", "Jun 3"), for a line with no room for more. */
+  short?: boolean;
 }
 
-export default function RelativeTime({ date, className }: RelativeTimeProps) {
+export default function RelativeTime({ date, className, short }: RelativeTimeProps) {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -41,7 +43,7 @@ export default function RelativeTime({ date, className }: RelativeTimeProps) {
       title={d.toLocaleString()}
       className={className}
     >
-      {formatFullDate(date, now)}
+      {short ? formatDate(date, now) : formatFullDate(date, now)}
     </time>
   );
 }

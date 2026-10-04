@@ -22,11 +22,12 @@ import CommandPalette from "@/components/CommandPalette";
 import ShortcutHelpDialog from "@/components/ShortcutHelpDialog";
 import DomainsDialog from "@/components/DomainsDialog";
 import FiltersDialog from "@/components/FiltersDialog";
+import SettingsDialog from "@/components/SettingsDialog";
 import { Toaster } from "@/components/ui/sonner";
 import { useThreads, useCounts } from "@/lib/queries";
 import { actionLabel, actionView } from "@/lib/actions";
 import { useThreadActions, type ActionOptions } from "@/lib/useThreadActions";
-import { useIsDesktop } from "@/lib/useMediaQuery";
+import { useIsDesktop, useIsWide } from "@/lib/useMediaQuery";
 import { useBackClose, BACK_LAYER } from "@/lib/useBackClose";
 import { useKeyboardScrollReset } from "@/lib/useKeyboardScrollReset";
 import { useUnreadBadge } from "@/lib/useUnreadBadge";
@@ -35,6 +36,14 @@ import { cn } from "@/lib/utils";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 import type { MailAction, NavView, View, ViewCounts } from "@/lib/types";
 import type { ReplyMode } from "@/lib/conversation";
+import { nextUnsentCheck, reportUnsent, undoLastHeld } from "@/lib/outbox";
+import { stashReply } from "@/lib/replyStash";
+import { getDraft, listDrafts } from "@/lib/api";
+import { draftToComposeInitial } from "@/components/DraftsList";
+import { toast } from "sonner";
+import { collectViewIds, SELECT_ALL_MAX } from "@/lib/selectAll";
+import { mailtoFromSearch, type MailtoFields } from "@/lib/mailto";
+import { openMailto, setMailtoComposer } from "@/lib/mailtoHandler";
 
 const EMPTY_COUNTS: ViewCounts = {
   inbox: 0,
@@ -76,6 +85,9 @@ export default function App() {
 
   // Multi-select state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // "Select all N in this view": the selection stands for the whole view,
+  // loaded or not (see lib/selectAll). Any change to the selection ends it.
+  const [wholeView, setWholeView] = useState(false);
 
   // Mobile single-pane view state. Only consulted below `md` (the desktop layout
   // always shows both panes via responsive classes). Tapping a thread flips to
@@ -84,6 +96,9 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const isDesktop = useIsDesktop();
+  // Wide enough for the full sidebar; below it the sidebar is an icon rail
+  // whose first button opens the drawer.
+  const isWide = useIsWide();
 
   // Single ComposeDialog instance: `composeOpen` toggles it, `composeInitial`
   // carries reply prefill (undefined → blank compose).
@@ -113,6 +128,13 @@ export default function App() {
   function openFilters() {
     setDrawerOpen(false);
     setFiltersOpen(true);
+  }
+
+  // Per-browser settings (undo send, email links).
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  function openSettings() {
+    setDrawerOpen(false);
+    setSettingsOpen(true);
   }
 
   useKeyboardScrollReset();
@@ -157,7 +179,12 @@ export default function App() {
   const [replyMode, setReplyMode] = useState<ReplyMode>("reply");
   // `r` and `a`: a request the reader carries out, since only it knows who the
   // thread's default reply goes to (and whether a reply is already being written).
-  const [replyRequest, setReplyRequest] = useState<{ mode: ReplyMode; nonce: number }>({ mode: "reply", nonce: 0 });
+  // `messageId` names the message to answer when it is not the default one
+  // (a reply put back by Undo send goes back to the message it answered).
+  const [replyRequest, setReplyRequest] = useState<{ mode: ReplyMode; nonce: number; messageId?: string | null }>({
+    mode: "reply",
+    nonce: 0,
+  });
   const [forwardNonce, setForwardNonce] = useState(0);
   // Same idea for `b`: the snooze menu belongs to the reader's toolbar.
   const [snoozeNonce, setSnoozeNonce] = useState(0);
@@ -184,9 +211,129 @@ export default function App() {
   /** Open the full compose dialog with a prefill (inline composer hand-off). */
   function openComposeWith(initial: ComposeInitial) {
     setReplyOpen(false);
+    // Already open on another message (Undo send pressed while writing the
+    // next one): the dialog only reads its prefill as it opens, so close it
+    // first. Closing keeps what was being written as a draft.
+    if (composeOpenRef.current) {
+      setComposeOpen(false);
+      setTimeout(() => {
+        setComposeInitial(initial);
+        setComposeOpen(true);
+      }, 0);
+      return;
+    }
     setComposeInitial(initial);
     setComposeOpen(true);
   }
+
+  // What the handlers below need to know NOW. They are called from toasts and
+  // timers long after the render that created them.
+  const composeOpenRef = useRef(composeOpen);
+  composeOpenRef.current = composeOpen;
+  const hereRef = useRef({ selectedThreadId, replyOpen, readerShowing: true });
+
+  /**
+   * Undo send on an inline reply. Back where it was written when that
+   * conversation is still open and no other reply has been started in it;
+   * otherwise in the full composer, which holds the same recipients, quote
+   * and draft.
+   */
+  function undoReplySend(u: { initial: ComposeInitial; mode: ReplyMode; messageId: string | null }) {
+    const threadId = u.initial.threadId;
+    const here = hereRef.current;
+    const text = u.initial.text ?? "";
+    if (
+      threadId &&
+      here.selectedThreadId === threadId &&
+      here.readerShowing &&
+      !here.replyOpen &&
+      // The inline composer picks a reply up from this local copy as it opens.
+      stashReply(threadId, { text, json: u.initial.bodyJson ?? "", draftId: u.initial.draftId })
+    ) {
+      setReplyRequest((r) => ({ mode: u.mode, messageId: u.messageId, nonce: r.nonce + 1 }));
+      return;
+    }
+    openComposeWith(u.initial);
+  }
+
+  /** Open a saved draft in the compose dialog (the "Open draft" of a toast). */
+  async function openDraftById(id: string) {
+    try {
+      openComposeWith(draftToComposeInitial(await getDraft(id)));
+    } catch {
+      handleView("drafts");
+    }
+  }
+  const openDraftRef = useRef(openDraftById);
+  openDraftRef.current = openDraftById;
+
+  // mailto: links. Three ways in, one way through (openMailto): the browser
+  // handing us a link from another site (/?compose=mailto:..., see
+  // lib/mailtoHandler), a link inside a message frame (lib/emailFrame), and a
+  // link anywhere in the app's own markup (a plain-text body, chat mode).
+  // Each only opens the composer filled in. Sending stays the user's act.
+  const openComposeRef = useRef(openComposeWith);
+  openComposeRef.current = openComposeWith;
+  useEffect(() => {
+    const withdraw = setMailtoComposer((f: MailtoFields) =>
+      openComposeRef.current({
+        to: f.to || undefined,
+        cc: f.cc || undefined,
+        bcc: f.bcc || undefined,
+        subject: f.subject || undefined,
+        text: f.body || undefined,
+        // A new message, so the signature may still be seeded (into an empty
+        // body only), and one closed untouched is not worth a draft.
+        replyQuote: "",
+        generated: true,
+      }),
+    );
+    const onClick = (e: MouseEvent) => {
+      if (e.defaultPrevented || e.button !== 0) return;
+      const link = e.target instanceof Element ? e.target.closest("a[href]") : null;
+      const href = link?.getAttribute("href") ?? "";
+      if (/^\s*mailto:/i.test(href) && openMailto(href)) e.preventDefault();
+    };
+    document.addEventListener("click", onClick);
+    const params = new URLSearchParams(window.location.search);
+    const handed = mailtoFromSearch(window.location.search);
+    if (params.has("compose")) {
+      if (handed) openMailto(handed);
+      // Gone from the address bar either way: a reload must not reopen it.
+      params.delete("compose");
+      const rest = params.toString();
+      window.history.replaceState(
+        window.history.state,
+        "",
+        window.location.pathname + (rest ? `?${rest}` : "") + window.location.hash,
+      );
+    }
+    return () => {
+      withdraw();
+      document.removeEventListener("click", onClick);
+    };
+  }, []);
+
+  // A message sent as an earlier page went away may not have made it. Ask
+  // once the Worker has had time to answer, now or when that time comes.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = () => {
+      const at = nextUnsentCheck();
+      if (at === null) return;
+      const wait = at - Date.now();
+      if (wait > 0) {
+        timer = setTimeout(check, wait + 50);
+        return;
+      }
+      void reportUnsent(
+        async () => (await listDrafts()).drafts.map((d) => d.id),
+        (id) => void openDraftRef.current(id),
+      );
+    };
+    check();
+    return () => clearTimeout(timer);
+  }, []);
 
   // Selecting a thread: on mobile, navigate to the full-screen reader.
   function handleSelectThread(threadId: string) {
@@ -305,6 +452,7 @@ export default function App() {
 
   // Selection helpers for multi-select.
   function toggleSelect(id: string) {
+    setWholeView(false);
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -314,10 +462,12 @@ export default function App() {
   }
 
   function clearSelection() {
+    setWholeView(false);
     setSelectedIds(new Set());
   }
 
   function selectAll() {
+    setWholeView(false);
     setSelectedIds(new Set(threadOrder));
   }
 
@@ -327,18 +477,50 @@ export default function App() {
     if (anchorIdx === -1 || targetIdx === -1) return;
     const start = Math.min(anchorIdx, targetIdx);
     const end = Math.max(anchorIdx, targetIdx);
+    setWholeView(false);
     setSelectedIds(new Set(threadOrder.slice(start, end + 1)));
   }
 
   function handleBulkAction(action: MailAction, opts?: ActionOptions) {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
+    if (wholeView) {
+      clearSelection();
+      void runOnWholeView(action, opts);
+      return;
+    }
     clearSelection();
     threadActions.run(ids, action, {
       ...opts,
       undoUntil: action === "unsnooze" ? sharedSnoozeTime(ids) : undefined,
       label: `${ids.length} ${actionLabel(action).toLowerCase()}`,
     });
+  }
+
+  /**
+   * A bulk action on the whole view. The ids are collected first, then it is
+   * the same action as any other: one toast, one Undo, the same optimistic
+   * update for the rows that are loaded.
+   */
+  async function runOnWholeView(action: MailAction, opts?: ActionOptions) {
+    const toastId = "select-all";
+    toast.loading("Finding every conversation in this view\u2026", { id: toastId, duration: Infinity });
+    let found;
+    try {
+      found = await collectViewIds({ view: threadView, q, category: activeCategory, domain: activeDomain });
+    } catch {
+      toast.error("Couldn't read the whole view. Nothing was changed.", { id: toastId, duration: 6000 });
+      return;
+    }
+    toast.dismiss(toastId);
+    if (found.ids.length === 0) return;
+    threadActions.run(found.ids, action, {
+      ...opts,
+      label: `${found.ids.length.toLocaleString()} ${actionLabel(action).toLowerCase()}`,
+    });
+    if (found.capped) {
+      toast(`That was the first ${SELECT_ALL_MAX.toLocaleString()}. Select all again for the rest.`, { duration: 10_000 });
+    }
   }
 
   /**
@@ -468,7 +650,9 @@ export default function App() {
         focusSearch();
       },
       onUndo() {
-        threadActions.undoLast();
+        // A message still being held comes first: it is the one thing here
+        // that cannot be taken back a moment later.
+        if (!undoLastHeld()) threadActions.undoLast();
       },
       onHelp() {
         setHelpOpen(true);
@@ -484,7 +668,7 @@ export default function App() {
         handleView(v);
       },
     },
-    composeOpen || paletteOpen || helpOpen || domainsOpen || filtersOpen,
+    composeOpen || paletteOpen || helpOpen || domainsOpen || filtersOpen || settingsOpen,
   );
 
   const viewTitle = VIEW_TITLES[view];
@@ -494,6 +678,23 @@ export default function App() {
   const sidebarCounts = counts.data ?? EMPTY_COUNTS;
   // On mobile, the reader fills the screen; the back arrow returns to the list.
   const mobileShowingReader = !isDesktop && mobileView === "reader";
+  // Every loaded row is selected and the server has more: offer the rest.
+  const allLoadedSelected = threadOrder.length > 0 && selectedIds.size === threadOrder.length;
+  // How many that is, where the counts say (a plain view: no search, label
+  // or domain narrowing it). Otherwise the offer is made without a number.
+  const viewTotal =
+    !searching && !activeCategory && !activeDomain && !isDraftsView ? (sidebarCounts[threadView] ?? 0) : 0;
+  const selectAllOffer =
+    allLoadedSelected && (wholeView || active.hasMore) ? (
+      <SelectAllBanner
+        loaded={threadOrder.length}
+        total={viewTotal}
+        wholeView={wholeView}
+        onSelectAll={() => setWholeView(true)}
+        onClear={clearSelection}
+      />
+    ) : null;
+  hereRef.current = { selectedThreadId, replyOpen, readerShowing: isDesktop || mobileShowingReader };
 
   // Hardware/browser Back closes mobile overlays instead of leaving the app.
   // Reader: Back returns to the list. A no-op on desktop (enabled is gated by
@@ -505,17 +706,17 @@ export default function App() {
   // expects Back to leave, like any other.
   useBackClose(!mobileShowingReader && selectedIds.size > 0, clearSelection, !isDesktop, BACK_LAYER.pane);
 
-  // Crossing to desktop (resize/rotate): close the drawer so a Sheet can't
-  // linger over the three-pane desktop layout.
+  // Crossing to a width with the full sidebar (resize/rotate): close the
+  // drawer so a Sheet can't linger over a layout that already shows it all.
   useEffect(() => {
-    if (isDesktop && drawerOpen) setDrawerOpen(false);
-  }, [isDesktop, drawerOpen]);
+    if (isDesktop && isWide && drawerOpen) setDrawerOpen(false);
+  }, [isDesktop, isWide, drawerOpen]);
 
   return (
     // Dynamic-viewport height (with a 100vh fallback for pre-dvh Safari): the
     // shell must shrink with the iOS keyboard (interactive-widget=
     // resizes-content) instead of letting the page scroll into a stuck offset.
-    <div className="flex h-screen supports-[height:100dvh]:h-dvh w-full overflow-hidden bg-background text-foreground">
+    <div data-print-flow className="flex h-screen supports-[height:100dvh]:h-dvh w-full overflow-hidden bg-background text-foreground">
       <Sidebar
         view={view}
         onView={handleView}
@@ -524,10 +725,13 @@ export default function App() {
         onDomainFilter={setDomainFilter}
         onOpenDomains={openDomains}
         onOpenFilters={openFilters}
+        onOpenSettings={openSettings}
+        onOpenMenu={() => setDrawerOpen(true)}
       />
 
-      {/* Mobile drawer: view nav + theme + account. Selecting a view closes
-          it (handleView sets drawerOpen=false). */}
+      {/* The drawer: view nav + theme + account, on a phone and behind the
+          rail's menu button. Selecting a view closes it (handleView sets
+          drawerOpen=false). */}
       <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
         <SheetContent
           side="left"
@@ -552,6 +756,7 @@ export default function App() {
             }}
             onOpenDomains={openDomains}
             onOpenFilters={openFilters}
+            onOpenSettings={openSettings}
             showBrand={false}
           />
         </SheetContent>
@@ -561,9 +766,14 @@ export default function App() {
           Desktop: fixed 320px column, always visible.
           Mobile: full width; hidden when the reader is showing. */}
       <section
+        // Printing shows the open conversation alone (see lib/print).
+        data-print-hide
         className={cn(
           // min-h-0 for the same reason as the reader column: without it this
           // grows to its content height and the list's ScrollArea never scrolls.
+          // The same 320px at every desktop width, a tablet included: a row's
+          // hover actions are sized for it, and any narrower they sit over
+          // the middle of the subject, where a click to open the thread lands.
           "flex min-w-0 flex-1 flex-col border-r md:w-80 md:flex-none md:shrink-0",
           mobileShowingReader && "hidden md:flex",
         )}
@@ -577,12 +787,14 @@ export default function App() {
         {!isDesktop && !mobileShowingReader && selectedIds.size > 0 && (
           <div className="bg-accent/30 pt-[env(safe-area-inset-top)] md:hidden">
             <BulkActionBar
-              count={selectedIds.size}
+              count={wholeView ? viewTotal : selectedIds.size}
+              wholeView={wholeView}
               view={actionsView}
               onClear={clearSelection}
               onAction={handleBulkAction}
               className="min-h-14 bg-transparent"
             />
+            {selectAllOffer}
           </div>
         )}
         {!isDesktop && !mobileShowingReader && selectedIds.size === 0 && (
@@ -661,12 +873,16 @@ export default function App() {
         )}
         <Separator className="hidden md:block" />
         {isDesktop && selectedIds.size > 0 && (
-          <BulkActionBar
-            count={selectedIds.size}
-            view={actionsView}
-            onClear={clearSelection}
-            onAction={handleBulkAction}
-          />
+          <>
+            <BulkActionBar
+              count={wholeView ? viewTotal : selectedIds.size}
+              wholeView={wholeView}
+              view={actionsView}
+              onClear={clearSelection}
+              onAction={handleBulkAction}
+            />
+            {selectAllOffer}
+          </>
         )}
         {/* AI-label filter bar — plain inbound views only, hidden while searching
             (search is global). */}
@@ -694,11 +910,13 @@ export default function App() {
               );
             })}
             </div>
-            {/* Right-edge fade hinting the chip row scrolls horizontally on
-                narrow screens. pointer-events-none so it never blocks a tap. */}
+            {/* Right-edge fade hinting the chip row scrolls horizontally. At
+                every width: the desktop list column is no wider than a phone,
+                and the last chips are off its edge there too.
+                pointer-events-none so it never blocks a tap. */}
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent md:hidden"
+              className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent"
             />
           </div>
         )}
@@ -727,6 +945,7 @@ export default function App() {
           Desktop: fills the remaining space, always visible.
           Mobile: full-screen; hidden unless mobileView === "reader". */}
       <div
+        data-print-flow
         className={cn(
           // min-h-0: without it this column grows to its content height and the
           // reader's internal ScrollArea never becomes the scroller.
@@ -735,7 +954,7 @@ export default function App() {
         )}
       >
         {/* Desktop top bar — command palette + compose. */}
-        <div className="hidden h-14 items-center justify-end gap-2 px-4 md:flex">
+        <div data-print-hide className="hidden h-14 items-center justify-end gap-2 px-4 md:flex">
           <Button
             type="button"
             variant="outline"
@@ -756,7 +975,7 @@ export default function App() {
             Compose
           </Button>
         </div>
-        <Separator className="hidden md:block" />
+        <Separator data-print-hide className="hidden md:block" />
         <Reader
           threadId={selectedThreadId}
           view={actionsView}
@@ -805,6 +1024,7 @@ export default function App() {
               : undefined
           }
           onOpenCompose={openComposeWith}
+          onUndoReplySend={undoReplySend}
           onAction={(action, opts) => {
             if (!selectedThreadId) return;
             const id = selectedThreadId;
@@ -831,6 +1051,7 @@ export default function App() {
         open={composeOpen}
         onOpenChange={setComposeOpen}
         initial={composeInitial}
+        onReopen={openComposeWith}
       />
       <CommandPalette
         open={paletteOpen}
@@ -841,11 +1062,58 @@ export default function App() {
         onShowShortcuts={() => setHelpOpen(true)}
         onOpenDomains={openDomains}
         onOpenFilters={openFilters}
+        onOpenSettings={openSettings}
       />
       <ShortcutHelpDialog open={helpOpen} onOpenChange={setHelpOpen} />
       <DomainsDialog open={domainsOpen} onOpenChange={setDomainsOpen} />
       <FiltersDialog open={filtersOpen} onOpenChange={setFiltersOpen} />
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <Toaster />
     </div>
+  );
+}
+
+/**
+ * Shown under the bulk bar once every loaded row is selected and the view has
+ * more: the selection is only what is loaded, and here is the way to mean
+ * all of it. After that it says so, and offers the way back.
+ */
+function SelectAllBanner({
+  loaded,
+  total,
+  wholeView,
+  onSelectAll,
+  onClear,
+}: {
+  loaded: number;
+  /** Size of the view, or 0 when it is not known. */
+  total: number;
+  wholeView: boolean;
+  onSelectAll: () => void;
+  onClear: () => void;
+}) {
+  const link =
+    "rounded px-1 font-medium text-primary underline underline-offset-2 hover:bg-accent max-md:inline-flex max-md:min-h-11 max-md:items-center";
+  return (
+    <p
+      role="status"
+      className="flex flex-wrap items-center gap-x-1 border-b bg-accent/20 px-4 py-1.5 text-xs text-muted-foreground"
+    >
+      {wholeView ? (
+        <>
+          <span>{total ? `All ${total.toLocaleString()} conversations in this view are selected.` : "Every conversation in this view is selected."}</span>
+          <button type="button" onClick={onClear} className={link}>
+            Clear selection
+          </button>
+        </>
+      ) : (
+        <>
+          <span>The {loaded.toLocaleString()} loaded so far are selected.</span>
+          <button type="button" onClick={onSelectAll} className={link}>
+            {total ? `Select all ${total.toLocaleString()} in this view` : "Select all in this view"}
+          </button>
+        </>
+      )}
+    </p>
   );
 }

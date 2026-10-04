@@ -3,6 +3,8 @@
 // Kept free of React so the real-browser check (app/test/e2e-email-frame.spec.ts)
 // can drive exactly this code.
 
+import { openMailto } from "./mailtoHandler";
+
 /**
  * Sandbox for every email-body iframe.
  *
@@ -181,7 +183,11 @@ export function interceptLinks(doc: Document, opener: LinkOpener): () => void {
       return;
     }
     const url = safeLinkUrl(href, opener.location.href);
-    if (url) opener.open(url, "_blank", "noopener,noreferrer");
+    if (!url) return;
+    // An address in a message is written to from here, not from whatever
+    // mail program the device happens to have registered.
+    if (/^mailto:/i.test(url) && openMailto(url)) return;
+    opener.open(url, "_blank", "noopener,noreferrer");
   };
   doc.addEventListener("click", onClick, true);
   doc.addEventListener("auxclick", onClick, true);
