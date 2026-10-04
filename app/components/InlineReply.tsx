@@ -1,3 +1,6 @@
+import { DraftSaveStatus, SendTiming, type SaveState } from "@/components/ComposeFeedback";
+import { keepRecovery, clearRecovery } from "@/lib/draftRecovery";
+import { sendFeedback } from "@/lib/sendFeedback";
 // Gmail-style inline reply, rendered at the bottom of the open thread.
 // Collapsed it's a single "Reply to …" affordance; expanded it's the same rich
 // body editor compose uses, seeded with the quoted history as a trimmable
@@ -20,7 +23,7 @@ import { composing } from "@/lib/keys";
 import { useIsDesktop } from "@/lib/useMediaQuery";
 import { sanitizeLocal } from "@/lib/identity";
 import { stashReply, stashedReply, clearStashedReply } from "@/lib/replyStash";
-import { canHold, holdSend } from "@/lib/outbox";
+import { canHold, holdSend, undoSendSeconds } from "@/lib/outbox";
 import type { SendPayload } from "@/lib/types";
 
 const BodyEditor = lazy(() => import("@/components/EmailBodyEditor"));
@@ -80,6 +83,12 @@ export default function InlineReply({
   const aiDraft = useDraftReply();
   const qc = useQueryClient();
   // Plain-text mirror of the editor (open-full handoff, AI-draft quote keep).
+  const [needsImmediate, setNeedsImmediate] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [domainPick, setDomainPick] = useState<string | null>(null);
+  const [localPick, setLocalPick] = useState<string | null>(null);
+  const saveRevision = useRef("");
   const [text, setText] = useState("");
   const [fromName, setFromName] = useState<string | null>(initial.fromName ?? null);
   // What the editor mounts with — replaced when an AI draft lands before the
@@ -138,7 +147,7 @@ export default function InlineReply({
    *  editor hands a seeded reply back WITHOUT its "> " markers, so raw equality
    *  reads every untouched reply as edited and autosaves a junk draft. */
   const replyDirty = (text.trim() !== "" && !sameBody(text, seededRef.current)) ||
-    (fromName !== null && fromName !== (initial.fromName ?? ""));
+    (fromName !== null && fromName !== (initial.fromName ?? "")) || domainPick !== null || localPick !== null;
   // The owner needs to know before it points this box at someone else: an
   // edited reply must not have its recipients changed under it.
   const dirtyNow = open && replyDirty;
@@ -164,6 +173,12 @@ export default function InlineReply({
     if (open && !wasOpenRef.current) {
       skipDraftRef.current = false;
       setFromName(initial.fromName ?? null);
+      setDomainPick(null);
+      setLocalPick(null);
+      setSaveState("idle");
+      setSendError(null);
+      setNeedsImmediate(false);
+      saveRevision.current = "";
       // The previous row is either deleted or now owned by the dialog; a new
       // reply gets a new id rather than writing over either.
       draftIdRef.current = null;
@@ -224,12 +239,16 @@ export default function InlineReply({
       bodyJson,
       threadId: initial.threadId,
       inReplyTo: initial.inReplyTo,
-      fromDomain: initial.fromDomain,
+      fromDomain,
       // Persist the actual sending local-part so a dialog resume doesn't
       // silently fall back to "hello" on deployments with another default.
       fromLocal,
       ...(fromName !== null ? { fromName: fromName.trim() } : {}),
     };
+    const revision = crypto.randomUUID();
+    saveRevision.current = revision;
+    setSaveState("saving");
+    const local = keepRecovery({ id, revision, updated: Date.now(), payload, attachments: [] });
     const save = savingRef.current.then(() =>
       putDraft(id, payload).then(() => {
         void qc.invalidateQueries({ queryKey: ["drafts"] });
@@ -239,8 +258,11 @@ export default function InlineReply({
     try {
       await save;
     } catch {
-      return false; // best-effort; the caller decides whether that matters
+      if (mountedRef.current && saveRevision.current === revision && !skipDraftRef.current) setSaveState(local ? "local" : "failed");
+      return false;
     }
+    clearRecovery(id, revision);
+    if (mountedRef.current && saveRevision.current === revision && !skipDraftRef.current) setSaveState("saved");
     // The server has it now, so a local fallback copy is no longer needed.
     if (initial.threadId) clearStashedReply(initial.threadId);
     return true;
@@ -251,6 +273,7 @@ export default function InlineReply({
     // Sent or discarded: either way there is nothing left to restore.
     if (initial.threadId) clearStashedReply(initial.threadId);
     const id = draftIdRef.current;
+    if (id) clearRecovery(id);
     draftIdRef.current = null;
     if (!id) return;
     void savingRef.current
@@ -267,12 +290,14 @@ export default function InlineReply({
   // Debounced autosave while typing.
   useEffect(() => {
     if (!open || !replyDirty) return;
+    saveRevision.current = crypto.randomUUID();
+    setSaveState("unsaved");
     const t = setTimeout(() => {
       void saveReplyDraft(text, docJsonRef.current);
     }, 1500);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, text, fromName]);
+  }, [open, text, fromName, domainPick, localPick]);
 
   /** Save the reply if the user wrote one and it is not already on its way out. */
   function flushReplyDraft() {
@@ -304,14 +329,14 @@ export default function InlineReply({
     if (open) cardRef.current?.scrollIntoView({ block: "nearest" });
   }, [open]);
 
-  // Same identity resolution as the dialog, minus the explicit picker: reply
+  // Same identity resolution as the dialog: reply
   // as the domain the original mail was addressed to when it can send, else
   // the server default. While identities load, trust the reply domain — the
   // server fails loudly (400) rather than re-routing the sender.
   const identities = useIdentities(open).data;
   const domains = identities?.identities.map((i) => i.domain) ?? [];
   const fromDomain =
-    [initial.fromDomain, identities?.defaultDomain].find((d) => !!d && domains.includes(d)) ??
+    [domainPick, initial.fromDomain, identities?.defaultDomain].find((d) => !!d && domains.includes(d)) ??
     initial.fromDomain ??
     identities?.defaultDomain ??
     "example.com";
@@ -323,7 +348,7 @@ export default function InlineReply({
   // sales@<default domain>, an address nobody wrote to.
   const domainSwapped = !!initial.fromDomain && fromDomain !== initial.fromDomain;
   const fromLocal =
-    (!domainSwapped && sanitizeLocal(initial.fromLocal ?? "")) || identities?.defaultLocal || "hello";
+    sanitizeLocal(localPick ?? "") || (!domainSwapped && sanitizeLocal(initial.fromLocal ?? "")) || identities?.defaultLocal || "hello";
 
   const fromNameValue = fromName ?? identities?.identities.find((i) => i.domain === fromDomain)?.displayName ?? "";
 
@@ -372,10 +397,11 @@ export default function InlineReply({
     );
   }
 
-  async function doSend() {
+  async function doSend(allowImmediate = false) {
     if (sendingRef.current || send.isPending) return;
     sendingRef.current = true;
     setSending(true);
+    setSendError(null);
     let bodyText = text;
     let bodyHtml: string | undefined;
     let docJson = "";
@@ -406,9 +432,26 @@ export default function InlineReply({
     };
     // Undo send: hold the reply instead of sending it now, once its draft is
     // on the server (the draft is what is left if the held send fails with
-    // nobody watching). If the save does not go through, send the old way.
+    // nobody watching). A failed save keeps the reply open for recovery.
     const mirror = { text: latestRef.current.text, json: docJson || docJsonRef.current };
-    if (onUndoSend && canHold(payload) && (await saveReplyDraft(mirror.text, mirror.json)) && draftIdRef.current) {
+    setNeedsImmediate(false);
+    if (onUndoSend && undoSendSeconds() > 0 && !canHold(payload) && !allowImmediate) {
+      setNeedsImmediate(true);
+      setSendError("This message is too large for Undo send. You can send it immediately, without an undo period.");
+      sendingRef.current = false;
+      setSending(false);
+      return;
+    }
+    const shouldHold = onUndoSend && canHold(payload);
+    if (shouldHold && !(await saveReplyDraft(mirror.text, mirror.json))) {
+      sendingRef.current = false;
+      if (mountedRef.current) {
+        setSending(false);
+        setSendError("Message not sent. The draft must be saved before Undo send can protect it. Retry saving, then send again.");
+      }
+      return;
+    }
+    if (shouldHold && draftIdRef.current) {
       const draftId = draftIdRef.current;
       // The same prefill the expand button hands to the dialog.
       const snapshot: ComposeInitial = {
@@ -448,10 +491,11 @@ export default function InlineReply({
       // when the component unmounts, which left a sent reply with no toast and
       // its draft row behind.
       await send.mutateAsync(payload);
-    } catch {
+    } catch (err) {
       sendingRef.current = false;
       if (mountedRef.current) {
         setSending(false);
+        setSendError(sendFeedback(err));
         toast.error("Send failed");
       } else {
         // Nothing on screen holds the text any more, so keep it as a draft
@@ -608,6 +652,20 @@ export default function InlineReply({
         />
       </label>
 
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-4 py-2 text-xs">
+        <span className="text-muted-foreground">From address</span>
+        <input aria-label="From local part" value={localPick ?? fromLocal} disabled={busy}
+          onChange={e => setLocalPick(e.target.value)} onBlur={() => { if (localPick !== null) setLocalPick(fromLocal); }}
+          className="min-w-0 flex-1 rounded border border-input bg-background px-2 py-1.5 text-base md:text-sm" />
+        <select aria-label="From domain" value={fromDomain} disabled={busy}
+          onChange={e => { setDomainPick(e.target.value); setLocalPick(null); }}
+          className="min-w-0 max-w-full rounded border border-input bg-background px-2 py-1.5 text-base md:text-sm">
+          {[...new Set([fromDomain, ...domains])].map(d => <option key={d} value={d}>@{d}</option>)}
+        </select>
+      </div>
+      {domainSwapped && !domainPick && <p role="status" className="px-4 py-2 text-sm">{initial.fromDomain} cannot send. This reply will use {fromLocal}@{fromDomain}. Review the From fields before sending.</p>}
+      <p className="px-4 py-2 text-xs text-muted-foreground">{identities?.identities.find(i => i.domain === fromDomain)?.signature ? "Signature is included below; edit it in the message." : "No signature configured for this address."}</p>
+
       {/* Body — quoted history is part of the document (trimmable blockquote). */}
       <Suspense
         fallback={
@@ -644,6 +702,10 @@ export default function InlineReply({
         />
       </Suspense>
 
+      {sendError && <p role="alert" className="px-4 py-2 text-sm text-destructive">{sendError}</p>}
+      {needsImmediate && <Button type="button" disabled={busy} onClick={() => void doSend(true)} className="mx-4">Send immediately</Button>}
+      <DraftSaveStatus state={saveState} retry={() => void saveReplyDraft(text, docJsonRef.current)} disabled={busy} />
+      <SendTiming available={!!onUndoSend} />
       {/* Footer */}
       <div className="flex items-center justify-between gap-2 border-t border-border/60 px-3 py-2">
         <Button
