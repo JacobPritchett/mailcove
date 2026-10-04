@@ -226,7 +226,7 @@ describe("attachments and drafts", () => {
     attach("report.pdf");
     await screen.findByText("report.pdf");
     expect(screen.queryByText(/not saved in drafts/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/saved with this draft/i)).toBeInTheDocument();
+    expect(screen.getByText(/included when this draft saves successfully/i)).toBeInTheDocument();
   });
 
   it("shows a loading state and blocks Send until a resumed draft's files arrive", async () => {
@@ -483,3 +483,17 @@ describe("IME composition and already-handled keys", () => {
   });
 });
 
+
+
+it("does not claim a closed draft was saved before the request succeeds", async () => {
+  let finish!: () => void;
+  vi.mocked(putDraft).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve({ ok: true }); }));
+  renderApp();
+  await openCompose();
+  fireEvent.change(screen.getByLabelText("Subject"), { target: { value: "Save carefully" } });
+  fireEvent.click(screen.getAllByRole("button", { name: /^Close$/ }).at(-1)!);
+  await waitFor(() => expect(putDraft).toHaveBeenCalled());
+  expect(toast.success).not.toHaveBeenCalledWith("Draft saved");
+  await act(async () => finish());
+  await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Draft saved"));
+});

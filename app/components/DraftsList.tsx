@@ -1,3 +1,4 @@
+import { useRecoveryDrafts, clearRecovery, type RecoveryDraft } from "@/lib/draftRecovery";
 // The Drafts view: autosaved compose sessions, newest first. Clicking a row
 // resumes it in the full compose dialog (reply drafts keep their threading
 // headers, so sending still joins the original conversation).
@@ -50,6 +51,7 @@ export function draftToComposeInitial(d: {
 export default function DraftsList({ onOpen }: DraftsListProps) {
   const { data, isPending, isError } = useDrafts(true);
   const del = useDeleteDraft();
+  const recovery = useRecoveryDrafts();
 
   function available(id: string): boolean {
     if (cancelHeldDraft(id)) return true;
@@ -68,14 +70,22 @@ export default function DraftsList({ onOpen }: DraftsListProps) {
     }
   }
 
-  if (isPending) {
+  function openRecovery(d: RecoveryDraft) {
+    if (!available(d.id)) return;
+    const p = d.payload;
+    onOpen({ draftId: d.id, to: p.to, cc: p.cc, bcc: p.bcc, subject: p.subject,
+      text: p.bodyText, bodyJson: p.bodyJson, threadId: p.threadId, inReplyTo: p.inReplyTo,
+      fromLocal: p.fromLocal, fromDomain: p.fromDomain, fromName: p.fromName,
+      signatureApplied: true, recoveryPendingAttachments: d.pendingAttachments, ...(d.attachments !== null ? { recoveryAttachments: d.attachments } : {}) });
+  }
+  if (isPending && !recovery.length) {
     return <p className="p-6 text-sm text-muted-foreground">Loading drafts…</p>;
   }
-  if (isError) {
+  if (isError && !recovery.length) {
     return <p className="p-6 text-sm text-muted-foreground">Couldn't load drafts.</p>;
   }
-  const drafts = data?.drafts ?? [];
-  if (drafts.length === 0) {
+  const drafts = (data?.drafts ?? []).filter(d => !recovery.some(r => r.id === d.id));
+  if (drafts.length === 0 && !recovery.length) {
     return (
       <div className="flex flex-col items-center gap-2 p-10 text-center text-muted-foreground">
         <FileText className="h-8 w-8 opacity-30" aria-hidden />
@@ -86,6 +96,16 @@ export default function DraftsList({ onOpen }: DraftsListProps) {
 
   return (
     <ul aria-label="Drafts" className="divide-y">
+      {recovery.map(d => <li key={d.id} className="border-b p-4">
+        <button type="button" onClick={() => openRecovery(d)} className="w-full text-left">
+          <span className="block text-sm font-medium">{d.payload.subject || "(no subject)"}</span>
+          <span className="block text-xs text-muted-foreground">Device recovery copy · {d.payload.to || "No recipients"}</span>
+          <span className="block text-xs text-muted-foreground">Open to recover changes not yet saved to the server. Device copy: {formatDate(d.updated, Date.now())}.</span>
+        </button>
+        {d.attachments === null && <p className="mt-1 text-xs text-muted-foreground">Some attachments still need to be loaded from the server.</p>}
+        <button type="button" className="mt-2 text-xs underline" onClick={() => { if (available(d.id)) clearRecovery(d.id); }}>Discard device copy</button>
+      </li>)}
+      {isError && <li className="p-4 text-sm">Couldn't load server drafts. Device copies are available above.</li>}
       {drafts.map((d) => (
         <li key={d.id} className="group relative">
           <button

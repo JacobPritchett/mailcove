@@ -806,7 +806,8 @@ function groupFolded(messages: ThreadMessage[], isOpen: (id: string) => boolean)
 function FoldedMessage({ msg, onOpen }: { msg: ThreadMessage; onOpen: () => void }) {
   const mine = msg.direction === "out";
   const fromLabel = senderLabel(msg.msg_from) || msg.msg_from;
-  const fromName = mine ? "You" : fromLabel;
+  const sentName = mine ? msg.body.headers?.fromName : undefined;
+  const fromName = mine ? (sentName ? `You · ${sentName}` : "You") : fromLabel;
   const fromAddr = msg.from_addr ?? addressOf(msg.msg_from);
   const flagged =
     msg.direction === "in" && (!!addressClaimedInName(fromLabel, fromAddr) || msg.body.headers?.auth?.dmarc === "fail");
@@ -905,7 +906,8 @@ function MessageEntry({
   const fromLabel = senderLabel(msg.msg_from) || msg.msg_from;
   // Our own messages read as "You"; the address beside it still says which
   // identity sent it.
-  const fromName = mine ? "You" : fromLabel;
+  const sentName = mine ? msg.body.headers?.fromName : undefined;
+  const fromName = mine ? (sentName ? `You · ${sentName}` : "You") : fromLabel;
   // The AUTHENTICATED mailbox where we have one; msg_from is the sender's own
   // unescaped text and a display name can contain anything, including a second
   // address. See showAddr below.
@@ -1011,7 +1013,7 @@ function MessageEntry({
           {(showDetail || printing) && (
             <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
               <dt className="font-medium">From</dt>
-              <dd className="[overflow-wrap:anywhere]">{msg.msg_from}</dd>
+              <dd className="[overflow-wrap:anywhere]">{sentName ? `${sentName} <${addressOf(msg.msg_from)}>` : msg.msg_from}</dd>
               <dt className="font-medium">To</dt>
               <dd className="[overflow-wrap:anywhere]">{msg.msg_to}</dd>
               {cc && (

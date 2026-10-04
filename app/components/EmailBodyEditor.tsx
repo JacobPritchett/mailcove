@@ -86,6 +86,7 @@ const EmailBodyEditor = forwardRef<ComposeBodyHandle, EmailBodyEditorProps>(
       apiRef.current = r;
       const ed = r.editor;
       if (!ed) return;
+      ed.view.dom.setAttribute("aria-label", "Message");
       if (readOnlyRef.current) ed.setEditable(false);
       if (autoFocusRef.current) ed.commands.focus(autoFocusRef.current);
       const sel = () => cbs.current.onCaretAtEndChange?.(caretAtEnd(ed));

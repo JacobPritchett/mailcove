@@ -205,15 +205,14 @@ describe("undo send: the compose dialog", () => {
     expect(saved).toContain("Two");
   });
 
-  it("sends at once when the draft cannot be saved, and a failure keeps the dialog open", async () => {
+  it("keeps the message open when saving fails instead of silently bypassing Undo send", async () => {
     vi.mocked(putDraft).mockRejectedValue(new Error("offline"));
-    vi.mocked(send).mockRejectedValue(new Error("offline"));
     renderApp();
     await compose({ to: "bob@example.com", subject: "Greetings", body: "hi there" });
     fireEvent.click(sendButton());
-    await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    await screen.findByText(/draft must be saved before Undo send/);
+    expect(send).not.toHaveBeenCalled();
     expect(heldToasts()).toBe(0);
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Send failed"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByLabelText("Subject")).toHaveValue("Greetings");
   });

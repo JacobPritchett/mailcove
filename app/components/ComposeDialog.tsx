@@ -1,3 +1,6 @@
+import { DraftSaveStatus, SendTiming, type SaveState } from "@/components/ComposeFeedback";
+import { keepRecovery, clearRecovery } from "@/lib/draftRecovery";
+import { sendFeedback } from "@/lib/sendFeedback";
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Send, X, AlertCircle, Loader2, Sparkles, Trash2, Paperclip } from "lucide-react";
@@ -42,7 +45,7 @@ import { useIsDesktop } from "@/lib/useMediaQuery";
 import { sanitizeLocal } from "@/lib/identity";
 import type { ForwardPart } from "@/lib/conversation";
 import { composing, keyIsSpokenFor } from "@/lib/keys";
-import { canHold, holdSend } from "@/lib/outbox";
+import { canHold, holdSend, undoSendSeconds } from "@/lib/outbox";
 
 /** Default local-part for the From field. */
 const FROM_DEFAULT_LOCAL = "hello";
@@ -103,6 +106,8 @@ export interface ComposeInitial {
   bodyJson?: string;
   fromLocal?: string;
   fromName?: string;
+  recoveryAttachments?: StagedAttachment[];
+  recoveryPendingAttachments?: StagedAttachment[];
 }
 
 export interface ComposeDialogProps {
@@ -156,6 +161,7 @@ interface Session {
   forwardLoad: Promise<StagedAttachment[]> | null;
   /** The user added or removed a file themselves. */
   filesTouched: boolean;
+  saveRevision?: string;
 }
 
 function newSession(draftId: string | null): Session {
@@ -181,6 +187,8 @@ export default function ComposeDialog({
   // The slash-menu tip in the body placeholder is for a keyboard; on a phone
   // it only crowds the line.
   const wideEnoughForTip = useIsDesktop();
+  const [needsImmediate, setNeedsImmediate] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [fromLocal, setFromLocal] = useState(FROM_DEFAULT_LOCAL);
   // null = no explicit pick yet → defaults to the reply context's domain, then
   // the server default. Stored separately so an explicit pick survives re-renders.
@@ -491,6 +499,8 @@ export default function ComposeDialog({
   useEffect(() => {
     if (!open) return;
     setFromLocal(initial?.fromLocal ? sanitizeLocal(initial.fromLocal) || FROM_DEFAULT_LOCAL : FROM_DEFAULT_LOCAL);
+    setSaveState("idle");
+    setNeedsImmediate(false);
     setFromDomainPick(null);
     setFromName(initial?.fromName ? initial.fromName : null);
     const seeded = commitRecipients([], initial?.to ?? "");
@@ -518,7 +528,7 @@ export default function ComposeDialog({
     // next compose opens, and would be sent to a recipient the user never chose
     // it for. Clearing only after a successful send would miss the far more
     // common close-without-sending path.
-    setAttachments([]);
+    setAttachments(initial?.recoveryPendingAttachments ?? []);
     setAttachError(null);
     setFwdNotes([]);
     setFwdFailed([]);
@@ -529,7 +539,11 @@ export default function ComposeDialog({
     // just listed. The draft still opens if this fails, but Send and the
     // attachment sync wait on it (see attLoad).
     const resumeId = initial?.draftId;
-    if (resumeId) loadDraftAttachments(resumeId, session);
+    if (initial?.recoveryAttachments) {
+      setAttachments(initial.recoveryAttachments);
+      session.forceAttSync = true;
+      setAttLoad("idle");
+    } else if (resumeId) loadDraftAttachments(resumeId, session);
     // A forward brings the original's files. Only on a fresh forward: once it
     // has been saved as a draft, the draft holds them.
     else if (initial?.forward) loadForwardAttachments(initial.forward, session);
@@ -652,7 +666,7 @@ export default function ComposeDialog({
   }
 
   /**
-   * Best-effort draft upsert (autosave path — failures stay silent). Resolves
+   * Draft upsert with a local recovery copy and visible save state. Resolves
    * to whether this save reached the server, for the one caller that cannot
    * go on without it (holding a sent message, see submitTo).
    */
@@ -699,6 +713,12 @@ export default function ComposeDialog({
     const attChanged = !lateFiles && readable && (s.forceAttSync || attSig !== s.syncedAtt);
     const attSnapshot = attachments.map((a) => ({ name: a.name, type: a.type, data: a.data }));
 
+    const revision = crypto.randomUUID();
+    s.saveRevision = revision;
+    setSaveState("saving");
+    const local = keepRecovery({ id, revision, updated: Date.now(), payload,
+      attachments: readable && !lateFiles ? [...attachments] : null,
+      ...(!readable || lateFiles ? { pendingAttachments: [...attachments] } : {}) });
     const save = s.saving.then(() =>
       putDraft(id, payload)
         .then(async () => {
@@ -725,9 +745,15 @@ export default function ComposeDialog({
     s.saving = save.catch(() => {});
     try {
       await save;
+      if (!readable && !lateFiles) {
+        if (sessionRef.current === s && s.saveRevision === revision && !s.skip) setSaveState("partial");
+        return false;
+      }
+      clearRecovery(id, revision);
+      if (sessionRef.current === s && s.saveRevision === revision && !s.skip) setSaveState("saved");
       return true;
     } catch {
-      // autosave is best-effort; the next tick retries
+      if (sessionRef.current === s && s.saveRevision === revision && !s.skip) setSaveState(local ? "local" : "failed");
       return false;
     }
   }
@@ -736,6 +762,7 @@ export default function ComposeDialog({
   function dropDraft(s: Session = sessionRef.current) {
     s.skip = true;
     const id = s.draftId;
+    if (id) clearRecovery(id);
     s.draftId = null;
     if (!id) return;
     // Join the autosave chain so the DELETE is ordered after EVERY queued PUT.
@@ -753,6 +780,8 @@ export default function ComposeDialog({
   // Debounced autosave while composing.
   useEffect(() => {
     if (!open || !draftHasContent()) return;
+    sessionRef.current.saveRevision = crypto.randomUUID();
+    setSaveState("unsaved");
     const t = setTimeout(() => void saveDraftNow(), 1500);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -776,8 +805,11 @@ export default function ComposeDialog({
       // saved draft isn't a surprise. Not shown on send/discard (they toast
       // their own outcome) or when there's nothing worth saving.
       const keptDraft = draftHasContent() && !sessionRef.current.skip;
-      void saveDraftNow({ waitForForward: true });
-      if (keptDraft) toast.success("Draft saved");
+      void saveDraftNow({ waitForForward: true }).then(saved => {
+        if (!keptDraft) return;
+        if (saved) toast.success("Draft saved");
+        else toast.error("Couldn't save the draft to the server. Check Drafts on this device for a recovery copy.");
+      });
     }
     wasOpenRef.current = open;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -843,7 +875,7 @@ export default function ComposeDialog({
     toInputRef.current?.focus();
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent, allowImmediate = false) {
     e.preventDefault();
     const s = sessionRef.current;
     if (s.sending || send.isPending) return;
@@ -867,7 +899,7 @@ export default function ComposeDialog({
     const copies = { cc: ccResult?.recipients ?? cc, bcc: bccResult?.recipients ?? bcc };
     s.sending = true;
     setSending(true);
-    void submitTo(s, r.recipients, copies).finally(() => {
+    void submitTo(s, r.recipients, copies, allowImmediate).finally(() => {
       s.sending = false;
       // Only this session's own Send button: by now another message may be
       // open, and possibly sending.
@@ -875,7 +907,7 @@ export default function ComposeDialog({
     });
   }
 
-  async function submitTo(s: Session, recipients: string[], copies: { cc: string[]; bcc: string[] }) {
+  async function submitTo(s: Session, recipients: string[], copies: { cc: string[]; bcc: string[] }, allowImmediate = false) {
     const cleanedLocal = sanitizeLocal(fromLocal) || FROM_DEFAULT_LOCAL;
     // Only an explicit edit ships as an override. Untouched (or cleared) →
     // omit, so the Worker resolves the identity's CURRENT profile name rather
@@ -929,10 +961,22 @@ export default function ComposeDialog({
     };
     // Undo send: hold the message instead of sending it now. Only once its
     // draft is on the server, because the draft is what is left if the held
-    // send fails with nobody watching. When the save does not go through
-    // (offline) the message is sent the old way, where a failure keeps this
-    // dialog open with everything in it.
-    if (sessionRef.current === s && onReopen && canHold(payload) && (await saveDraftNow()) && s.draftId) {
+    // send fails with nobody watching. A failed save keeps the dialog open;
+    // it must not silently bypass the promised undo period.
+    setNeedsImmediate(false);
+    if (onReopen && undoSendSeconds() > 0 && !payload.attachments?.length && !canHold(payload) && !allowImmediate) {
+      if (sessionRef.current === s) {
+        setNeedsImmediate(true);
+        setSendError("This message is too large for Undo send. You can send it immediately, without an undo period.");
+      }
+      return;
+    }
+    const shouldHold = sessionRef.current === s && onReopen && canHold(payload);
+    if (shouldHold && !(await saveDraftNow())) {
+      if (sessionRef.current === s) setSendError("Message not sent. The draft must be saved before Undo send can protect it. Retry saving, then send again.");
+      return;
+    }
+    if (shouldHold && s.draftId) {
       const draftId = s.draftId;
       // Everything Undo needs to put this dialog back as it is now.
       const snapshot: ComposeInitial = {
@@ -976,7 +1020,7 @@ export default function ComposeDialog({
     } catch (err) {
       // The draft is kept. The reason renders in the dialog, if it is still
       // this message's dialog.
-      if (sessionRef.current === s) setSendError(err instanceof Error ? err.message : "Send failed");
+      if (sessionRef.current === s) setSendError(sendFeedback(err));
       toast.error("Send failed");
       return;
     }
@@ -1287,20 +1331,22 @@ export default function ComposeDialog({
             >
               From
             </label>
-            <div className="flex min-w-0 flex-1 items-baseline gap-2">
+            <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-2 md:flex-nowrap">
               {/* Display name — prefilled from the identity's sending profile;
                   editable per message. Empty falls back server-side. */}
               <input
                 id="compose-from-name"
+                disabled={blocked}
                 value={fromNameValue}
                 onChange={(e) => setFromName(e.target.value)}
                 placeholder="Name"
                 aria-label="From name"
                 size={Math.min(Math.max(fromNameValue.length, 4), 20)}
-                className={cn(FIELD, "w-auto min-w-0 shrink")}
+                className={cn(FIELD, "w-auto min-w-0 shrink max-md:basis-full")}
               />
               <input
                 id="compose-from"
+                disabled={blocked}
                 value={fromLocal}
                 onChange={(e) => setFromLocal(e.target.value)}
                 onBlur={() =>
@@ -1316,6 +1362,7 @@ export default function ComposeDialog({
               {domainOptions.length > 1 ? (
                 <select
                   value={fromDomain}
+                  disabled={blocked}
                   onChange={(e) => setFromDomainPick(e.target.value)}
                   aria-label="From domain"
                   // Borderless like the rest of the row; shrink (not shrink-0) so a
@@ -1335,6 +1382,11 @@ export default function ComposeDialog({
               )}
             </div>
           </div>
+
+          {initial?.fromDomain && fromDomain !== initial.fromDomain && !fromDomainPick && (
+            <p role="status" className="px-5 py-2 text-sm text-foreground">{initial.fromDomain} cannot send. This message will use {fromLocal}@{fromDomain}. Review the From fields before sending.</p>
+          )}
+          <p className="px-5 py-2 text-xs text-muted-foreground">{signatureFor(fromDomain) ? "Signature is included in the message below and can be edited there." : "No signature configured for this address."}</p>
 
           {/* Subject */}
           <div className="flex items-center gap-3 border-b border-border/60 px-5 py-3">
@@ -1548,7 +1600,7 @@ export default function ComposeDialog({
               )}
               {attachments.length > 0 && (
                 <p className="text-xs text-muted-foreground/70">
-                  Files are saved with this draft and sent with the message.
+                  Files are included when this draft saves successfully and when you send.
                 </p>
               )}
               {attachError && (
@@ -1560,6 +1612,9 @@ export default function ComposeDialog({
             </div>
           )}
 
+          {needsImmediate && <Button type="button" disabled={blocked} onClick={e => handleSubmit(e, true)} className="mx-4">Send immediately</Button>}
+          <DraftSaveStatus state={saveState} retry={() => void saveDraftNow()} disabled={blocked} />
+          <SendTiming attachments={attachments.length > 0} available={!!onReopen} />
           {/* Footer */}
           <div className="mt-auto flex items-center justify-between gap-3 border-t border-border/60 px-5 py-3 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
             <span className="flex items-center gap-3">

@@ -53,7 +53,7 @@ export default function SettingsDialog({ open, onOpenChange }: SettingsDialogPro
             </h3>
             <p className="mt-1 text-sm text-muted-foreground">
               How long a message waits after you press Send, so you can take it back. Messages with
-              attachments are sent at once.
+              attachments are sent at once. Switching tabs or leaving the page can send a waiting message early. Oversized messages ask before sending immediately.
             </p>
             <div role="radiogroup" aria-labelledby="settings-undo-send" className="mt-3 flex flex-wrap gap-1.5">
               {UNDO_SEND_CHOICES.map((choice) => {
