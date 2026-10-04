@@ -112,7 +112,7 @@ describe("the desktop toolbar", () => {
 
   it("More holds reply all, forward, star, junk, summarize and the reading mode", async () => {
     const menu = await (async () => { renderReader(); return openMore(); })();
-    expect(names(menu)).toEqual(["Reply all", "Forward", "Star", "Report junk", "Summarize", "Rich", "Chat"]);
+    expect(names(menu)).toEqual(["Reply all", "Forward", "Star", "Report junk", "Summarize", "Print", "Rich", "Chat"]);
   });
 
   it("Reply all and Forward under More do what the buttons did", async () => {
@@ -172,7 +172,7 @@ describe("the phone top bar", () => {
     renderReader({ mobileChrome: chrome });
     await screen.findByRole("heading", { level: 1 });
     expect(within(screen.getByRole("toolbar")).queryByRole("button", { name: "Reply" })).toBeNull();
-    expect(names(await openMore())).toEqual(["Star", "Report junk", "Summarize", "Rich", "Chat"]);
+    expect(names(await openMore())).toEqual(["Star", "Report junk", "Summarize", "Print", "Rich", "Chat"]);
     expect(screen.getByRole("button", { name: "Reply all", hidden: true })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Forward", hidden: true })).toBeInTheDocument();
   });

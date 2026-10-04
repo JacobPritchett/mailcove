@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleFetch, type Env } from "../index";
 
+describe.each(["legacy", "browser"])("%s domain API", (kind) => {
+const apiPath = (path: string) => kind === "browser" ? path.replace(/^\/api\/domains\//, "/api/domain-routing/") : path;
+
 const ctx = {} as ExecutionContext;
 
 function cf(body: unknown, status = 200): Response {
@@ -33,7 +36,7 @@ function makeEnv(opts: { token?: string; cfToken?: string | undefined } = {}): E
 }
 
 function get(path: string, token = "secret-token") {
-  return new Request(`https://inbox.example.com${path}`, {
+  return new Request(`https://inbox.example.com${apiPath(path)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -86,7 +89,7 @@ describe("GET /api/domains/:zoneId", () => {
 });
 
 function send(path: string, method: string, body: unknown, token = "secret-token") {
-  return new Request(`https://inbox.example.com${path}`, {
+  return new Request(`https://inbox.example.com${apiPath(path)}`, {
     method,
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -128,4 +131,6 @@ describe("PUT /api/domains/:zoneId/catch-all", () => {
     const res = await handleFetch(send("/api/domains/z1/catch-all", "PUT", { action: "drop" }, "nope"), makeEnv(), ctx);
     expect(res.status).toBe(401);
   });
+});
+
 });

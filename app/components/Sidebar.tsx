@@ -1,10 +1,11 @@
-import { Inbox, Star, Send, Mails, Trash2, Globe, Download, Bell, BellRing, Filter, AtSign, FileText, OctagonAlert, AlarmClock } from "lucide-react";
+import { Inbox, Star, Send, Mails, Trash2, Globe, Download, Bell, BellRing, Filter, AtSign, FileText, OctagonAlert, AlarmClock, Settings, Menu } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 import { useMe } from "@/lib/queries";
 import { useInstallPrompt } from "@/lib/useInstallPrompt";
 import { useNotifications } from "@/lib/useNotifications";
+import { useIsDesktop, useIsWide } from "@/lib/useMediaQuery";
 import ThemeToggle from "@/components/ThemeToggle";
 import type { NavView, ViewCounts } from "@/lib/types";
 
@@ -39,6 +40,10 @@ export interface SidebarProps {
   onOpenDomains?: () => void;
   /** Open the inbox rules manager. */
   onOpenFilters?: () => void;
+  /** Open the per-browser settings (undo send, email links). */
+  onOpenSettings?: () => void;
+  /** Open the full menu as a drawer (the rail's first button). */
+  onOpenMenu?: () => void;
 }
 
 /**
@@ -72,6 +77,7 @@ export function SidebarContent({
   onDomainFilter,
   onOpenDomains,
   onOpenFilters,
+  onOpenSettings,
   showBrand = true,
 }: SidebarProps & { showBrand?: boolean }) {
   const me = useMe();
@@ -91,7 +97,11 @@ export function SidebarContent({
           <Separator />
         </>
       )}
-      <nav className="flex flex-1 flex-col gap-1 p-2">
+      {/* min-h-0 + its own scroll: on a short screen (a phone's drawer, with
+          several inboxes listed) the views scroll and the buttons under them
+          stay on screen. Without it they were pushed off the bottom, out of
+          reach. */}
+      <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2">
         {NAV.map(({ id, label, icon: Icon }) => {
           const badge = navBadge(id, counts);
           return (
@@ -101,7 +111,7 @@ export function SidebarContent({
               onClick={() => onView(id)}
               aria-current={view === id ? "page" : undefined}
               className={cn(
-                "flex min-h-11 items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors md:min-h-0",
+                "flex min-h-11 shrink-0 items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors md:min-h-0",
                 view === id
                   ? "bg-accent text-accent-foreground"
                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -135,7 +145,7 @@ export function SidebarContent({
               onClick={() => onDomainFilter(null)}
               aria-current={domainFilter == null ? "true" : undefined}
               className={cn(
-                "flex min-h-11 items-center gap-3 rounded-md px-3 py-1.5 text-sm transition-colors md:min-h-0",
+                "flex min-h-11 shrink-0 items-center gap-3 rounded-md px-3 py-1.5 text-sm transition-colors md:min-h-0",
                 domainFilter == null
                   ? "bg-accent font-medium text-accent-foreground"
                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -151,7 +161,7 @@ export function SidebarContent({
                 onClick={() => onDomainFilter(d.domain)}
                 aria-current={domainFilter === d.domain ? "true" : undefined}
                 className={cn(
-                  "flex min-h-11 items-center gap-3 rounded-md px-3 py-1.5 text-sm transition-colors md:min-h-0",
+                  "flex min-h-11 shrink-0 items-center gap-3 rounded-md px-3 py-1.5 text-sm transition-colors md:min-h-0",
                   domainFilter === d.domain
                     ? "bg-accent font-medium text-accent-foreground"
                     : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -217,6 +227,16 @@ export function SidebarContent({
             <span className="flex-1 text-left">Domains</span>
           </button>
         )}
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="flex min-h-11 items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground md:min-h-0"
+          >
+            <Settings className="h-4 w-4" />
+            <span className="flex-1 text-left">Settings</span>
+          </button>
+        )}
         <ThemeToggle />
         {email && (
           <div
@@ -231,11 +251,89 @@ export function SidebarContent({
   );
 }
 
-/** Desktop sidebar aside (md+). Hidden below `md` — the drawer replaces it. */
-export default function Sidebar(props: SidebarProps) {
+/** One icon button of the rail: 44px, named and titled by what it opens. */
+const RAIL_BUTTON =
+  "relative flex size-11 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
+
+/**
+ * The sidebar as a column of icons, for widths where the full one would
+ * squeeze the message out (see useIsWide). Views and the dialogs only; the
+ * first button opens the drawer, which has everything the full sidebar has
+ * (the per-domain inboxes, notifications, the signed-in address).
+ */
+function SidebarRail({ view, onView, counts, domainFilter, onOpenDomains, onOpenFilters, onOpenSettings, onOpenMenu }: SidebarProps) {
+  const idle = "text-muted-foreground hover:bg-accent/50 hover:text-foreground";
   return (
-    <aside className="hidden w-56 shrink-0 flex-col border-r bg-muted/30 md:flex">
-      <SidebarContent {...props} />
+    <div className="flex h-full flex-col items-center">
+      <div className="flex h-14 items-center">
+        <button
+          type="button"
+          onClick={onOpenMenu}
+          aria-label="Open menu"
+          title={domainFilter ? `Menu (showing ${domainFilter})` : "Menu"}
+          className={cn(RAIL_BUTTON, idle)}
+        >
+          <Menu className="h-5 w-5" />
+          {/* A domain filter is on and its switcher is not on screen: say so. */}
+          {domainFilter && <span aria-hidden className="absolute top-2 right-2 size-2 rounded-full bg-primary" />}
+        </button>
+      </div>
+      <Separator />
+      <nav aria-label="Folders" className="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto py-2">
+        {NAV.map(({ id, label, icon: Icon }) => {
+          const badge = BADGED.has(id) ? navBadge(id, counts) : 0;
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => onView(id)}
+              aria-current={view === id ? "page" : undefined}
+              aria-label={badge > 0 ? `${label}, ${badge} unread` : label}
+              title={label}
+              className={cn(RAIL_BUTTON, "shrink-0", view === id ? "bg-accent text-accent-foreground" : idle)}
+            >
+              <Icon className="h-4 w-4" />
+              {badge > 0 && (
+                <Badge aria-hidden className="absolute -top-0.5 -right-0.5 h-4 min-w-4 px-1 text-[0.625rem] tabular-nums">
+                  {badge > 99 ? "99+" : badge}
+                </Badge>
+              )}
+            </button>
+          );
+        })}
+      </nav>
+      <Separator />
+      <div className="flex flex-col items-center gap-1 py-2">
+        {onOpenFilters && (
+          <button type="button" onClick={onOpenFilters} aria-label="Rules" title="Rules" className={cn(RAIL_BUTTON, idle)}>
+            <Filter className="h-4 w-4" />
+          </button>
+        )}
+        {onOpenDomains && (
+          <button type="button" onClick={onOpenDomains} aria-label="Domains" title="Domains" className={cn(RAIL_BUTTON, idle)}>
+            <Globe className="h-4 w-4" />
+          </button>
+        )}
+        {onOpenSettings && (
+          <button type="button" onClick={onOpenSettings} aria-label="Settings" title="Settings" className={cn(RAIL_BUTTON, idle)}>
+            <Settings className="h-4 w-4" />
+          </button>
+        )}
+        <ThemeToggle compact />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Desktop sidebar aside (md+). Hidden below `md`, where the drawer replaces
+ * it. From `md` up to useIsWide it is the icon rail.
+ */
+export default function Sidebar(props: SidebarProps) {
+  const rail = useIsDesktop() && !useIsWide();
+  return (
+    <aside data-print-hide className={cn("hidden shrink-0 flex-col border-r bg-muted/30 md:flex", rail ? "w-14" : "w-56")}>
+      {rail ? <SidebarRail {...props} /> : <SidebarContent {...props} />}
     </aside>
   );
 }

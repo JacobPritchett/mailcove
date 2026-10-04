@@ -20,6 +20,8 @@ import { composing } from "@/lib/keys";
 import { useIsDesktop } from "@/lib/useMediaQuery";
 import { sanitizeLocal } from "@/lib/identity";
 import { stashReply, stashedReply, clearStashedReply } from "@/lib/replyStash";
+import { canHold, holdSend } from "@/lib/outbox";
+import type { SendPayload } from "@/lib/types";
 
 const BodyEditor = lazy(() => import("@/components/EmailBodyEditor"));
 
@@ -47,6 +49,12 @@ export interface InlineReplyProps {
   onStart?: () => void;
   /** Told whenever "the user has written something here" changes. */
   onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * Put a reply back after Undo send. Handed the same prefill "Open in full
+   * composer" builds (body, quote, recipients, its draft). Without this
+   * nothing is held and Send goes out at once.
+   */
+  onUndoSend?: (initial: ComposeInitial) => void;
   ref?: React.Ref<InlineReplyHandle>;
 }
 
@@ -63,6 +71,7 @@ export default function InlineReply({
   collapsedActions,
   onStart,
   onDirtyChange,
+  onUndoSend,
   ref,
 }: InlineReplyProps) {
   // The slash-menu tip is for a keyboard; on a phone it only crowds the line.
@@ -176,6 +185,9 @@ export default function InlineReply({
         userEditedRef.current = true;
         hasSeededRef.current = true;
         docJsonRef.current = kept.json;
+        // A reply put back by Undo send still has its draft: keep writing to
+        // that row rather than leave it behind and start a second one.
+        draftIdRef.current = kept.draftId ?? null;
         latestRef.current.text = kept.text;
         setText(kept.text);
         setBodySeed(kept.text);
@@ -373,21 +385,60 @@ export default function InlineReply({
     // Ship HTML for any visible body, incl. rich-only content (image/divider)
     // whose plaintext serialization is empty.
     const hasVisibleBody = bodyText.trim() !== "" || docHasVisibleContent(docJson);
+    const payload: SendPayload = {
+      from: `${fromLocal}@${fromDomain}`,
+      fromLocal,
+      to: initial.to ?? "",
+      ...(ccList.length ? { cc: ccList } : {}),
+      subject: initial.subject ?? "",
+      text: bodyText,
+      ...(bodyHtml && hasVisibleBody ? { html: bodyHtml } : {}),
+      inReplyTo: initial.inReplyTo,
+      threadId: initial.threadId,
+    };
+    // Undo send: hold the reply instead of sending it now, once its draft is
+    // on the server (the draft is what is left if the held send fails with
+    // nobody watching). If the save does not go through, send the old way.
+    const mirror = { text: latestRef.current.text, json: docJson || docJsonRef.current };
+    if (onUndoSend && canHold(payload) && (await saveReplyDraft(mirror.text, mirror.json)) && draftIdRef.current) {
+      const draftId = draftIdRef.current;
+      // The same prefill the expand button hands to the dialog.
+      const snapshot: ComposeInitial = {
+        ...initial,
+        text: mirror.text || initial.text,
+        replyQuote: initial.replyQuote,
+        signatureApplied: hasSeededRef.current,
+        bodyJson: mirror.json || undefined,
+        draftId,
+        fromLocal,
+        fromDomain,
+      };
+      // The held send owns the draft row now (the Worker deletes it when it
+      // accepts the message); nothing here may write or delete it again.
+      skipDraftRef.current = true;
+      sendingRef.current = false;
+      holdSend({
+        payload,
+        draftId,
+        restore: () => onUndoSend(snapshot),
+        onSettled: () => {
+          void qc.invalidateQueries({ queryKey: ["threads"] });
+          void qc.invalidateQueries({ queryKey: ["thread"] });
+          void qc.invalidateQueries({ queryKey: ["drafts"] });
+          void qc.invalidateQueries({ queryKey: ["counts"] });
+        },
+      });
+      if (mountedRef.current) {
+        setSending(false);
+        onOpenChange(false);
+      }
+      return;
+    }
     try {
       // mutateAsync, not mutate with per-call callbacks: those are dropped
       // when the component unmounts, which left a sent reply with no toast and
       // its draft row behind.
-      await send.mutateAsync({
-        from: `${fromLocal}@${fromDomain}`,
-        fromLocal,
-        to: initial.to ?? "",
-        ...(ccList.length ? { cc: ccList } : {}),
-        subject: initial.subject ?? "",
-        text: bodyText,
-        ...(bodyHtml && hasVisibleBody ? { html: bodyHtml } : {}),
-        inReplyTo: initial.inReplyTo,
-        threadId: initial.threadId,
-      });
+      await send.mutateAsync(payload);
     } catch {
       sendingRef.current = false;
       if (mountedRef.current) {

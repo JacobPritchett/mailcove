@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Inbox, Keyboard, PenSquare, Search, Send, Star, Mails, Trash2, Globe, Filter, OctagonAlert, AlarmClock } from "lucide-react";
+import { Inbox, Keyboard, PenSquare, Search, Send, Star, Mails, Trash2, Globe, Filter, OctagonAlert, AlarmClock, Settings } from "lucide-react";
 import {
   CommandDialog,
   CommandEmpty,
@@ -27,6 +27,8 @@ export interface CommandPaletteProps {
   onOpenDomains?: () => void;
   /** Open the inbox rules manager. */
   onOpenFilters?: () => void;
+  /** Open the per-browser settings. */
+  onOpenSettings?: () => void;
 }
 
 /**
@@ -42,6 +44,7 @@ export default function CommandPalette({
   onShowShortcuts,
   onOpenDomains,
   onOpenFilters,
+  onOpenSettings,
 }: CommandPaletteProps) {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -86,6 +89,12 @@ export default function CommandPalette({
             <CommandItem onSelect={() => run(onOpenDomains)}>
               <Globe />
               <span>Domains (Email Routing)</span>
+            </CommandItem>
+          )}
+          {onOpenSettings && (
+            <CommandItem onSelect={() => run(onOpenSettings)}>
+              <Settings />
+              <span>Settings (undo send, email links)</span>
             </CommandItem>
           )}
           {onShowShortcuts && (

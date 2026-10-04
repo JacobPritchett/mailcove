@@ -36,3 +36,12 @@ export function useMediaQuery(query: string): boolean {
 export function useIsDesktop(): boolean {
   return useMediaQuery("(min-width: 768px)");
 }
+
+/**
+ * Room for the full sidebar beside the list and a readable message. Below
+ * this (a tablet, a narrow desktop window) the sidebar is an icon rail: with
+ * all three panes at full width the reader was left as little as 224px.
+ */
+export function useIsWide(): boolean {
+  return useMediaQuery("(min-width: 1100px)");
+}

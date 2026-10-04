@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AlarmClock, AlarmClockOff, Archive, ArrowDown, Inbox, LoaderCircle, MailCheck, MailOpen, MoreHorizontal, OctagonAlert, PenSquare, RotateCcw, ShieldCheck, Star, Trash2, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -102,7 +102,18 @@ export default function MessageList({
   // (the checkboxes then show and a tap toggles), and rows can be swiped.
   const touch = useMediaQuery("(pointer: coarse)");
   const selecting = (selectedIds?.size ?? 0) > 0;
-  const runAction = onAction ?? own.run;
+  // What the rows are handed must not change from one render to the next, or
+  // memoizing them is for nothing: App makes these handlers anew every time
+  // it renders. The rows get one function each, for good, that calls
+  // whichever handler is current.
+  const latest = useRef({ onSelect, runAction: onAction ?? own.run, onToggleSelect, onSelectRange });
+  latest.current = { onSelect, runAction: onAction ?? own.run, onToggleSelect, onSelectRange };
+  const selectRow = useCallback((threadId: string) => latest.current.onSelect(threadId), []);
+  const runAction = useCallback(
+    (threadIds: string[], action: MailAction, opts?: ActionOptions) =>
+      opts ? latest.current.runAction(threadIds, action, opts) : latest.current.runAction(threadIds, action),
+    [],
+  );
   const searching = !!q;
   const viewLabel = VIEW_LABELS[view];
 
@@ -111,14 +122,15 @@ export default function MessageList({
 
   // Unified toggle handler passed to each Row. On shift-click, delegates to
   // onSelectRange using the stored anchor; on plain click, records a new anchor.
-  const handleRowToggle: RowToggleHandler = (id, shiftKey) => {
-    if (shiftKey && lastAnchorRef.current && onSelectRange) {
-      onSelectRange(lastAnchorRef.current, id);
+  const handleRowToggle = useCallback<RowToggleHandler>((id, shiftKey) => {
+    const { onSelectRange: range, onToggleSelect: toggle } = latest.current;
+    if (shiftKey && lastAnchorRef.current && range) {
+      range(lastAnchorRef.current, id);
     } else {
       lastAnchorRef.current = id;
-      onToggleSelect?.(id);
+      toggle?.(id);
     }
-  };
+  }, []);
 
   // ---- Paging: load the next page as the end of the list comes near ----
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -161,6 +173,43 @@ export default function MessageList({
     if (first) anchorRef.current = { id: first.dataset.threadId ?? "", top: first.getBoundingClientRect().top - top };
   }, []);
   const threads = data?.threads;
+
+  // ---- Coming back to a view puts the list where it was left ----
+  // Per view (and search, label, domain): the offset is remembered as the
+  // list scrolls and put back once that view's rows are on screen again.
+  // Declared before the anchoring effect below so that, on a change of view,
+  // this runs first and clears the anchor (a row of the view just left).
+  const viewKey = `${view}\n${q ?? ""}\n${category ?? ""}\n${domain ?? ""}`;
+  const viewKeyRef = useRef(viewKey);
+  viewKeyRef.current = viewKey;
+  /** The view whose offset has been put back: only then is scrolling recorded for it. */
+  const restoredRef = useRef<string | null>(null);
+  const hasRows = !!threads?.length;
+  useLayoutEffect(() => {
+    const el = viewportRef.current;
+    if (!el || !hasRows || restoredRef.current === viewKey) return;
+    restoredRef.current = viewKey;
+    anchorRef.current = null;
+    el.scrollTop = scrollMemory.get(viewKey) ?? 0;
+  }, [viewKey, hasRows]);
+  // A phone hides the list (display: none) while the reader is up, and a
+  // hidden scroller forgets where it was. Put it back as it reappears.
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let hidden = el.clientHeight === 0;
+    const ro = new ResizeObserver(() => {
+      const nowHidden = el.clientHeight === 0;
+      if (hidden && !nowHidden) {
+        const want = scrollMemory.get(viewKeyRef.current) ?? 0;
+        if (el.scrollTop !== want) el.scrollTop = want;
+      }
+      hidden = nowHidden;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   useLayoutEffect(() => {
     const el = viewportRef.current;
     const anchor = anchorRef.current;
@@ -179,6 +228,11 @@ export default function MessageList({
     const el = viewportRef.current;
     if (!el) return;
     const onScroll = () => {
+      // Not while hidden, and not before this view's own offset is back: the
+      // clamp to 0 as a list empties or hides is not the user scrolling.
+      if (el.clientHeight > 0 && restoredRef.current === viewKeyRef.current) {
+        scrollMemory.set(viewKeyRef.current, el.scrollTop);
+      }
       noteAnchor();
       maybeLoadMore();
     };
@@ -255,7 +309,9 @@ export default function MessageList({
       </div>
     );
   } else {
-    const now = Date.now();
+    // To the minute: rows only show a time of day or a date, and a value
+    // that changed on every render would re-render every row with it.
+    const now = Math.floor(Date.now() / 60_000) * 60_000;
     content = (
       <ul className="flex flex-col">
         {data.threads.map((t) => (
@@ -266,11 +322,13 @@ export default function MessageList({
             actions={actionView(view, q)}
             now={now}
             selected={t.thread_id === selectedThreadId}
-            onSelect={onSelect}
+            onSelect={selectRow}
             runAction={runAction}
             checkable={!!selectedIds}
             touch={touch}
-            selecting={selecting}
+            // Only a touch row looks or behaves differently while selecting.
+            // Passed as-is, the first tick of a checkbox re-rendered every row.
+            selecting={touch && selecting}
             checked={selectedIds?.has(t.thread_id) ?? false}
             onToggle={handleRowToggle}
             showDomain={showDomain}
@@ -356,7 +414,44 @@ export default function MessageList({
   );
 }
 
-function Row({
+/**
+ * Where each view's list was scrolled to, by view key. Module level: it has
+ * to outlive the list itself, which Drafts replaces.
+ */
+const scrollMemory = new Map<string, number>();
+
+/** For tests: forget every remembered scroll position. */
+export function resetScrollMemoryForTest(): void {
+  scrollMemory.clear();
+}
+
+type RowProps = Parameters<typeof RowImpl>[0];
+
+/** Same row to look at? Then React can leave it alone. */
+function sameRow(a: RowProps, b: RowProps): boolean {
+  for (const key of Object.keys(b) as (keyof RowProps)[]) {
+    if (key === "thread") continue;
+    if (!Object.is(a[key], b[key])) return false;
+  }
+  if (a.thread === b.thread) return true;
+  // A refetch can hand back an equal row in a new object.
+  const x = a.thread as unknown as Record<string, unknown>;
+  const y = b.thread as unknown as Record<string, unknown>;
+  const keys = Object.keys(y);
+  return keys.length === Object.keys(x).length && keys.every((k) => Object.is(x[k], y[k]));
+}
+
+/**
+ * One row of the list. Memoized: with hundreds loaded, every poll and every
+ * move of the selection used to re-render all of them (a quarter of a second
+ * of script at 500 rows) when at most two had changed.
+ */
+const Row = memo(RowImpl, sameRow);
+
+/** Which of a row's menus is open; null until the pointer or focus first reaches the row. */
+type RowMenu = null | "idle" | "snooze" | "more" | "delete";
+
+function RowImpl({
   thread,
   view,
   actions,
@@ -445,6 +540,37 @@ function Row({
       delete underlay.dataset.armed;
     }
   }, [thread]);
+  // The row's menus (snooze, more, the delete confirmation) are Radix roots:
+  // providers, a popper, a focus scope each. Mounted for every row they were
+  // most of what a row cost, and on a phone they are never even shown. So
+  // they are mounted when the row is first approached (pointer or focus), and
+  // until then their triggers are plain buttons that look and are named the
+  // same, and that mount the menu already open if they are activated first
+  // (a screen reader's click arrives with neither pointer nor focus).
+  const [menu, setMenu] = useState<RowMenu>(null);
+  const arm = () => setMenu((m) => m ?? "idle");
+  const menuProps = (kind: Exclude<RowMenu, null | "idle">) => ({
+    open: menu === kind,
+    onOpenChange: (open: boolean) => setMenu(open ? kind : "idle"),
+  });
+  /** The trigger of a menu that is not mounted yet. */
+  const pending = (kind: Exclude<RowMenu, null | "idle">) => ({
+    "aria-haspopup": (kind === "delete" ? "dialog" : "menu") as "dialog" | "menu",
+    "aria-expanded": false,
+    onPointerDown: (e: React.PointerEvent) => {
+      if (e.button === 0 && kind !== "delete") setMenu(kind);
+    },
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (kind !== "delete" && (e.key === "Enter" || e.key === " " || e.key === "ArrowDown")) {
+        e.preventDefault();
+        setMenu(kind);
+      }
+    },
+    onClick: (e: React.MouseEvent) => {
+      e.stopPropagation();
+      setMenu(kind);
+    },
+  });
   // On touch the checkbox takes up room only while selecting.
   const showCheckbox = checkable && (!touch || selecting);
   const LeftIcon = swipes.right.icon;
@@ -452,7 +578,17 @@ function Row({
 
   return (
     <li data-thread-id={thread.thread_id}>
-      <div className="group relative overflow-hidden border-b border-border/60">
+      <div
+        className="group relative overflow-hidden border-b border-border/60"
+        // A mouse only: a tap is a pointer too, and on a phone these menus
+        // are not on screen.
+        onPointerEnter={(e) => {
+          if (e.pointerType === "mouse") arm();
+        }}
+        // Not on a touch screen, where a tap focuses the row it opens: the
+        // triggers there mount their menu when they are pressed.
+        onFocusCapture={touch ? undefined : arm}
+      >
         {/* What a swipe uncovers: the colour and icon of the action it will
             take. Hidden until the row moves (the gesture sets data-dir), and
             decorative: the same actions are in the reader and the bulk bar. */}
@@ -553,7 +689,7 @@ function Row({
                 </Badge>
               )}
             </span>
-            <span className="shrink-0 text-xs text-muted-foreground">
+            <span className="shrink-0 text-xs text-foreground/70">
               {/* In Snoozed, when it comes back matters more than when it came. */}
               {view === "snoozed" && thread.snoozedUntil
                 ? `Until ${formatSnoozeTime(thread.snoozedUntil, now)}`
@@ -587,7 +723,7 @@ function Row({
             )}
           </div>
           {/* Snippet = tertiary tier: muted preview, below the subject. */}
-          <div className="truncate text-xs text-foreground/55">
+          <div className="truncate text-xs text-foreground/60">
             {thread.snippet}
           </div>
         </button>
@@ -624,7 +760,19 @@ function Row({
               </Button>
 
               {/* Delete forever — requires confirmation */}
-              <AlertDialog>
+              {menu === null ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Delete forever"
+                  aria-label="Delete forever"
+                  {...pending("delete")}
+                >
+                  <Trash2 className="h-4 w-4 text-destructive" />
+                </Button>
+              ) : (
+              <AlertDialog {...menuProps("delete")}>
                 <AlertDialogTrigger asChild>
                   <Button
                     type="button"
@@ -656,6 +804,7 @@ function Row({
                   </AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>
+              )}
             </>
           ) : (
             <>
@@ -705,25 +854,42 @@ function Row({
                 <Trash2 className="h-4 w-4 text-muted-foreground" />
               </Button>
 
-              {canSnooze && (
-                <SnoozeMenu onSnooze={(until) => handleAction("snooze", { until })}>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    title="Snooze"
-                    aria-label="Snooze"
-                    onClick={(e) => e.stopPropagation()}
-                  >
+              {canSnooze &&
+                (menu === null ? (
+                  <Button type="button" variant="ghost" size="icon-sm" title="Snooze" aria-label="Snooze" {...pending("snooze")}>
                     <AlarmClock className="h-4 w-4 text-muted-foreground" />
                   </Button>
-                </SnoozeMenu>
-              )}
+                ) : (
+                  <SnoozeMenu onSnooze={(until) => handleAction("snooze", { until })} {...menuProps("snooze")}>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      title="Snooze"
+                      aria-label="Snooze"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <AlarmClock className="h-4 w-4 text-muted-foreground" />
+                    </Button>
+                  </SnoozeMenu>
+                ))}
 
               {/* The less frequent ones. Three buttons and this keep the
                   panel narrow enough that most of the row stays readable (and
                   clickable) under the pointer. */}
-              <DropdownMenu>
+              {menu === null ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  title="More actions"
+                  aria-label={`More actions for ${thread.subject || "(no subject)"}`}
+                  {...pending("more")}
+                >
+                  <MoreHorizontal className="h-4 w-4 text-muted-foreground" />
+                </Button>
+              ) : (
+              <DropdownMenu {...menuProps("more")}>
                 <DropdownMenuTrigger asChild>
                   <Button
                     type="button"
@@ -750,6 +916,7 @@ function Row({
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+              )}
             </>
           )}
           </div>

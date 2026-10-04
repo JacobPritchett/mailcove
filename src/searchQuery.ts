@@ -244,10 +244,14 @@ export function parseSearchQuery(q: string, now: number = Date.now(), tzOffsetMi
  * The outer SELECT rebuilds each thread's display row from its latest message
  * in scope, the same collapse the normal views use. Results are ordered by
  * relevance when there is free text, newest first otherwise.
+ *
+ * `idsOnly` keeps the matching and the order and drops the display row, for
+ * callers that only need to know which threads matched (select all). It is a
+ * flag here, not a second builder, so the two can never disagree on a result.
  */
 export function buildSearchSql(
   p: ParsedSearch,
-  opts: { limit: number; offset?: number; domain?: string; domainIncludesNull?: boolean },
+  opts: { limit: number; offset?: number; domain?: string; domainIncludesNull?: boolean; idsOnly?: boolean },
 ): { sql: string; binds: unknown[] } {
   // Junk is trash with a mark, so Trash and Junk split the trash state the
   // same way the two views do.
@@ -291,6 +295,20 @@ export function buildSearchSql(
     binds.push(opts.domain.toLowerCase());
   }
 
+  const display = `h.thread_id AS thread_id,
+      ${latest("id")} AS id,
+      ${latest("msg_from")} AS msg_from,
+      ${latest("msg_to")} AS msg_to,
+      ${latest("subject")} AS subject,
+      ${latest("snippet")} AS snippet,
+      ${latest("category")} AS category,
+      ${latest("domain")} AS domain,
+      (SELECT MAX(date) FROM messages x WHERE ${live}) AS date,
+      (SELECT COUNT(*) FROM messages x WHERE ${live}) AS count,
+      (SELECT MAX(unread) FROM messages x WHERE ${live}) AS anyUnread,
+      (SELECT MAX(has_attachments) FROM messages x WHERE ${live}) AS hasAttachments,
+      (SELECT MAX(starred) FROM messages x WHERE ${live}) AS starred`;
+
   const sql = `
     WITH ${ranked}
     hits AS (
@@ -303,19 +321,7 @@ export function buildSearchSql(
       GROUP BY m.thread_id
     )
     SELECT
-      h.thread_id AS thread_id,
-      ${latest("id")} AS id,
-      ${latest("msg_from")} AS msg_from,
-      ${latest("msg_to")} AS msg_to,
-      ${latest("subject")} AS subject,
-      ${latest("snippet")} AS snippet,
-      ${latest("category")} AS category,
-      ${latest("domain")} AS domain,
-      (SELECT MAX(date) FROM messages x WHERE ${live}) AS date,
-      (SELECT COUNT(*) FROM messages x WHERE ${live}) AS count,
-      (SELECT MAX(unread) FROM messages x WHERE ${live}) AS anyUnread,
-      (SELECT MAX(has_attachments) FROM messages x WHERE ${live}) AS hasAttachments,
-      (SELECT MAX(starred) FROM messages x WHERE ${live}) AS starred
+      ${opts.idsOnly ? "h.thread_id AS thread_id" : display}
     FROM hits h
     ORDER BY h.rank, h.hitDate DESC, h.thread_id DESC
     LIMIT ? OFFSET ?`;

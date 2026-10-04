@@ -28,6 +28,9 @@ const thread = (id: string) => ({
 /** Stub the API; returns the list of /api/send request bodies seen. */
 async function stubApi(page: Page, opts: { sendDelayMs?: number } = {}) {
   const sends: unknown[] = [];
+  // These specs are about a send that goes out at once; the hold that Undo
+  // send puts in front of it has its own (e2e-undo-send).
+  await page.addInitScript(() => localStorage.setItem("mailcove.undo-send", "0"));
   await page.route("**/api/**", async (route) => {
     const req = route.request();
     const p = new URL(req.url()).pathname;

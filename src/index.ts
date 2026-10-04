@@ -8,9 +8,9 @@ import { getThread, findThreadIdByMessageIds, findSentByMessageId } from "./stor
 import { isMailAction, isSnoozeTime, mutateMessage, mutateThread, mutateThreads, purgeOldTrash, drainPendingDeletes, wakeSnoozed } from "./store_mutations";
 import {
   isView, isCategory, isDomainName, listThreadsByView, countsByView, countsByDomain,
-  parsePageSize, parseCursor, encodeDateCursor, encodeOffsetCursor,
+  parsePageSize, parseCursor, encodeDateCursor, encodeOffsetCursor, listThreadIdsByView, IDS_PAGE_SIZE, type View, type Category, type PageCursor,
 } from "./store_views";
-import { ftsUpsert, ftsRowFrom, bodyForIndex, searchThreads, reindexAll } from "./search";
+import { ftsUpsert, ftsRowFrom, bodyForIndex, searchThreads, searchThreadIds, reindexAll } from "./search";
 import { summarizeThread, draftReply, suggestCompletion } from "./ai";
 import {
   parseOutboundAttachments,
@@ -57,7 +57,7 @@ import {
 } from "./domains";
 import { classifyWithJunk } from "./categorize";
 import { addBlocked, blockEntryDomain, countBlocked, isBlocked, shouldAutoJunk, listBlocked, normalizeBlockEntry, isOwnDomain, ownDomains, removeBlocked, MAX_BLOCKED } from "./junk";
-import { validateDraft, putDraft, listDrafts, getDraft, deleteDraft, countDrafts } from "./drafts";
+import { validateDraft, putDraft, listDrafts, getDraft, deleteDraft, countDrafts, isDraftId } from "./drafts";
 import {
   parseDraftAttachments,
   putDraftAttachments,
@@ -118,6 +118,54 @@ const contactBuckets = new Map<string, Bucket>();
 const sendBuckets = new Map<string, Bucket>();
 /** Upper bound on recipients per send, so one call cannot fan out to a list. */
 const MAX_RECIPIENTS = 50;
+
+/** What a list request asks for, once validated. */
+interface ListQuery {
+  view: View;
+  q: string | undefined;
+  category: Category | undefined;
+  domain: string | undefined;
+  domainIncludesNull: boolean;
+  cursor: PageCursor | null;
+  offset: number;
+  tzOffsetMin: number;
+}
+
+/**
+ * Read and validate the parameters GET /api/messages and GET /api/messages/ids
+ * share. One parser for both, because the ids route promises the same threads
+ * as the list: a rule that lived in two places would let them drift.
+ */
+function parseListQuery(url: URL, env: Env): ListQuery | { error: string } {
+  const viewParam = url.searchParams.get("view") || "inbox";
+  if (!isView(viewParam)) return { error: "invalid view" };
+  const q = url.searchParams.get("q")?.trim() || undefined;
+  const categoryParam = url.searchParams.get("category") || undefined;
+  const category = isCategory(categoryParam) ? categoryParam : undefined;
+  // Optional per-domain narrowing. Search honours it too (the view and the
+  // category are ignored while searching; `in:` covers the view).
+  // A present-but-invalid domain is a 400, not a silent unfiltered list.
+  const domainParam = url.searchParams.get("domain");
+  if (domainParam !== null && !isDomainName(domainParam)) return { error: "invalid domain" };
+  const domain = domainParam ?? undefined;
+  // Legacy rows predate the domain column; they belong to the default inbox
+  // domain, so filtering by it must include NULL.
+  const domainIncludesNull = !!domain && domain.toLowerCase() === (env.INBOX_DOMAIN || "").toLowerCase();
+  // `cursor` is whatever the previous page returned as nextCursor.
+  const cursorParam = url.searchParams.get("cursor");
+  const cursor = cursorParam ? parseCursor(cursorParam) : null;
+  if (cursorParam && (!cursor || (q ? cursor.kind !== "offset" : cursor.kind !== "date"))) {
+    return { error: "invalid cursor" };
+  }
+  const offset = cursor?.kind === "offset" ? cursor.offset : 0;
+  // The browser's timezone offset, so before:/after: mean the user's days.
+  // Bounded to real offsets (UTC-14..UTC+14); anything else is ignored.
+  const tzRaw = url.searchParams.get("tz");
+  const tzOffsetMin = tzRaw !== null && /^-?\d{1,3}$/.test(tzRaw) && Math.abs(Number(tzRaw)) <= 840 ? Number(tzRaw) : 0;
+  return { view: viewParam, q, category, domain, domainIncludesNull, cursor, offset, tzOffsetMin };
+}
+
+
 
 /** Test-only: clear the send limiter so each test starts with a full bucket. */
 export function resetSendBucketsForTest() {
@@ -777,7 +825,12 @@ const MAX_PUSH_THREAD_ID_BYTES = 512;
 // ---------------------------------------------------------------- HTTP API
 export async function handleFetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
-  const path = url.pathname;
+  // Keep the original per-domain API for service-token automation. The browser
+  // uses a separate path under the owner's normal Access application, because
+  // a more-specific service-auth application can cover /api/domains/*.
+  // Normalize before dispatch so both paths share authentication, CSRF checks,
+  // ownership guards, and exactly the same handlers.
+  const path = url.pathname.replace(/^\/api\/domain-routing\//, "/api/domains/");
 
   // With run_worker_first: ["/api/*"], only /api/* reaches the Worker; every
   // other path is served by Workers Assets (SPA fallback to index.html). If a
@@ -847,42 +900,44 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     } catch (e) { return json({ error: e instanceof Error ? e.message : "mutate failed" }, 400); }
   }
 
+  // GET /api/messages/ids?view=inbox&q= : the thread ids of a whole view or
+  // search, for "select all N" across pages. Must be BEFORE the
+  // /api/messages/:id regex, which would otherwise read "ids" as a message id.
+  // Same parameters and the same order as the list below, so the ids are
+  // exactly the threads paging the list would show; what it skips is the
+  // display row per thread and the counts query per page. Read-only, and the
+  // page size is fixed so one request cannot be asked for the whole mailbox.
+  if (path === "/api/messages/ids" && request.method === "GET") {
+    const lq = parseListQuery(url, env);
+    if ("error" in lq) return json({ error: lq.error }, 400);
+    const { view, q, category, domain, domainIncludesNull, cursor, offset, tzOffsetMin } = lq;
+    if (q) {
+      const ids = await searchThreadIds(env, q, IDS_PAGE_SIZE, { domain, domainIncludesNull, offset, tzOffsetMin });
+      return json({ ids, nextCursor: ids.length < IDS_PAGE_SIZE ? null : encodeOffsetCursor(offset + ids.length) });
+    }
+    const rows = await listThreadIdsByView(env, view, IDS_PAGE_SIZE, category, domain, domainIncludesNull, cursor?.kind === "date" ? cursor.after : undefined);
+    const last = rows[rows.length - 1];
+    return json({
+      ids: rows.map((r) => r.thread_id),
+      // A full page means there may be more, as on the list route.
+      nextCursor: rows.length < IDS_PAGE_SIZE || !last ? null : encodeDateCursor({ date: last.sort_date, thread_id: last.thread_id }),
+    });
+  }
+
   // GET /api/messages?view=inbox&q=
   // With a query, search is GLOBAL full-text (FTS5, relevance-ranked, across all
   // non-trash mail) and the view is ignored. Without one, it's the normal
   // per-view conversation list.
   if (path === "/api/messages" && request.method === "GET") {
-    const viewParam = url.searchParams.get("view") || "inbox";
-    if (!isView(viewParam)) return json({ error: "invalid view" }, 400);
-    const q = url.searchParams.get("q")?.trim() || undefined;
-    const categoryParam = url.searchParams.get("category") || undefined;
-    const category = isCategory(categoryParam) ? categoryParam : undefined;
-    // Optional per-domain narrowing. Search honours it too (the view and the
-    // category are ignored while searching; `in:` covers the view).
-    // A present-but-invalid domain is a 400, not a silent unfiltered list.
-    const domainParam = url.searchParams.get("domain");
-    if (domainParam !== null && !isDomainName(domainParam)) return json({ error: "invalid domain" }, 400);
-    const domain = domainParam ?? undefined;
-    // Legacy rows predate the domain column; they belong to the default inbox
-    // domain, so filtering by it must include NULL.
-    const domainIncludesNull = !!domain && domain.toLowerCase() === (env.INBOX_DOMAIN || "").toLowerCase();
-    // Paging. `limit` sizes the page; `cursor` is whatever the previous page
-    // returned as nextCursor. Without either this is the first page at the
-    // default size, exactly as before paging existed.
+    const lq = parseListQuery(url, env);
+    if ("error" in lq) return json({ error: lq.error }, 400);
+    const { view, q, category, domain, domainIncludesNull, cursor, offset, tzOffsetMin } = lq;
+    // Paging. `limit` sizes the page. Without it or a cursor this is the first
+    // page at the default size, exactly as before paging existed.
     const limit = parsePageSize(url.searchParams.get("limit"));
-    const cursorParam = url.searchParams.get("cursor");
-    const cursor = cursorParam ? parseCursor(cursorParam) : null;
-    if (cursorParam && (!cursor || (q ? cursor.kind !== "offset" : cursor.kind !== "date"))) {
-      return json({ error: "invalid cursor" }, 400);
-    }
-    const offset = cursor?.kind === "offset" ? cursor.offset : 0;
-    // The browser's timezone offset, so before:/after: mean the user's days.
-    // Bounded to real offsets (UTC-14..UTC+14); anything else is ignored.
-    const tzRaw = url.searchParams.get("tz");
-    const tzOffsetMin = tzRaw !== null && /^-?\d{1,3}$/.test(tzRaw) && Math.abs(Number(tzRaw)) <= 840 ? Number(tzRaw) : 0;
     const threads = q
       ? await searchThreads(env, q, limit, { domain, domainIncludesNull, offset, tzOffsetMin })
-      : await listThreadsByView(env, viewParam, limit, category, domain, domainIncludesNull, cursor?.kind === "date" ? cursor.after : undefined);
+      : await listThreadsByView(env, view, limit, category, domain, domainIncludesNull, cursor?.kind === "date" ? cursor.after : undefined);
     // A full page means there may be more. An empty next page is the cheap,
     // honest way to find out there was not, rather than a COUNT per request.
     const last = threads[threads.length - 1];
@@ -1890,6 +1945,23 @@ export async function handleFetch(request: Request, env: Env, _ctx: ExecutionCon
     // absent at runtime, "" is the correct graceful fallback (this message just
     // won't be a reply-link target) — do NOT throw.
     const sentMessageId = sendResult?.messageId ?? "";
+    // The message this was the draft of has been accepted: the draft goes, and
+    // it goes HERE rather than on a later request from the client. A message
+    // held for Undo send can go out as its page is closing (a keepalive
+    // request nobody reads the answer to), and the client's only way to tell
+    // on its next visit whether recovery may be needed is the surviving draft.
+    // Cleanup can fail after acceptance, so the client must not infer that the
+    // message was not sent. Never make a cleanup error a send failure.
+    if (isDraftId(b.draftId)) {
+      try {
+        await deleteDraftAttachments(env, b.draftId).catch(() => {
+          // orphaned blob; the row goes regardless (as in DELETE /api/drafts/:id)
+        });
+        await deleteDraft(env, b.draftId);
+      } catch (e) {
+        console.error("send: deleting the sent draft failed:", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+      }
+    }
     const id = uuid();
     const snippet = String(b.text || "").replace(/\s+/g, " ").trim().slice(0, 200);
     // Store attachments the same way inbound mail does (att/<id>/p<n> in R2 plus

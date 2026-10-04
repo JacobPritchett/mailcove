@@ -136,7 +136,7 @@ test.describe("reader (phone)", () => {
     await expect(page.getByRole("toolbar").getByRole("button", { name: "Reply" })).toHaveCount(0);
     await page.getByRole("button", { name: "More actions", exact: true }).click();
     const menu = page.getByRole("menu");
-    expect(await itemNames(page)).toEqual(["Star", "Report junk", "Summarize", "Rich", "Chat"]);
+    expect(await itemNames(page)).toEqual(["Star", "Report junk", "Summarize", "Print", "Rich", "Chat"]);
     for (const item of await menu.locator('[role="menuitem"],[role="menuitemradio"]').all()) {
       // Rounded: the box is read while the menu's open animation settles.
       expect(Math.round((await item.boundingBox())!.height)).toBeGreaterThanOrEqual(44);
@@ -204,7 +204,7 @@ for (const width of [1280, 1440]) {
       await page.keyboard.press("Enter");
       await expect(page.getByRole("menu")).toBeVisible();
       expect(await itemNames(page)).toEqual([
-        "Reply all", "Forward", "Star", "Report junk", "Summarize", "Rich", "Chat",
+        "Reply all", "Forward", "Star", "Report junk", "Summarize", "Print", "Rich", "Chat",
       ]);
       await page.keyboard.press("Escape");
       await expect(page.getByRole("button", { name: "More actions", exact: true })).toBeFocused();

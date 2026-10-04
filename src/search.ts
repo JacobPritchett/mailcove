@@ -118,6 +118,30 @@ export async function searchThreads(
 }
 
 /**
+ * The thread ids a search matches, in result order, without the display rows:
+ * the same parse and the same statement as searchThreads with the per-thread
+ * lookups left out, so offset N here is offset N there.
+ */
+export async function searchThreadIds(
+  env: SearchEnv,
+  q: string,
+  limit: number,
+  opts: { offset?: number; domain?: string; domainIncludesNull?: boolean; now?: number; tzOffsetMin?: number } = {},
+): Promise<string[]> {
+  const parsed = parseSearchQuery(q, opts.now, opts.tzOffsetMin);
+  if (parsed.empty) return [];
+  const { sql, binds } = buildSearchSql(parsed, {
+    limit,
+    offset: opts.offset,
+    domain: opts.domain,
+    domainIncludesNull: opts.domainIncludesNull,
+    idsOnly: true,
+  });
+  const { results } = await env.DB.prepare(sql).bind(...binds).all<{ thread_id: string }>();
+  return (results ?? []).map((r) => r.thread_id);
+}
+
+/**
  * Rebuild the entire FTS index from scratch: clear it, then re-index every
  * message, pulling full body text from R2 (parsed/<id>.json). Used as a
  * one-time backfill after the migration and to recover from drift. Messages

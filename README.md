@@ -44,6 +44,15 @@ UI:       https://inbox.example.com  (React SPA, behind Cloudflare Access)
   and long-press to select several conversations.
 - Multiple domains: receive and send for more than one domain, with per-domain
   identities, display names, and signatures.
+- Undo send with a configurable delay. Small messages without attachments can be
+  recalled while held; switching away from the page sends them immediately. A saved
+  draft remains recoverable if delivery cannot be confirmed.
+- Long conversations collapse earlier messages. Tablet layouts use a compact sidebar,
+  and the list preserves your scroll position between views.
+- Print conversations or individual messages, open mailto links in the composer, and
+  preview calendar invitations with an .ics download. Long HTML emails may split
+  awkwardly across printed pages.
+- Select every conversation across loaded pages, up to 10,000 per operation.
 - Drafts with autosave, attachments, inbox rules, and a command palette with keyboard
   shortcuts.
 - Optional Workers AI features: thread summaries, reply drafts, compose suggestions,

@@ -9,12 +9,15 @@ function makeEnv(opts: {
   sendReturn: { messageId?: string } | undefined;
 }) {
   const inserts: { sql: string; params: any[] }[] = [];
+  /** Draft ids deleted, in order. */
+  const draftDeletes: string[] = [];
   const db = {
     prepare(sql: string) {
       const call = { sql, params: [] as any[] };
       return {
         bind(...params: any[]) {
           call.params = params;
+          if (/DELETE FROM drafts\b/i.test(sql)) draftDeletes.push(String(params[0]));
           // Match the messages table only — NOT the messages_fts search index.
           if (/INSERT INTO messages\b/i.test(sql)) inserts.push(call);
           return { run: async () => ({}), first: async () => null, all: async () => ({ results: [] }) };
@@ -35,7 +38,7 @@ function makeEnv(opts: {
     ACCESS_AUD: "aud",
     AUTH_TOKEN: "secret-token",
   } as unknown as Env;
-  return { env, inserts, send, r2 };
+  return { env, inserts, send, r2, draftDeletes };
 }
 
 function sendRequest(body: unknown) {
@@ -139,5 +142,51 @@ describe("/api/send Message-ID handling", () => {
     // in_reply_to is persisted; message_id is the real one.
     expect(inserts[0].params[11]).toBe("<real@cf>");
     expect(inserts[0].params[12]).toBe("<parent@a.com>");
+  });
+});
+
+describe("/api/send deletes the draft it was sent from", () => {
+  const DRAFT = "0b0e6a1c-1111-4222-8333-444455556666";
+
+  it("deletes the named draft once the message is accepted", async () => {
+    const { env, draftDeletes } = makeEnv({ sendReturn: { messageId: "<real@cf>" } });
+    const res = await handleFetch(sendRequest({ to: "x@y.com", text: "hi", draftId: DRAFT }), env, ctx);
+    expect(res.status).toBe(200);
+    expect(draftDeletes).toEqual([DRAFT]);
+  });
+
+  it("keeps the draft when the send fails: a draft that exists was not sent", async () => {
+    const { env, send, draftDeletes } = makeEnv({ sendReturn: undefined });
+    send.mockRejectedValueOnce(new Error("upstream down"));
+    const res = await handleFetch(sendRequest({ to: "x@y.com", text: "hi", draftId: DRAFT }), env, ctx);
+    expect(res.status).toBe(502);
+    expect(draftDeletes).toEqual([]);
+  });
+
+  it("keeps the draft when the request is refused before sending", async () => {
+    const { env, draftDeletes } = makeEnv({ sendReturn: { messageId: "<real@cf>" } });
+    const res = await handleFetch(sendRequest({ text: "no recipient", draftId: DRAFT }), env, ctx);
+    expect(res.status).toBe(400);
+    expect(draftDeletes).toEqual([]);
+  });
+
+  it("ignores a draft id that is not one", async () => {
+    const { env, draftDeletes } = makeEnv({ sendReturn: { messageId: "<real@cf>" } });
+    for (const draftId of ["../x", "", 7, { id: DRAFT }, "short"]) {
+      const res = await handleFetch(sendRequest({ to: "x@y.com", text: "hi", draftId }), env, ctx);
+      expect(res.status).toBe(200);
+    }
+    expect(draftDeletes).toEqual([]);
+  });
+
+  it("still reports the send as accepted when deleting the draft throws", async () => {
+    const { env } = makeEnv({ sendReturn: { messageId: "<real@cf>" } });
+    const prepare = env.DB.prepare.bind(env.DB);
+    (env.DB as any).prepare = (sql: string) => {
+      if (/DELETE FROM drafts\b/i.test(sql)) throw new Error("D1 unavailable");
+      return prepare(sql);
+    };
+    const res = await handleFetch(sendRequest({ to: "x@y.com", text: "hi", draftId: DRAFT }), env, ctx);
+    expect(res.status).toBe(200);
   });
 });

@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { AlarmClock, AlarmClockOff, Archive, Ban, ChevronDown, Download, ExternalLink, Forward, Mail, MailMinus, MailOpen, MoreHorizontal, OctagonAlert, Paperclip, Reply, ReplyAll, RotateCcw, ShieldAlert, ShieldCheck, Sparkles, Star, Trash2, type LucideIcon } from "lucide-react";
+import { AlarmClock, AlarmClockOff, Archive, Ban, ChevronDown, ChevronsDownUp, ChevronsUpDown, Download, ExternalLink, Forward, Mail, MailMinus, MailOpen, MoreHorizontal, OctagonAlert, Paperclip, Printer, Reply, ReplyAll, RotateCcw, ShieldAlert, ShieldCheck, Sparkles, Star, Trash2, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -48,9 +48,11 @@ import {
   senderLabel,
 } from "@/lib/format";
 import InlineReply, { type InlineReplyHandle } from "@/components/InlineReply";
+import InviteCard, { inviteAttachment } from "@/components/InviteCard";
 import { defaultReplyTarget, forwardInitial, replyInitialForThread } from "@/lib/replyContext";
 import { addressClaimedInName, hasReplyAll, ownDomains, type ReplyMode } from "@/lib/conversation";
 import { IFRAME_SANDBOX, wrapHtml, autoSizeEmailFrame } from "@/lib/emailFrame";
+import { enterPrintLayout, framesSettled, markKeepTogether } from "@/lib/print";
 import type { ComposeInitial } from "@/components/ComposeDialog";
 import type { MailAction, ThreadMessage, View } from "@/lib/types";
 
@@ -69,7 +71,9 @@ export interface ReaderProps {
   onReplyRequest?: (mode: ReplyMode) => void;
   /** The `r` and `a` shortcuts: start a reply of this kind to the default
    *  message. A new `nonce` is a new press. */
-  replyRequest?: { mode: ReplyMode; nonce: number };
+  replyRequest?: { mode: ReplyMode; nonce: number; messageId?: string | null };
+  /** Undo send on an inline reply: put it back (see App). */
+  onUndoReplySend?: (u: { initial: ComposeInitial; mode: ReplyMode; messageId: string | null }) => void;
   /** Bumped by the `f` shortcut: forward the default message of this thread. */
   forwardNonce?: number;
   /** Escape hatch: open the full compose dialog with this prefill (used by the
@@ -87,6 +91,68 @@ export interface ReaderProps {
   mobileChrome?: { leading: React.ReactNode; trailing?: React.ReactNode };
 }
 
+/** A conversation longer than this opens with its earlier messages folded away. */
+const LONG_THREAD = 3;
+
+/**
+ * Which messages of the open conversation are unfolded.
+ *
+ * A long conversation opens showing its last message and whatever is unread,
+ * with the rest as one-line headers. That choice is made ONCE per opening:
+ * opening a thread marks it read, and deciding again from the refetched data
+ * would fold the unread messages away under the reader. After that only two
+ * things change it: the user, and new mail, which arrives unfolded.
+ *
+ * Kept in a ref and settled during render rather than in an effect, so the
+ * first paint of a thread is already folded and no message body (an iframe)
+ * is mounted only to be torn down a moment later.
+ */
+function useFoldedThread(threadId: string | null, messages: ThreadMessage[] | undefined) {
+  const ref = useRef<{ thread: string | null; known: Set<string>; open: Set<string> }>({
+    thread: null,
+    known: new Set(),
+    open: new Set(),
+  });
+  const [, redraw] = useReducer((n: number) => n + 1, 0);
+  const s = ref.current;
+  if (s.thread !== threadId) {
+    s.thread = threadId;
+    s.known = new Set();
+    s.open = new Set();
+  }
+  if (messages?.length) {
+    const first = s.known.size === 0;
+    const fresh = messages.filter((m) => !s.known.has(m.id));
+    for (const m of fresh) {
+      s.known.add(m.id);
+      const last = m === messages[messages.length - 1];
+      // A short conversation, or mail that arrived while it was open: shown.
+      if (!first || messages.length <= LONG_THREAD || last || m.unread === 1) s.open.add(m.id);
+    }
+  }
+  const long = (messages?.length ?? 0) > LONG_THREAD;
+  return {
+    /** Folding applies to this conversation at all. */
+    long,
+    isOpen: (id: string) => !long || s.open.has(id),
+    allOpen: !long || (messages ?? []).every((m) => s.open.has(m.id)),
+    open(id: string) {
+      s.open.add(id);
+      redraw();
+    },
+    openAll() {
+      for (const m of messages ?? []) s.open.add(m.id);
+      redraw();
+    },
+    /** Back to the last message alone. */
+    foldEarlier() {
+      const last = messages?.[messages.length - 1];
+      s.open = new Set(last ? [last.id] : []);
+      redraw();
+    },
+  };
+}
+
 export default function Reader({
   threadId,
   view = "inbox",
@@ -98,6 +164,7 @@ export default function Reader({
   forwardNonce = 0,
   snoozeNonce = 0,
   onOpenCompose,
+  onUndoReplySend,
   onAction,
   mobileChrome,
 }: ReaderProps) {
@@ -106,11 +173,11 @@ export default function Reader({
   // while a thread is still loading); only a loaded thread puts actions in it.
   const frame = (body: React.ReactNode, actions?: React.ReactNode) =>
     mobileChrome ? (
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main data-print-flow className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* The safe-area padding is on an OUTER box and the 56px row inside
             it. On one box (border-box) the padding eats into the 56px, and in
             the installed app the buttons hung up into the status bar. */}
-        <div className="shrink-0 border-b pt-[env(safe-area-inset-top)]">
+        <div data-print-hide className="shrink-0 border-b pt-[env(safe-area-inset-top)]">
           <div className="flex h-14 items-center px-2">
             {mobileChrome.leading}
             <div className="min-w-0 flex-1" />
@@ -130,6 +197,83 @@ export default function Reader({
     useThread(threadId);
   const [mode, setMode] = useReaderMode();
   const summarize = useSummarizeThread();
+  const fold = useFoldedThread(threadId, data?.messages);
+  // Printing: the whole conversation (`only` null) or one message of it.
+  // While set, the reader is in its print layout (see lib/print): every
+  // message unfolded, or the one alone, with its addresses and date in full.
+  const [printing, setPrinting] = useState<{ only: string | null } | null>(null);
+  const articleRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!printing) return;
+    const leave = enterPrintLayout();
+    let cancelled = false;
+    const done = () => setPrinting(null);
+    window.addEventListener("afterprint", done);
+    // Once the frames have settled at the printed width, not before.
+    void framesSettled(articleRef.current ?? document).then(() => {
+      if (cancelled) return;
+      markKeepTogether(articleRef.current ?? document);
+      window.print();
+    });
+    return () => {
+      cancelled = true;
+      window.removeEventListener("afterprint", done);
+      leave();
+    };
+  }, [printing]);
+  useEffect(() => {
+    setPrinting(null);
+  }, [threadId]);
+  // The browser's own Print (its menu, Cmd/Ctrl+P). The shortcut is taken
+  // over so the conversation is prepared first; a print started any other way
+  // still gets the layout, just without the unfolding.
+  const hasThread = !!data?.messages.length;
+  useEffect(() => {
+    if (!hasThread) return;
+    let leave: (() => void) | null = null;
+    const before = () => {
+      leave ??= enterPrintLayout();
+    };
+    const after = () => {
+      leave?.();
+      leave = null;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== "p") return;
+      // Something is open over the conversation: leave the browser to it.
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return;
+      e.preventDefault();
+      setPrinting((cur) => cur ?? { only: null });
+    };
+    window.addEventListener("beforeprint", before);
+    window.addEventListener("afterprint", after);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("beforeprint", before);
+      window.removeEventListener("afterprint", after);
+      document.removeEventListener("keydown", onKey);
+      after();
+    };
+  }, [hasThread]);
+
+  // The message the user has just unfolded: it takes focus, which would
+  // otherwise be dropped to the page when the header they pressed goes away.
+  const [unfoldedId, setUnfoldedId] = useState<string | null>(null);
+  // A long conversation opens on what there is to read, not on a column of
+  // folded headers with the unfolded message somewhere below the screen.
+  const scrolledForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!data || scrolledForRef.current === data.thread_id) return;
+    scrolledForRef.current = data.thread_id;
+    if (data.messages.length <= LONG_THREAD) return;
+    const first = document.querySelector<HTMLElement>("[data-message-open]");
+    const pane = first?.closest<HTMLElement>("[data-slot=scroll-area-viewport]");
+    if (!first || !pane) return;
+    // Only when it starts below the fold; a thread that fits stays at its top.
+    if (first.getBoundingClientRect().top > pane.getBoundingClientRect().bottom - 160) {
+      first.scrollIntoView({ block: "start" });
+    }
+  }, [data]);
 
   // Clear any prior AI summary when switching conversations so it never shows
   // under the wrong thread.
@@ -202,7 +346,7 @@ export default function Reader({
 
   // `r` and `a` live in App, which has no thread data. They arrive as a
   // request and take the same path as every button (startReply, below).
-  const startReplyRef = useRef<((mode: ReplyMode) => void) | null>(null);
+  const startReplyRef = useRef<((mode: ReplyMode, messageId?: string | null) => void) | null>(null);
   const replySeenRef = useRef(replyRequest?.nonce ?? 0);
   // A press made for one thread is never carried out on another.
   useEffect(() => {
@@ -217,7 +361,7 @@ export default function Reader({
     // again when it arrives) rather than drop the key.
     if (!loaded || !startReplyRef.current) return;
     replySeenRef.current = nonce;
-    if (replyRequest) startReplyRef.current(replyRequest.mode);
+    if (replyRequest) startReplyRef.current(replyRequest.mode, replyRequest.messageId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [replyRequest?.nonce, loaded]);
 
@@ -347,8 +491,8 @@ export default function Reader({
     }
     beginReply(mode, messageId);
   };
-  startReplyRef.current = (mode) => {
-    if (canReply && onReplyOpenChange) startReply(mode);
+  startReplyRef.current = (mode, messageId) => {
+    if (canReply && onReplyOpenChange) startReply(mode, messageId ?? null);
   };
   const startForward = (m: ThreadMessage) => onOpenCompose?.(forwardInitial(m));
   const total = data.total ?? messages.length;
@@ -387,6 +531,7 @@ export default function Reader({
       onForward={
         defaultTarget && onOpenCompose && (isDesktop || !hasReplyRow) ? () => startForward(defaultTarget) : undefined
       }
+      onPrint={() => setPrinting({ only: null })}
       onSummarize={() => summarize.mutate(threadRootId)}
       summarizing={summarize.isPending}
       mode={mode}
@@ -401,13 +546,28 @@ export default function Reader({
     // scrollHeight === clientHeight and the overflow escaped to the document,
     // which is why the thread could not be scrolled with a reply box open.
     // @container: the toolbar shows its labels by the width of THIS pane.
-    <Body className="@container flex min-h-0 min-w-0 flex-1 flex-col">
+    <Body data-print-flow className="@container flex min-h-0 min-w-0 flex-1 flex-col">
+      {printing && (
+        // Only seen if the browser's print dialog never came up, or never
+        // reported closing: the way back to the app.
+        <div data-print-hide role="status" className="flex items-center justify-between gap-2 border-b bg-muted/40 px-4 py-2 text-sm">
+          <span>Print view</span>
+          <Button type="button" variant="outline" size="sm" onClick={() => setPrinting(null)} className="max-md:h-11">
+            Done
+          </Button>
+        </div>
+      )}
       <ScrollArea className="min-h-0 flex-1">
         {/* mx-auto + max-w caps the reading measure so a message doesn't sprawl
             to 150+ chars/line on a wide monitor (standard mail-client behavior). */}
-        <article className="mx-auto w-full max-w-3xl px-4 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] md:px-7 md:py-6">
+        <article
+          ref={articleRef}
+          data-print-root
+          className="mx-auto w-full max-w-3xl px-4 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] md:px-7 md:py-6"
+        >
           {isError && (
             <div
+              data-print-hide
               role="status"
               className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
             >
@@ -426,9 +586,22 @@ export default function Reader({
           )}
           <h1 className="text-xl font-semibold [overflow-wrap:anywhere]">{subject}</h1>
           {isThread && (
-            <p className="mt-1 text-xs text-muted-foreground">
-              {total} messages
-            </p>
+            <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+              <span>{total} messages</span>
+              {fold.long && mode !== "chat" && (
+                <Button
+                  data-print-hide
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => (fold.allOpen ? fold.foldEarlier() : fold.openAll())}
+                  className="h-6 gap-1 px-1.5 text-xs text-muted-foreground max-md:h-11 max-md:px-3"
+                >
+                  {fold.allOpen ? <ChevronsDownUp className="size-3.5" /> : <ChevronsUpDown className="size-3.5" />}
+                  {fold.allOpen ? "Collapse earlier" : "Expand all"}
+                </Button>
+              )}
+            </div>
           )}
           {snoozedUntil !== null && (
             <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -447,7 +620,7 @@ export default function Reader({
               the same actions sit in the top bar instead (see `frame`), so the
               first message starts right under the subject. */}
           {isDesktop && toolbar ? (
-            <div className="sticky top-0 z-10 -mx-4 mt-3 mb-5 border-b bg-background px-4 py-2 md:-mx-7 md:px-7">
+            <div data-print-hide className="sticky top-0 z-10 -mx-4 mt-3 mb-5 border-b bg-background px-4 py-2 md:-mx-7 md:px-7">
               {toolbar}
             </div>
           ) : (
@@ -456,7 +629,7 @@ export default function Reader({
 
           {/* AI summary panel — appears once Summarize is clicked. */}
           {(summarize.isPending || summarize.data || summarize.error) && (
-            <div className="mb-5 rounded-lg border bg-muted/40 p-3" role="status">
+            <div data-print-hide className="mb-5 rounded-lg border bg-muted/40 p-3" role="status">
               <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <Sparkles className="size-3.5" />
                 AI summary
@@ -478,25 +651,51 @@ export default function Reader({
           )}
 
           <div className="flex flex-col gap-6">
-            {mode === "chat" ? (
+            {mode === "chat" && !printing ? (
               <ChatView data={data} />
             ) : (
-              messages.map((m) => (
-                <MessageEntry
-                  key={m.id}
-                  msg={m}
-                  own={mine}
-                  onReply={onReplyOpenChange ? (mode) => startReply(mode, m.id) : undefined}
-                  onForward={onOpenCompose ? () => startForward(m) : undefined}
-                />
-              ))
+              // Runs of folded messages share one card, a line each. Printing
+              // unfolds them all (or shows the one message being printed)
+              // without touching what is folded on screen afterwards.
+              groupFolded(
+                printing?.only ? messages.filter((m) => m.id === printing.only) : messages,
+                printing ? () => true : fold.isOpen,
+              ).map((group) =>
+                group.folded ? (
+                  <div key={group.messages[0].id} className="divide-y overflow-hidden rounded-lg border bg-card">
+                    {group.messages.map((m) => (
+                      <FoldedMessage
+                        key={m.id}
+                        msg={m}
+                        onOpen={() => {
+                          fold.open(m.id);
+                          setUnfoldedId(m.id);
+                        }}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  group.messages.map((m) => (
+                    <MessageEntry
+                      key={m.id}
+                      msg={m}
+                      own={mine}
+                      takeFocus={unfoldedId === m.id}
+                      onPrint={() => setPrinting({ only: m.id })}
+                      printing={!!printing}
+                      onReply={onReplyOpenChange ? (mode) => startReply(mode, m.id) : undefined}
+                      onForward={onOpenCompose ? () => startForward(m) : undefined}
+                    />
+                  ))
+                ),
+              )
             )}
           </div>
 
           {/* Inline reply, Gmail-style, at the end of the conversation. Keyed
               by thread so a thread switch never carries a draft across. */}
           {canReply && replyInitial && onReplyOpenChange && (
-            <div className="mt-6">
+            <div data-print-hide className="mt-6">
               <InlineReply
                 key={`${threadRootId}:${replyNonce}`}
                 ref={replyRef}
@@ -508,6 +707,11 @@ export default function Reader({
                   replyDirtyRef.current = dirty;
                 }}
                 onOpenFull={onOpenCompose}
+                onUndoSend={
+                  onUndoReplySend
+                    ? (snapshot) => onUndoReplySend({ initial: snapshot, mode: openMode, messageId: openTargetId })
+                    : undefined
+                }
                 collapsedActions={
                   <>
                     {canReplyAll && (
@@ -580,14 +784,82 @@ function safeHttpsUrl(raw: string | null | undefined): string | null {
   }
 }
 
+/** Split a conversation into runs of folded messages and runs of open ones. */
+function groupFolded(messages: ThreadMessage[], isOpen: (id: string) => boolean) {
+  const groups: { folded: boolean; messages: ThreadMessage[] }[] = [];
+  for (const m of messages) {
+    const folded = !isOpen(m.id);
+    const last = groups[groups.length - 1];
+    if (last && last.folded === folded) last.messages.push(m);
+    else groups.push({ folded, messages: [m] });
+  }
+  return groups;
+}
+
+/**
+ * A folded message: who, the start of what they said, and when, on one line.
+ * The whole line is the button that unfolds it. Nothing of the body is
+ * mounted (no iframe, no image banner) until then. What would be a warning or
+ * a paperclip on the open message is still marked here, so folding never
+ * hides the fact that a message has files or failed its sender check.
+ */
+function FoldedMessage({ msg, onOpen }: { msg: ThreadMessage; onOpen: () => void }) {
+  const mine = msg.direction === "out";
+  const fromLabel = senderLabel(msg.msg_from) || msg.msg_from;
+  const fromName = mine ? "You" : fromLabel;
+  const fromAddr = msg.from_addr ?? addressOf(msg.msg_from);
+  const flagged =
+    msg.direction === "in" && (!!addressClaimedInName(fromLabel, fromAddr) || msg.body.headers?.auth?.dmarc === "fail");
+  const files = msg.body.attachments.length;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-expanded={false}
+      aria-label={`Expand message from ${fromName}`}
+      className="flex min-h-11 w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-accent/50 focus-visible:bg-accent/50 focus-visible:outline-none"
+    >
+      <span
+        aria-hidden="true"
+        className="grid size-7 shrink-0 place-items-center rounded-full text-[0.65rem] font-semibold text-white"
+        style={{ backgroundColor: avatarColor(fromAddr || fromLabel) }}
+      >
+        {initialsOf(fromLabel)}
+      </span>
+      <span className="max-w-[40%] min-w-0 truncate text-sm font-medium text-foreground">{fromName}</span>
+      <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">{msg.snippet}</span>
+      {flagged && (
+        <ShieldAlert className="size-4 shrink-0 text-destructive" aria-label="Sender warning" role="img" />
+      )}
+      {files > 0 && (
+        <Paperclip
+          className="size-3.5 shrink-0 text-muted-foreground"
+          aria-label={files === 1 ? "1 attachment" : `${files} attachments`}
+          role="img"
+        />
+      )}
+      <RelativeTime short date={msg.date} className="shrink-0 text-xs text-muted-foreground" />
+    </button>
+  );
+}
+
 /** One message within the conversation: header + sandboxed body. */
 function MessageEntry({
   msg,
   own,
+  takeFocus,
   onReply,
   onForward,
+  onPrint,
+  printing,
 }: {
   msg: ThreadMessage;
+  /** Print this message alone. */
+  onPrint?: () => void;
+  /** Being printed: show the full addresses and the exact date. */
+  printing?: boolean;
+  /** Just unfolded by the user: take focus, so the keyboard carries on from here. */
+  takeFocus?: boolean;
   /** The user's own domains (see ownDomains), so Reply all is offered honestly. */
   own?: string[];
   onReply?: (mode: ReplyMode) => void;
@@ -600,6 +872,12 @@ function MessageEntry({
   const [busy, setBusy] = useState(false);
   const [showDetail, setShowDetail] = useState(false);
   const [confirmBlock, setConfirmBlock] = useState(false);
+  const rootRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (takeFocus) rootRef.current?.focus({ preventScroll: true });
+    // Once, as it appears: later renders must not pull focus back.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const html = shownHtml ?? body.html;
   const blocked = shownHtml ? 0 : (msg.remoteShown ? 0 : msg.remoteImageCount ?? 0);
@@ -676,12 +954,20 @@ function MessageEntry({
     }
   }
   const bccList = headers?.bcc?.map((b) => b.address).join(", ");
+  const invite = inviteAttachment(body.attachments);
   const replyToList = headers?.replyTo?.map((r) => r.address).join(", ");
 
   return (
-    <section className="overflow-hidden rounded-lg border bg-card">
+    <section
+      ref={rootRef}
+      tabIndex={-1}
+      data-message-open=""
+      aria-label={`Message from ${fromName}`}
+      // scroll-mt: clear of the sticky toolbar when scrolled to (see Reader).
+      className="scroll-mt-16 overflow-hidden rounded-lg border bg-card focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+    >
       {/* Header — all metadata rendered as escaped React text nodes. */}
-      <div className="flex items-start gap-3 px-4 pt-3 pb-2.5">
+      <div data-message-head className="flex items-start gap-3 px-4 pt-3 pb-2.5">
         <span
           aria-hidden="true"
           className="mt-0.5 grid size-9 shrink-0 place-items-center rounded-full text-xs font-semibold text-white"
@@ -702,6 +988,7 @@ function MessageEntry({
             )}
           </div>
           <button
+            data-print-hide
             type="button"
             aria-expanded={showDetail}
             onClick={() => setShowDetail((v) => !v)}
@@ -719,7 +1006,9 @@ function MessageEntry({
 
           {/* The full addresses, on request. Collapsed by default because they
               are the answer to "who exactly?", not the everyday reading need. */}
-          {showDetail && (
+          {/* Always there when printing: a printed message that does not say
+              who it went to, or when, is not a record of anything. */}
+          {(showDetail || printing) && (
             <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
               <dt className="font-medium">From</dt>
               <dd className="[overflow-wrap:anywhere]">{msg.msg_from}</dd>
@@ -766,6 +1055,7 @@ function MessageEntry({
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
+              data-print-hide
               type="button"
               variant="ghost"
               size="icon"
@@ -789,6 +1079,11 @@ function MessageEntry({
             {onForward && (
               <DropdownMenuItem onSelect={onForward}>
                 <Forward /> Forward
+              </DropdownMenuItem>
+            )}
+            {onPrint && (
+              <DropdownMenuItem onSelect={onPrint}>
+                <Printer /> Print
               </DropdownMenuItem>
             )}
             {msg.direction === "in" && (
@@ -849,7 +1144,7 @@ function MessageEntry({
       )}
 
       {unsubscribe && (
-        <div className="mx-4 mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground">
+        <div data-print-hide className="mx-4 mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground">
           <span>This is a mailing list.</span>
           {unsubLink ? (
             <a
@@ -911,6 +1206,8 @@ function MessageEntry({
           )}
         </div>
       )}
+
+      {invite && <InviteCard messageId={msg.id} attachment={invite} />}
 
       {/* Body — identical sandboxed iframe + CSP for every message. It sits
           full-bleed against the card edge: senders style their own margins,
@@ -974,7 +1271,7 @@ function EmailFrame({ html, title }: { html: string; title: string }) {
     // The wrapper holds the frame's space while it is being measured (see
     // measureContentHeight); the height itself is written straight to the
     // iframe, outside React.
-    <div className="overflow-hidden rounded-md border bg-card p-4">
+    <div data-email-frame-wrapper className="overflow-hidden rounded-md border bg-card p-4">
       <iframe
         ref={ref}
         title={title}
@@ -992,7 +1289,7 @@ export function MessageImageBanner({
 }: { count: number; sender: string; onShow: () => void; onAlways: () => void }) {
   if (!count) return null;
   return (
-    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+    <div data-print-hide className="mb-3 flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
       <span className="text-muted-foreground">
         {count} {count === 1 ? "image" : "images"} blocked for your privacy.
         Showing them lets the sender know you opened this message.
@@ -1070,6 +1367,7 @@ function ReaderToolbar({
   onReply,
   onReplyAll,
   onForward,
+  onPrint,
   onSummarize,
   summarizing,
   mode,
@@ -1088,6 +1386,8 @@ function ReaderToolbar({
   onReply?: () => void;
   onReplyAll?: () => void;
   onForward?: () => void;
+  /** Print the whole conversation. */
+  onPrint?: () => void;
   onSummarize: () => void;
   summarizing: boolean;
   mode: ReaderMode;
@@ -1100,12 +1400,11 @@ function ReaderToolbar({
     <div
       role="toolbar"
       aria-label="Conversation actions"
-      // The scroll is a last resort for a pane too narrow for even the icons
-      // (a tablet in portrait); at every ordinary width nothing overflows.
-      className={cn(
-        "flex items-center",
-        compact ? "gap-0" : "gap-1 overflow-x-auto [scrollbar-width:none] @2xl:gap-1.5 [&::-webkit-scrollbar]:hidden",
-      )}
+      // One row at every width the layout produces (the narrowest reading
+      // pane is about 390px, and the icons need 300). Wrapping is the last
+      // resort for anything narrower still: it never scrolls sideways and
+      // never hides an action off the edge.
+      className={cn("flex items-center", compact ? "gap-0" : "flex-wrap gap-1 @2xl:gap-1.5")}
     >
       {/* Dropped in a very narrow pane, where the icons need the room; the
           reply box at the end of the thread is still there. */}
@@ -1217,6 +1516,11 @@ function ReaderToolbar({
           <DropdownMenuItem onSelect={onSummarize} disabled={summarizing}>
             <Sparkles /> {summarizing ? "Summarizing…" : "Summarize"}
           </DropdownMenuItem>
+          {onPrint && (
+            <DropdownMenuItem onSelect={onPrint}>
+              <Printer /> Print
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuLabel>Reading mode</DropdownMenuLabel>
           <DropdownMenuRadioGroup value={mode} onValueChange={(v) => onMode(v as ReaderMode)}>

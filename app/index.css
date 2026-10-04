@@ -195,3 +195,92 @@ body > div:has([data-re-bubble-menu]),
 body > div:has([data-re-link-selector]) {
   z-index: 60;
 }
+
+/* Toast buttons (Undo, Open draft). Sonner draws them 24px tall, which on a
+   touch screen is a miss waiting to happen, and Undo is the one button here
+   that is only on offer for a few seconds. */
+@media (pointer: coarse) {
+  [data-sonner-toast] [data-button] {
+    min-height: 44px;
+    padding-inline: 16px;
+    font-size: 0.875rem;
+  }
+}
+/* Sonner's own description colour is a fixed grey that all but vanishes on
+   the dark popover. */
+[data-sonner-toast] [data-description] {
+  color: var(--muted-foreground);
+}
+
+/* ----------------------------------------------------------------
+ * Printing a conversation (see lib/print.ts, and the reader's Print).
+ *
+ * `html.printing` is set before the browser lays the page out for paper, so
+ * these apply on screen for a moment too: the message frames size themselves
+ * by script and must already be at the printed width when printing starts.
+ * ---------------------------------------------------------------- */
+@page {
+  margin: 0.5in;
+}
+html.printing,
+html.printing body {
+  height: auto !important;
+  overflow: visible !important;
+  background: #fff !important;
+}
+/* Everything between the page and the conversation stops being an app shell
+   (fixed height, its own scroller) and becomes ordinary flowing blocks, or
+   the conversation would print one screenful and stop. */
+html.printing :is(#root, [data-print-flow], [data-slot="scroll-area"], [data-slot="scroll-area-viewport"], [data-slot="scroll-area-viewport"] > div) {
+  display: block !important;
+  position: static !important;
+  width: auto !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+/* The app around the conversation, and every control inside it. */
+html.printing :is([data-print-hide], [data-sonner-toaster], [data-slot="scroll-area-scrollbar"]) {
+  display: none !important;
+}
+/* 6.9in fits inside the margins of both Letter and A4, so the frames are laid
+   out at a width that is the same on screen and on either paper. */
+html.printing [data-print-root] {
+  width: 6.9in !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+/* Page breaks. A browser prints a frame as one unbreakable block and no
+   stylesheet can change that: one that does not fit what is left of a page
+   starts at the top of the next and is cut by height from there, so on a long
+   HTML message the cut can fall through a line of text, and the page before
+   it ends early.
+
+   Two things made that much worse and are undone here. The card clips its
+   overflow, and a clipping box is laid out for paper as a single block whose
+   frames are painted once and then cut off: the rest of the message was
+   simply missing from the printout. And every border between the page and
+   the frame is one more box the paginator pushes, a blank page each. */
+html.printing [data-print-root] [data-message-open] {
+  overflow: visible !important;
+  box-shadow: none;
+}
+html.printing [data-print-root] [data-message-open] > div {
+  border-top-width: 0 !important;
+}
+/* A message that fits on a page is kept on one (marked by the reader, which
+   can measure; a long one must be free to break after its sender line). */
+html.printing [data-print-root] [data-message-open][data-print-keep] {
+  break-inside: avoid;
+}
+
+/* Email-frame cards must flow too; clipping this inner wrapper adds blank
+   pages and can cut off long messages even when the outer card flows. */
+html.printing [data-email-frame-wrapper] {
+  overflow: visible !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+}

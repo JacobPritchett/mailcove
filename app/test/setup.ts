@@ -23,9 +23,11 @@ if (!Element.prototype.scrollIntoView) {
 // Individual tests can override `matches` to exercise the mobile layout.
 if (typeof window !== "undefined" && !window.matchMedia) {
   window.matchMedia = (query: string): MediaQueryList => {
-    const isMin768 = /min-width:\s*768px/.test(query);
+    // A 1280px window: wide enough for the full sidebar as well (below 1100px
+    // it is an icon rail, see useIsWide).
+    const min = /min-width:\s*(\d+)px/.exec(query);
     return {
-      matches: isMin768, // desktop by default
+      matches: !!min && Number(min[1]) <= 1280, // desktop by default
       media: query,
       onchange: null,
       addEventListener: () => {},
@@ -43,8 +45,19 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 // down and surface as an unhandled "dispatchEvent ... is not of type 'Event'"
 // that failed the run without failing any test. Unmount here and give those
 // timers one turn while the window still exists.
-import { afterEach, vi } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
+
+// Undo send holds a sent message for ten seconds by default. The suite sends
+// mail in dozens of places that are about something else, so it runs with the
+// delay off; the tests that are about the hold (outbox, undo-send) turn it on.
+beforeEach(() => {
+  try {
+    localStorage.setItem("mailcove.undo-send", "0");
+  } catch {
+    // a test that replaced localStorage with something that throws
+  }
+});
 
 afterEach(async () => {
   cleanup();

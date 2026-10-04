@@ -24,6 +24,8 @@ export interface FakeThread {
   cc?: string;
   /** Extra fields for the thread's one message (headers, attachments, ...). */
   message?: Record<string, unknown>;
+  /** This many earlier messages before that one (a long conversation). */
+  earlier?: number;
 }
 
 export interface Mailbox {
@@ -33,6 +35,10 @@ export interface Mailbox {
   requests: string[];
   /** Bodies of POST /api/send, in order. */
   sends: Record<string, unknown>[];
+  /** Saved drafts by id (the last PUT body of each). */
+  drafts: Map<string, Record<string, unknown>>;
+  /** Attachment bytes by request path ("/api/attachments/<message id>/<name>"). */
+  files: Map<string, string>;
   /** Bodies of the mutate calls, in order. */
   mutations: { threadIds: string[]; action: string; until?: number }[];
   /** Add a thread at the top (new mail). */
@@ -103,12 +109,30 @@ function apply(t: FakeThread, action: string, until?: number) {
 }
 
 /** Route every /api call on `page` to an in-memory mailbox and return it. */
-export async function stubMailbox(page: Page, threads: FakeThread[], opts: { pageDelayMs?: number } = {}): Promise<Mailbox> {
+export async function stubMailbox(
+  page: Page,
+  threads: FakeThread[],
+  opts: {
+    pageDelayMs?: number;
+    /** Undo send delay for this page. Off unless a spec is about the hold. */
+    undoSendSeconds?: 0 | 5 | 10 | 30;
+    /** Answer POST /api/send with this status instead of accepting it. */
+    sendStatus?: number;
+  } = {},
+): Promise<Mailbox> {
+  // Before any page script: specs send mail in passing and should not each
+  // wait out a hold. Only when nothing is stored yet, so a choice the spec
+  // makes in the app survives a reload.
+  await page.addInitScript((seconds) => {
+    if (localStorage.getItem("mailcove.undo-send") === null) localStorage.setItem("mailcove.undo-send", String(seconds));
+  }, opts.undoSendSeconds ?? 0);
   const box: Mailbox = {
     threads,
     blocked: [],
     requests: [],
     sends: [],
+    drafts: new Map(),
+    files: new Map(),
     mutations: [],
     deliver(subject, from = "New Sender <new@example.com>") {
       const t: FakeThread = {
@@ -174,6 +198,34 @@ export async function stubMailbox(page: Page, threads: FakeThread[], opts: { pag
       if (opts.pageDelayMs && cursor) await new Promise((r) => setTimeout(r, opts.pageDelayMs));
       return route.fulfill(json({ threads: pageRows.map(listRow), unread: 0, user: "me", nextCursor }));
     }
+    if (p === "/api/messages/ids" && method === "GET") {
+      // The same membership and order as the list above, ids only, 500 a page.
+      const view = url.searchParams.get("view") ?? "inbox";
+      const q = url.searchParams.get("q");
+      const cursor = url.searchParams.get("cursor");
+      let rows = [...box.threads].sort((a, b) => b.date - a.date || (a.thread_id < b.thread_id ? 1 : -1));
+      rows = q
+        ? rows.filter((t) => t.state !== "trash" && `${t.subject} ${t.from}`.toLowerCase().includes(q.toLowerCase()))
+        : rows.filter((t) => inView(t, view, now));
+      const m = cursor ? /^d\.(\d+)\.(.+)$/.exec(cursor) : null;
+      const o = cursor ? /^o\.(\d+)$/.exec(cursor) : null;
+      if (m) {
+        const date = Number(m[1]);
+        const id = decodeURIComponent(m[2]);
+        rows = rows.filter((t) => t.date < date || (t.date === date && t.thread_id < id));
+      } else if (o) {
+        rows = rows.slice(Number(o[1]));
+      }
+      const pageRows = rows.slice(0, 500);
+      const last = pageRows[pageRows.length - 1];
+      const nextCursor =
+        pageRows.length < 500 || !last
+          ? null
+          : q
+            ? `o.${(o ? Number(o[1]) : 0) + pageRows.length}`
+            : `d.${last.date}.${encodeURIComponent(last.thread_id)}`;
+      return route.fulfill(json({ ids: pageRows.map((t) => t.thread_id), nextCursor }));
+    }
     if (p === "/api/messages/mutate" && method === "POST") {
       const b = req.postDataJSON() as { threadIds: string[]; action: string; until?: number };
       box.mutations.push(b);
@@ -196,9 +248,18 @@ export async function stubMailbox(page: Page, threads: FakeThread[], opts: { pag
       const t = box.threads.find((x) => x.thread_id === id);
       if (!t) return route.fulfill(json({ error: "not found" }, 404));
       const addr = /<([^>]+)>/.exec(t.from)?.[1] ?? t.from;
+      const earlier = Array.from({ length: t.earlier ?? 0 }, (_, i) => ({
+        id: `m-${id}-e${i + 1}`, thread_id: id, direction: "in", folder: "inbox",
+        msg_from: `Earlier ${i + 1} <earlier${i + 1}@example.com>`, from_addr: `earlier${i + 1}@example.com`,
+        msg_to: "me@example.com", msg_cc: null, subject: t.subject, snippet: `Earlier snippet ${i + 1}`,
+        date: t.date - (t.earlier! - i) * 3_600_000, unread: 0, has_attachments: 0,
+        message_id: `<${id}-e${i + 1}@example.com>`, in_reply_to: null, state: t.state, starred: 0,
+        body: { text: "", html: `<p>Earlier body ${i + 1}</p>`, attachments: [] },
+        domain: t.domain ?? "example.com", envelope_to: "me@example.com", spam: 0, snoozed_until: null,
+      }));
       return route.fulfill(json({
         thread_id: id,
-        messages: [{
+        messages: [...earlier, {
           id: `m-${id}`, thread_id: id, direction: t.direction, folder: "inbox", msg_from: t.from,
           msg_to: "me@example.com", msg_cc: t.cc ?? null, subject: t.subject, snippet: t.snippet, date: t.date,
           unread: t.unread ? 1 : 0, has_attachments: 0, message_id: `<${id}@example.com>`, in_reply_to: null,
@@ -213,6 +274,12 @@ export async function stubMailbox(page: Page, threads: FakeThread[], opts: { pag
           ...t.message,
         }],
       }));
+    }
+    if (p.startsWith("/api/attachments/") && method === "GET") {
+      const file = box.files.get(decodeURIComponent(p));
+      if (file === undefined) return route.fulfill(json({ error: "not found" }, 404));
+      // As the Worker serves them: a download, never a renderable type.
+      return route.fulfill({ status: 200, contentType: "application/octet-stream", body: file });
     }
     if (p === "/api/blocked" && method === "GET") return route.fulfill(json({ blocked: box.blocked }));
     if (p === "/api/blocked" && method === "POST") {
@@ -231,12 +298,43 @@ export async function stubMailbox(page: Page, threads: FakeThread[], opts: { pag
       return route.fulfill(json({ ok: true }));
     }
     if (p === "/api/send" && method === "POST") {
-      box.sends.push(req.postDataJSON() as Record<string, unknown>);
+      const body = req.postDataJSON() as Record<string, unknown>;
+      box.sends.push(body);
+      if (opts.sendStatus) return route.fulfill(json({ error: "send failed" }, opts.sendStatus));
+      // As the Worker does: the draft a message was sent from goes with it.
+      if (typeof body.draftId === "string") box.drafts.delete(body.draftId);
       return route.fulfill(json({ ok: true, id: "sent" }));
+    }
+    const draft = /^\/api\/drafts\/([A-Za-z0-9-]{8,64})$/.exec(p);
+    if (draft && method === "PUT") {
+      box.drafts.set(draft[1], req.postDataJSON() as Record<string, unknown>);
+      return route.fulfill(json({ ok: true }));
+    }
+    if (draft && method === "DELETE") {
+      box.drafts.delete(draft[1]);
+      return route.fulfill(json({ ok: true }));
+    }
+    if (draft && method === "GET") {
+      const d = box.drafts.get(draft[1]);
+      if (!d) return route.fulfill(json({ error: "not found" }, 404));
+      return route.fulfill(json({
+        id: draft[1], threadId: null, inReplyTo: null, to: "", cc: "", bcc: "", subject: "", bodyText: "", bodyJson: "",
+        fromLocal: "me", fromDomain: "example.com", fromName: "", attachments: [], updated: now, ...d,
+      }));
+    }
+    if (/^\/api\/drafts\/[A-Za-z0-9-]{8,64}\/attachments$/.test(p) && method === "GET") {
+      return route.fulfill(json({ attachments: [] }));
     }
     if (p === "/api/filters") return route.fulfill(json({ filters: [] }));
     if (p === "/api/contacts") return route.fulfill(json({ contacts: [] }));
-    if (p === "/api/drafts") return route.fulfill(json({ drafts: [] }));
+    if (p === "/api/drafts") {
+      return route.fulfill(json({
+        drafts: [...box.drafts].map(([id, d]) => ({
+          id, to: d.to ?? "", subject: d.subject ?? "", snippet: String(d.bodyText ?? "").slice(0, 80),
+          threadId: d.threadId ?? null, updated: now, attachments: [],
+        })),
+      }));
+    }
     if (p === "/api/identities") {
       return route.fulfill(json({
         identities: [{ domain: "example.com", sendingDomain: "send.example.com", displayName: "Me", signature: "" }],

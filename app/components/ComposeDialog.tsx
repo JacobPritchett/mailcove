@@ -31,7 +31,7 @@ import {
 } from "@/lib/api";
 import { commitRecipients } from "@/lib/recipients";
 import { RecipientField, type RecipientFieldHandle } from "@/components/RecipientField";
-import type { Contact } from "@/lib/types";
+import type { Contact, SendPayload } from "@/lib/types";
 import { docHasVisibleContent } from "@/lib/editorDoc";
 import { bodySeedWithSignature, sameBody } from "@/lib/replyContext";
 import AnchoredListbox from "@/components/AnchoredListbox";
@@ -42,6 +42,7 @@ import { useIsDesktop } from "@/lib/useMediaQuery";
 import { sanitizeLocal } from "@/lib/identity";
 import type { ForwardPart } from "@/lib/conversation";
 import { composing, keyIsSpokenFor } from "@/lib/keys";
+import { canHold, holdSend } from "@/lib/outbox";
 
 /** Default local-part for the From field. */
 const FROM_DEFAULT_LOCAL = "hello";
@@ -69,8 +70,9 @@ export interface ComposeInitial {
   /** Files of a forwarded message, fetched and staged when the dialog opens,
    *  and the names of the ones that were never stored and so cannot travel. */
   forward?: { messageId: string; parts: ForwardPart[]; notStored?: string[] };
-  /** Everything in this prefill was generated (a forward): closed without the
-   *  user changing anything, it is not worth keeping as a draft. */
+  /** Everything in this prefill was generated (a forward, a mailto: link):
+   *  closed without the user changing anything, it is not worth keeping as a
+   *  draft. */
   generated?: boolean;
   subject?: string;
   text?: string;
@@ -108,6 +110,12 @@ export interface ComposeDialogProps {
   onOpenChange: (open: boolean) => void;
   /** Optional prefill for reply context; absent → blank compose. */
   initial?: ComposeInitial;
+  /**
+   * Open this dialog again with a prefill, after it has closed. Undo send
+   * needs it to put a held message back; without it nothing is held and Send
+   * goes out at once.
+   */
+  onReopen?: (initial: ComposeInitial) => void;
 }
 
 /**
@@ -168,6 +176,7 @@ export default function ComposeDialog({
   open,
   onOpenChange,
   initial,
+  onReopen,
 }: ComposeDialogProps) {
   // The slash-menu tip in the body placeholder is for a keyboard; on a phone
   // it only crowds the line.
@@ -601,12 +610,16 @@ export default function ComposeDialog({
    */
   function untouchedPrefill() {
     if (!initial?.generated || sessionRef.current.resumed || sessionRef.current.filesTouched) return false;
+    const opened = (list?: string) => commitRecipients([], list ?? "").recipients.join(",");
     return (
-      sameBody(text, initial.text ?? "") &&
+      // As opened, or as opened plus the signature seeded into an empty body.
+      (sameBody(text, initial.text ?? "") || (!initial.text && sameBody(text, seededSigRef.current))) &&
       subject === (initial.subject ?? "") &&
-      recipients.join(",") === commitRecipients([], initial.to ?? "").recipients.join(",") &&
+      recipients.join(",") === opened(initial.to) &&
       !toInput.trim() &&
-      cc.length + bcc.length === 0 &&
+      // The copies it was opened with (a mailto: link can name some), no more.
+      cc.join(",") === opened(initial.cc) &&
+      bcc.join(",") === opened(initial.bcc) &&
       !ccPending.trim() &&
       !bccPending.trim()
     );
@@ -638,8 +651,12 @@ export default function ComposeDialog({
     );
   }
 
-  /** Best-effort draft upsert (autosave path — failures stay silent). */
-  async function saveDraftNow(opts: { waitForForward?: boolean } = {}) {
+  /**
+   * Best-effort draft upsert (autosave path — failures stay silent). Resolves
+   * to whether this save reached the server, for the one caller that cannot
+   * go on without it (holding a sent message, see submitTo).
+   */
+  async function saveDraftNow(opts: { waitForForward?: boolean } = {}): Promise<boolean> {
     const s = sessionRef.current;
     // Closing while a forward's files are still downloading: the draft is
     // written now and its files follow when they arrive, rather than a draft
@@ -647,7 +664,7 @@ export default function ComposeDialog({
     const lateFiles = opts.waitForForward && attLoadRef.current === "loading" ? s.forwardLoad : null;
     // A pending "discard the stored files" still has to be written even when
     // nothing else is left in the draft.
-    if (s.skip || (!draftHasContent() && !s.forceAttSync)) return;
+    if (s.skip || (!draftHasContent() && !s.forceAttSync)) return false;
     const id = (s.draftId ??= crypto.randomUUID());
     let live = "";
     try {
@@ -708,8 +725,10 @@ export default function ComposeDialog({
     s.saving = save.catch(() => {});
     try {
       await save;
+      return true;
     } catch {
       // autosave is best-effort; the next tick retries
+      return false;
     }
   }
 
@@ -884,31 +903,76 @@ export default function ComposeDialog({
     // one we drop.
     const hasVisibleBody = bodyText.trim() !== "" || docHasVisibleContent(docJson);
     setSendError(null);
-    try {
-      await send.mutateAsync({
-        // Full identity address; the Worker resolves it against the registry.
-        // fromLocal rides along for back-compat with the legacy default path.
-        from: `${cleanedLocal}@${fromDomain}`,
-        fromLocal: cleanedLocal,
-        ...(cleanedName ? { fromName: cleanedName } : {}),
-        to: recipients,
-        ...(copies.cc.length ? { cc: copies.cc } : {}),
-        ...(copies.bcc.length ? { bcc: copies.bcc } : {}),
+    const payload: SendPayload = {
+      // Full identity address; the Worker resolves it against the registry.
+      // fromLocal rides along for back-compat with the legacy default path.
+      from: `${cleanedLocal}@${fromDomain}`,
+      fromLocal: cleanedLocal,
+      ...(cleanedName ? { fromName: cleanedName } : {}),
+      to: recipients,
+      ...(copies.cc.length ? { cc: copies.cc } : {}),
+      ...(copies.bcc.length ? { bcc: copies.bcc } : {}),
+      subject,
+      text: bodyText,
+      ...(bodyHtml && hasVisibleBody ? { html: bodyHtml } : {}),
+      inReplyTo: initial?.inReplyTo,
+      threadId: initial?.threadId,
+      ...(attachments.length
+        ? {
+            attachments: attachments.map((a) => ({
+              filename: a.name,
+              type: a.type,
+              data: a.data,
+            })),
+          }
+        : {}),
+    };
+    // Undo send: hold the message instead of sending it now. Only once its
+    // draft is on the server, because the draft is what is left if the held
+    // send fails with nobody watching. When the save does not go through
+    // (offline) the message is sent the old way, where a failure keeps this
+    // dialog open with everything in it.
+    if (sessionRef.current === s && onReopen && canHold(payload) && (await saveDraftNow()) && s.draftId) {
+      const draftId = s.draftId;
+      // Everything Undo needs to put this dialog back as it is now.
+      const snapshot: ComposeInitial = {
+        to: recipients.join(", "),
+        cc: copies.cc.join(", ") || undefined,
+        bcc: copies.bcc.join(", ") || undefined,
         subject,
-        text: bodyText,
-        ...(bodyHtml && hasVisibleBody ? { html: bodyHtml } : {}),
+        text,
+        bodyJson: docJson || undefined,
         inReplyTo: initial?.inReplyTo,
         threadId: initial?.threadId,
-        ...(attachments.length
-          ? {
-              attachments: attachments.map((a) => ({
-                filename: a.name,
-                type: a.type,
-                data: a.data,
-              })),
-            }
-          : {}),
+        fromDomain,
+        fromLocal: cleanedLocal,
+        ...(fromName !== null ? { fromName } : {}),
+        replyQuote: initial?.replyQuote,
+        // The body is the user's now, signature and all: nothing may be
+        // seeded into it when it comes back.
+        signatureApplied: true,
+        draftId,
+      };
+      // The held send owns the draft row from here: this session must not
+      // write it again (the close-flush) or delete it (the Worker does that
+      // when it accepts the message).
+      s.skip = true;
+      holdSend({
+        payload,
+        draftId,
+        restore: () => onReopen(snapshot),
+        onSettled: () => {
+          void qc.invalidateQueries({ queryKey: ["threads"] });
+          void qc.invalidateQueries({ queryKey: ["thread"] });
+          void qc.invalidateQueries({ queryKey: ["drafts"] });
+          void qc.invalidateQueries({ queryKey: ["counts"] });
+        },
       });
+      if (sessionRef.current === s) onOpenChange(false);
+      return;
+    }
+    try {
+      await send.mutateAsync(payload);
     } catch (err) {
       // The draft is kept. The reason renders in the dialog, if it is still
       // this message's dialog.

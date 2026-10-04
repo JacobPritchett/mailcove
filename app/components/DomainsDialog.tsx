@@ -58,6 +58,7 @@ import {
   sendingState,
 } from "@/lib/domains";
 import { cn } from "@/lib/utils";
+import { ApiError } from "@/lib/api";
 import type { DomainSummary, DomainDetail, RuleActionKind } from "@/lib/types";
 
 export interface DomainsDialogProps {
@@ -692,7 +693,7 @@ function CatchAllEditor({ detail }: { detail: DomainDetail }) {
 
 /** The routing detail for one selected zone (with live edit controls). */
 function DomainDetailPane({ zone, inboxWorker }: { zone: DomainSummary; inboxWorker?: string | null }) {
-  const { data, isPending, isError, refetch, isFetching } = useDomainDetail(zone.zoneId, zone.name);
+  const { data, isPending, isError, error, refetch, isFetching } = useDomainDetail(zone.zoneId, zone.name);
   const detail = data?.detail;
 
   if (isPending) {
@@ -702,6 +703,13 @@ function DomainDetailPane({ zone, inboxWorker }: { zone: DomainSummary; inboxWor
     return (
       <div className="space-y-3 p-6">
         <p className="text-sm text-muted-foreground">Couldn't load routing for {zone.name}.</p>
+        <p role="alert" className="text-sm text-muted-foreground [overflow-wrap:anywhere]">
+          {error instanceof ApiError && error.status === 0
+            ? "The browser could not reach the routing service. Check your connection and whether a browser extension blocked the request."
+            : error instanceof ApiError
+              ? `${error.message} (HTTP ${error.status})`
+              : "The routing service returned an unexpected response. Try again."}
+        </p>
         <Button size="sm" variant="outline" onClick={() => refetch()}>
           <RefreshCw className="h-4 w-4" /> Retry
         </Button>
